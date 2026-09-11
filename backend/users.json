@@ -1,0 +1,102 @@
+{
+  "SR01": {
+    "user_id": "SR01PRO",
+    "password_hash": "scrypt:32768:8:1$7Gxn51hkysEKITrB$3f3b500a0af057d341c2bb925fa313317fa8cf9290308ee0f3b5a7e0eb369e1bce08efea0f98871724e6fed0f7ec2b4320f1feb540f4022cac4bcfd32be6079d",
+    "md_key": "2e79a3665080fc851f7512",
+    "md_secret": "Nxso377@TU",
+    "ix_key": "03e06243ea4bdaee0cd400",
+    "ix_secret": "Ybct186@ig"
+  },
+  "SR02": {
+    "user_id": "SR02PRO",
+    "password_hash": "scrypt:32768:8:1$hMdF9MgDqgqDOS5A$37a96be7d7134d265dea834c6990b367bddf3cfb2f211866b3407bb93b07a76360747da9a7a63d510d661b3d2a2a62ea2626a567c583ee8f7d67345727f982f3"
+  },
+  "SR03": {
+    "user_id": "SR03PRO",
+    "password_hash": "scrypt:32768:8:1$Y3ln0IcoPPDGk3ef$fbebe87544a32e6e9b5b0022b6934f64b14df444a58943b4909fbf46289c6c149a6965541c322df4b9be2a2ce9975cde59901e8eeaeb3e124226c23e5943c332"
+  },
+  "SR04": {
+    "user_id": "SR04PRO",
+    "password_hash": "scrypt:32768:8:1$sCW1l3Pp5MEtOPDa$7a33979f5d1d6c92ed63ecfcab8612972f62042c7054b86bcfeefd38fa5fac01060b5781ef945830dca18a5c9bfbb5bd178040da631c8bfecf41025894766bd0",
+    "md_key": "c4de42b007cdf567061257",
+    "md_secret": "Ybdw346$Mq",
+    "ix_key": "28476f6db32e48d5c59588",
+    "ix_secret": "Unfl742#PJ"
+  },
+  "SR05": {
+    "user_id": "SR05PRO",
+    "password_hash": "scrypt:32768:8:1$XYSTTxnJUM3Pcl2b$ac96adc1767e2e379d4f6b91034c97612c3bdba3f221323fd4f86e552af6f8d128a2c8d07615d58becda6a284fc141a44b82de17909cc5c81d6a90f14f0e8760"
+  },
+  "SR06": {
+    "user_id": "SR06PRO",
+    "password_hash": "scrypt:32768:8:1$CJalhzWLsDCMwtjn$213d6f86105f3773a0bff27336eed3b659028fe263b8b429969120ec64d7440fb71b73c63c45161b2aa0e49df02fce3b2779708f897e509466e6f4bc977ef6e1",
+    "md_key": "6afdc0c1936a1620b1b687",
+    "md_secret": "Wwts627@Z2",
+    "ix_key": "38fce425888af475ed1611",
+    "ix_secret": "Wcrr005$Rl"
+  },
+  "SR07": {
+    "user_id": "SR07PRO",
+    "password_hash": "scrypt:32768:8:1$9n7VsjACQC43VSKK$daed529532f1ab51480ce87cf6c2ec3338ee5a70675f800cf816ccdadb1a981529bc8399cd0842844c16e49124d5e44b91d58b629dc84ec800e21f03adf97f5f"
+  },
+  "SR08": {
+    "user_id": "SR08PRO",
+    "password_hash": "scrypt:32768:8:1$GoQTB20ogEVGAbvH$e8d07990b9b7e3f48a280aa51a1e530e9c3708a65abbfc0fe259cfbf205a8e0468237a953c3126868334abfb874025bb8dadaded5c252b009ffff7da3af3265e",
+    "md_key": "7549b35c110f83aad09994",
+    "md_secret": "Htmu388#3H",
+    "ix_key": "39396c88d28df182db3606",
+    "ix_secret": "Pahx430#iU"
+  },
+  "SR09": {
+    "user_id": "SR09PRO",
+    "password_hash": "scrypt:32768:8:1$SzVRtw5YLA9bTLRV$f61997020b13898def42191bd685c4a9f217e7e629965e1b8b14c638ef95e64bddec7964d04f63b449d4346e12cce29bed659fbd71db2cc8c23fc28117b9ae48",
+    "md_key": "79b4d7c1fed85cc67b2929",
+    "md_secret": "Rjbn657$5C",
+    "ix_key": "ce2298399b8945f6223361",
+    "ix_secret": "Cvtv638@9W"
+  },
+  "SR10": {
+    "user_id": "SR10PRO",
+    "password_hash": "scrypt:32768:8:1$VTMYP8JJKZeoMwYZ$2a47390e8046369809086f01f9ff0e2f8e7eaefb3547b72d310addb35fe85808d4f0a1791c5164c840bbe7844aa458d752fe31082bbce5d8e08406fb5bcd0022",
+    "md_key": "7173a6e5b194eb17894663",
+    "md_secret": "Rjpb778#v#",
+    "ix_key": "e16aeb2cdb25de5fd5a623",
+    "ix_secret": "Hfdf822$$F"
+  },
+  "SR11": {
+    "user_id": "SR11PRO",
+    "password_hash": "scrypt:32768:8:1$IwgcDovhekwQLU4y$105f91197cfc6d0e881697864a750b8dfc70c7d961ea32a1aab1b8a9b720361e1fa44b4f6a0f501ba5e1af4ffeb24ee79464eb70822f62595318583458532d1f",
+    "md_key": "fd624865dfb11a2e43d709",
+    "md_secret": "Unmo436#bI",
+    "ix_key": "8d74582e2e6c4b6547d202",
+    "ix_secret": "Uald471@$d"
+  },
+  "SR12": {
+    "user_id": "SR12PRO",
+    "password_hash": "scrypt:32768:8:1$TZPoNDJB0hSYZL8L$860e95f0e4aec3b4cd9039c563fc9a678bf3ec47d88d057dd2d317227febed77b5b93b8fd32dac0036c93f8bf25d3eccd32ff864c5a25a76354e5e066caed07e"
+  },
+  "SR13": {
+    "user_id": "SR13PRO",
+    "password_hash": "scrypt:32768:8:1$dfVjuSJAtrhrM5UK$8ea6c8d8addcd0490daa4692a7f8dbccd715af41510656b56f05ced682edce7582cbf091b0eed2996e41ad09b4a8c2895e49ada9904d0977ee5fd20eb60e3563"
+  },
+  "SR14": {
+    "user_id": "SR14PRO",
+    "password_hash": "scrypt:32768:8:1$9Pm997V7FL4rhXOI$fdde63bda83f78ce6ffe6d6a5b04b9dac57c0e263fa559ac6633ffa8db19914a4317733153369e3d45be2d5e47e79a868f36e5bbcc0f7c71e672ef91eb7ac734"
+  },
+  "SR15": {
+    "user_id": "SR15PRO",
+    "password_hash": "scrypt:32768:8:1$iPGusEhIGIk0cFNz$1844952b5bfd7a2a9f3ab34f9b7e954bea55665a789dc330a7422e37f41be0a95a89fb92249529f44631cc7580b2ea6ff0539f87007bf3a0d09edf1ebf957871"
+  },
+  "SR16": {
+    "user_id": "SR16PRO",
+    "password_hash": "scrypt:32768:8:1$ivZfEqy9VDmJ5mUy$405957ab62a1f6d755d36332c07f140af1fedd3d84e82e07d6f00b3e7a4c84b517c5907138b982e88286ac2650a063e90c76ba738dca8baf16db9744744ab4c8"
+  },
+  "SR17": {
+    "user_id": "SR17PRO",
+    "password_hash": "scrypt:32768:8:1$VMR4oFE5ZP17P2H7$0257916a7187928ce67204fb1a2d7fab624f130d70bb5f3fd89d22512364eb83aa30e5e9430f2b25d8383d211b6e7e2138d54cd43855ac3aa3266cab6c2fd7ca",
+    "md_key": "b3285d98faebc4d5777283",
+    "md_secret": "Jdoq671#rb",
+    "ix_key": "740f09a0ecad9c4077e235",
+    "ix_secret": "Jimb825@mO"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "sonofwind-nifty-ladder",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @workspace/sonOfWind-dashboard dev",
+    "build": "pnpm --filter @workspace/sonOfWind-dashboard build"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2"
+  }
+}

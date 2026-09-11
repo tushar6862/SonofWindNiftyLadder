@@ -1,0 +1,16 @@
+Flask==3.0.3
+flask-cors==4.0.1
+requests==2.32.3
+python-socketio==4.6.0
+python-engineio==3.13.0
+gunicorn>=22.0.0
+
+# Tick engine / dashboard pipeline (optional: redis only if REDIS_URL set)
+numpy>=1.26.0
+scipy>=1.11.0
+pandas>=2.0.0
+redis>=5.0.0
+
+# Morning sentiment LLM parse (Moneycontrol → Gemini)
+google-genai>=1.0.0
+

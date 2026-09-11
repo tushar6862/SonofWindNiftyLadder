@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "HedgeX Dashboard"
+version = "1.0.0"
+id = "artifacts/sonOfWind-dashboard"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23032
+
+[services.development]
+run = "pnpm --filter @workspace/sonOfWind-dashboard run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/sonOfWind-dashboard", "run", "build" ]
+publicDir = "artifacts/sonOfWind-dashboard/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23032"
+BASE_PATH = "/"
