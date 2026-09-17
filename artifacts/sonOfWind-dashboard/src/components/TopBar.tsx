@@ -3,7 +3,8 @@ import { createPortal } from "react-dom";
 import { Settings, RefreshCw, Sun, Moon, ExternalLink, ChevronUp, ChevronDown } from "lucide-react";
 import type { IndexName } from "@/pages/Dashboard";
 import { useAuth } from "@/auth/AuthContext";
-import { useLiveHiLo, useLiveLtp, useLiveSpotDayRef } from "@/context/LiveLtpContext";
+import { useLiveHiLo, useLiveSpotDayRef, useTickLtp } from "@/context/LiveLtpContext";
+import { FastLtp } from "@/components/FastLtp";
 import type { ChainResolved } from "@/types/market";
 import { liveAtmStrikeForChain } from "@/lib/liveAtmStrike";
 import { fmtPct, fmtPrice } from "@/lib/formatNumber";
@@ -169,7 +170,6 @@ export default function TopBar({
   const [time, setTime] = useState(new Date());
   const { state, logout } = useAuth();
   const [, navigate] = useLocation();
-  const ltps = useLiveLtp();
   const hilo = useLiveHiLo();
   const spotDayRefByToken = useLiveSpotDayRef();
 
@@ -186,9 +186,10 @@ export default function TopBar({
 
   const spotToken = chain?.spotToken;
   const vixId = chain?.vixInstrumentId;
+  const tickSpot = useTickLtp(typeof spotToken === "number" ? spotToken : null);
+  const tickVix = useTickLtp(typeof vixId === "number" ? vixId : null);
 
-  const rawSpotTick =
-    typeof spotToken === "number" && ltps[spotToken] != null ? ltps[spotToken] : undefined;
+  const rawSpotTick = tickSpot != null && tickSpot > 0 ? tickSpot : undefined;
   const stableSnap = typeof chain?.spotLtp === "number" ? chain!.spotLtp : undefined;
   const liveSpot =
     typeof rawSpotTick === "number" && rawSpotTick > 0
@@ -275,8 +276,10 @@ export default function TopBar({
     chain && atmStrikeDisplay != null && chain.instrumentMap[String(atmStrikeDisplay)]
       ? chain.instrumentMap[String(atmStrikeDisplay)]
       : null;
-  const ceLt = atmRow ? ltps[atmRow.ce] : undefined;
-  const peLt = atmRow ? ltps[atmRow.pe] : undefined;
+  const tickCe = useTickLtp(atmRow?.ce ?? null);
+  const tickPe = useTickLtp(atmRow?.pe ?? null);
+  const ceLt = tickCe != null && tickCe > 0 ? tickCe : undefined;
+  const peLt = tickPe != null && tickPe > 0 ? tickPe : undefined;
   const atmStraddle =
     typeof ceLt === "number" && typeof peLt === "number" ? ceLt + peLt : undefined;
   /** Synthetic future at ATM: K + CE − PE (live LTPs). */
@@ -307,8 +310,7 @@ export default function TopBar({
     }
   }, [synFut, liveSpot, atmStrikeDisplay]);
 
-  const rawVixTick = typeof vixId === "number" ? ltps[vixId] : undefined;
-  const liveVix = typeof rawVixTick === "number" && rawVixTick > 0 ? rawVixTick : undefined;
+  const liveVix = tickVix != null && tickVix > 0 ? tickVix : undefined;
 
   const vixDayRef = typeof vixId === "number" ? spotDayRefByToken[vixId] : undefined;
   const vixStreamPrev =
@@ -341,8 +343,6 @@ export default function TopBar({
     <>
       <div className="sow-glass-topbar text-[15px]">
         <div className="sow-glass-topbar__inner">
-          <span className="sow-glass-topbar__logo font-logo">SonOfWind Nifty Ladder</span>
-
           <SpinnerSelect value={index} options={INDICES} onChange={handleIndexChange} theme={theme} />
           <div className="flex flex-col gap-0">
             <SpinnerSelect value={expiry} options={expirySelectOptions} onChange={onExpiryChange} theme={theme} />
@@ -354,7 +354,13 @@ export default function TopBar({
               <div className="flex items-center gap-1 flex-wrap">
                 <span className="sow-glass-topbar-stat__label">Spot:</span>
                 <ExternalLink className="w-3 h-3 text-muted-foreground" />
-                <span className="sow-glass-topbar-stat__value tabular-nums">{fmtPrice(liveSpot)}</span>
+                <span className="sow-glass-topbar-stat__value tabular-nums">
+                  {typeof spotToken === "number" && spotToken > 0 ? (
+                    <FastLtp iid={spotToken} className="sow-glass-topbar-stat__value tabular-nums" />
+                  ) : (
+                    fmtPrice(liveSpot)
+                  )}
+                </span>
                 {typeof deltaAbs === "number" && typeof deltaPct === "number" ? (
                   <span
                     className={
@@ -425,7 +431,16 @@ export default function TopBar({
                       : "Refresh chain or wait for Touchline — prev close / open loaded from REST on resolve when socket omits fields."
                   }
                 >
-                  {fmtPrice(liveVix)}
+                  {typeof vixId === "number" && vixId > 0 ? (
+                    <FastLtp
+                      iid={vixId}
+                      className={`font-bold tabular-nums text-[13px] ${
+                        vixShowDelta ? (vixUp ? "text-cd-green" : "text-cd-red") : "text-foreground"
+                      }`}
+                    />
+                  ) : (
+                    fmtPrice(liveVix)
+                  )}
                 </span>
                 {vixShowDelta ? (
                   <span

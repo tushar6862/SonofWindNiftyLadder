@@ -11,13 +11,24 @@ function resolveBackendOrigin(): string {
 
 export const BACKEND_ORIGIN = resolveBackendOrigin();
 
-/** EventSource must bypass Vite's buffered ``/api`` proxy in dev — connect straight to Flask. */
+/**
+ * MD EventSource origin.
+ * LAN Vite URL (http://192.168.x.x:5174) must NOT target 127.0.0.1 — browsers treat
+ * that as a private-network jump and the stream dies; hunt LTP then freezes on REST.
+ * Same-origin ``""`` uses the unbuffered ``/api/md/stream`` Vite proxy.
+ */
 export function getMdStreamOrigin(): string {
   const explicit = (import.meta.env as any)?.VITE_MD_STREAM_ORIGIN as string | undefined;
   if (explicit !== undefined && explicit !== null && String(explicit).trim() !== "") {
     return String(explicit).trim().replace(/\/+$/, "");
   }
   if (import.meta.env.DEV) {
+    if (typeof window !== "undefined") {
+      const host = window.location.hostname;
+      if (host !== "localhost" && host !== "127.0.0.1") {
+        return "";
+      }
+    }
     const proxyTarget = (import.meta.env as any)?.VITE_PROXY_TARGET as string | undefined;
     if (proxyTarget && String(proxyTarget).trim()) {
       return String(proxyTarget).trim().replace(/\/+$/, "");

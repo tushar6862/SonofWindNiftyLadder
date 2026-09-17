@@ -52,16 +52,40 @@ export default defineConfig({
     fs: {
       strict: true,
     },
-    // Same-origin `/api/*` → Flask (avoid CORS + preflight failures when UI is localhost and API is 127.0.0.1).
-    // EventSource for /api/md/stream uses getMdStreamOrigin() (direct Flask) — proxy buffering delays ticks.
+    // Same-origin `/api/*` → Flask. LAN UI (192.168.x.x:5174) must proxy SSE too —
+    // the browser cannot EventSource 127.0.0.1 from a LAN page.
     proxy: {
       "/api/md/stream": {
         target: process.env.VITE_PROXY_TARGET ?? "http://127.0.0.1:5000",
         changeOrigin: true,
+        timeout: 0,
+        proxyTimeout: 0,
         configure: (proxy) => {
-          proxy.on("proxyRes", (proxyRes) => {
-            proxyRes.headers["cache-control"] = "no-cache, no-transform";
+          proxy.on("proxyReq", (proxyReq) => {
+            proxyReq.setHeader("Accept", "text/event-stream");
+            proxyReq.setHeader("Cache-Control", "no-cache");
+          });
+          proxy.on("proxyRes", (proxyRes, _req, res) => {
+            proxyRes.headers["cache-control"] = "no-cache, no-store, no-transform";
             proxyRes.headers["x-accel-buffering"] = "no";
+            proxyRes.headers["connection"] = "keep-alive";
+            try {
+              (res.socket as { setNoDelay?: (v: boolean) => void } | null)?.setNoDelay?.(true);
+            } catch {
+              /* ignore */
+            }
+            try {
+              (res as { flushHeaders?: () => void }).flushHeaders?.();
+            } catch {
+              /* ignore */
+            }
+            proxyRes.on("data", () => {
+              try {
+                (res as { flush?: () => void }).flush?.();
+              } catch {
+                /* ignore */
+              }
+            });
           });
         },
       },

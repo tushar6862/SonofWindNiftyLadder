@@ -35,10 +35,15 @@ function dispatchAtpMap(atpMap?: Record<string, number> | Record<number, number>
   window.dispatchEvent(new CustomEvent("sonofwind_atp_snapshot", { detail: { map: atpMap } }));
 }
 
-function dispatchQuoteMaps(r: { ltpMap?: Record<string, number>; atpMap?: Record<string, number> } | null) {
+function dispatchQuoteMaps(
+  r: { ltpMap?: Record<string, number>; atpMap?: Record<string, number> } | null,
+  source: "focus" | "batch" = "batch",
+) {
   if (!r) return;
   if (r.ltpMap && typeof r.ltpMap === "object" && Object.keys(r.ltpMap).length) {
-    window.dispatchEvent(new CustomEvent("sonofwind_ltp_snapshot", { detail: { map: r.ltpMap } }));
+    window.dispatchEvent(
+      new CustomEvent("sonofwind_ltp_snapshot", { detail: { map: r.ltpMap, source } }),
+    );
   }
   dispatchAtpMap(r.atpMap);
 }
@@ -60,10 +65,39 @@ async function fetchQuoteChunk(
       body: JSON.stringify({ xtsMessageCode: 1501, instruments: chunk }),
       signal,
     })) as { ltpMap?: Record<string, number>; atpMap?: Record<string, number> };
-    dispatchQuoteMaps(r);
+    dispatchQuoteMaps(r, "batch");
   } catch {
     /* best-effort */
   }
+}
+
+async function fetchFocusQuote(
+  inst: { exchangeSegment: number; exchangeInstrumentID: number },
+  isCancelled?: () => boolean,
+): Promise<void> {
+  if (isCancelled?.()) return;
+  const signal =
+    typeof AbortSignal !== "undefined" && "timeout" in AbortSignal
+      ? (AbortSignal as typeof AbortSignal & { timeout: (ms: number) => AbortSignal }).timeout(4000)
+      : undefined;
+  try {
+    const r = (await apiFetch("/api/md/quote_snapshot", {
+      method: "POST",
+      body: JSON.stringify({ xtsMessageCode: 1501, instruments: [inst] }),
+      signal,
+    })) as { ltpMap?: Record<string, number>; atpMap?: Record<string, number> };
+    dispatchQuoteMaps(r, "focus");
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** One-token Snap Quote LTP — never waits behind the chain batch lock. */
+export async function refreshPaintLtpFromRest(
+  inst: { exchangeSegment: number; exchangeInstrumentID: number },
+  isCancelled?: () => boolean,
+): Promise<void> {
+  await fetchFocusQuote(inst, isCancelled);
 }
 
 async function fetchAtpChunks(

@@ -8,22 +8,14 @@ export type TouchTick = {
 };
 
 /**
- * Match XTS Snap Quote ``LTP`` (last traded), not bid/ask mid.
- * Mid is only a hole-fill when no print exists yet.
+ * XTS Snap Quote ``LTP`` only (last traded). Never bid/ask mid — that was
+ * painting 82.60 when Snap Quote LTP was 82.80.
  */
 export function touchPxFromTick(
   tick: TouchTick | null | undefined,
   fallback?: number | null,
 ): number | null {
   if (tick?.ltp && tick.ltp > 0) return tick.ltp;
-  const bid = tick?.bid != null && tick.bid > 0 ? tick.bid : null;
-  const ask = tick?.ask != null && tick.ask > 0 ? tick.ask : null;
-  if (bid != null && ask != null && ask >= bid) {
-    const mid = (bid + ask) / 2;
-    if (mid > 0) return mid;
-  }
-  if (bid != null) return bid;
-  if (ask != null) return ask;
   if (typeof fallback === "number" && Number.isFinite(fallback) && fallback > 0) return fallback;
   return null;
 }

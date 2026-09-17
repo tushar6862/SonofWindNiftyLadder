@@ -663,7 +663,7 @@ export default function LeftPanel() {
           <div className="ramsetu-glass-wrap -m-2 p-2 space-y-3">
             <div className="ramsetu-glass-header">
               <div className="ramsetu-glass-header__title">Same-strike short grid</div>
-              <div className="ramsetu-glass-header__note">Hunt 98–105 · T1 cover 30% · hard SL 70%</div>
+              <div className="ramsetu-glass-header__note">Hunt 98–105 · T1 cover 30% · hard SL 30%</div>
             </div>
             <p className="ramsetu-glass-empty">
               START AGAIN after 09:16 IST. Exit All / MTM target-SL yahan se ladder session clear karte hain.

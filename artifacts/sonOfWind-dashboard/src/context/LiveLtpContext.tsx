@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { apiFetch, getAuthToken, getMdStreamOrigin, mdStartOnce } from "@/lib/backend";
 
 export type LtpMapState = Record<number, number>;
@@ -47,6 +47,17 @@ export type LiveTickPeek = {
 };
 
 const liveTickPeek = new Map<number, LiveTickPeek>();
+const ltpPaintListeners = new Map<number, Set<(ltp: number) => void>>();
+/** Socket last-trade time only. REST must not stamp this — a slow quote was rewinding the print. */
+const socketPrintAt = new Map<number, number>();
+
+/** Ms since the last socket last-trade for this token. null if the socket has not printed. */
+export function socketPrintAgeMs(id: number): number | null {
+  if (!Number.isFinite(id) || id <= 0) return null;
+  const t = socketPrintAt.get(id);
+  if (t == null) return null;
+  return performance.now() - t;
+}
 
 export function peekLiveTick(id: number): LiveTickPeek | null {
   if (!Number.isFinite(id) || id <= 0) return null;
@@ -58,7 +69,46 @@ export function peekLiveLtp(id: number): number | null {
   return row && row.ltp > 0 ? row.ltp : null;
 }
 
-function rememberLiveTick(id: number, ltp: number | null, bid: number | null, ask: number | null): void {
+/** Fires on every last-trade print — paint DOM without waiting for React. */
+export function subscribeLiveLtp(id: number, onLtp: (ltp: number) => void): () => void {
+  if (!Number.isFinite(id) || id <= 0) return () => {};
+  let set = ltpPaintListeners.get(id);
+  if (!set) {
+    set = new Set();
+    ltpPaintListeners.set(id, set);
+  }
+  set.add(onLtp);
+  const cur = peekLiveLtp(id);
+  if (cur != null) onLtp(cur);
+  return () => {
+    const s = ltpPaintListeners.get(id);
+    if (!s) return;
+    s.delete(onLtp);
+    if (!s.size) ltpPaintListeners.delete(id);
+  };
+}
+
+/** Tick-to-tick LTP for a token — bypasses the React map flush. */
+export function useTickLtp(id: number | null | undefined): number | null {
+  const [px, setPx] = useState<number | null>(() => (typeof id === "number" ? peekLiveLtp(id) : null));
+  useLayoutEffect(() => {
+    if (typeof id !== "number" || id <= 0) {
+      setPx(null);
+      return;
+    }
+    setPx(peekLiveLtp(id));
+    return subscribeLiveLtp(id, setPx);
+  }, [id]);
+  return px;
+}
+
+function rememberLiveTick(
+  id: number,
+  ltp: number | null,
+  bid: number | null,
+  ask: number | null,
+  fromRest = false,
+): void {
   const prev = liveTickPeek.get(id);
   const now = performance.now();
   const nextLtp = ltp != null && ltp > 0 ? ltp : prev?.ltp ?? 0;
@@ -67,6 +117,7 @@ function rememberLiveTick(id: number, ltp: number | null, bid: number | null, as
   if (!(nextLtp > 0) && nextBid == null && nextAsk == null) return;
   const ltpChanged = nextLtp > 0 && nextLtp !== prev?.ltp;
   const bookChanged = nextBid !== prev?.bid || nextAsk !== prev?.ask;
+  if (ltpChanged && !fromRest) socketPrintAt.set(id, now);
   liveTickPeek.set(id, {
     ltp: nextLtp,
     bid: nextBid,
@@ -74,6 +125,12 @@ function rememberLiveTick(id: number, ltp: number | null, bid: number | null, as
     ltpAt: ltpChanged ? now : prev?.ltpAt ?? (nextLtp > 0 ? now : 0),
     bookAt: bookChanged ? now : prev?.bookAt ?? 0,
   });
+  if (ltpChanged) {
+    const subs = ltpPaintListeners.get(id);
+    if (subs) {
+      for (const cb of subs) cb(nextLtp);
+    }
+  }
 }
 
 function walkNumbers(obj: unknown, out: Array<[string, number]>): void {
@@ -228,27 +285,26 @@ const STREAM_GLOBAL_STALE_MS = 2500;
 /** Reconnect md/start when no streamed LTP for this long (do not thrash SSE). */
 const STREAM_STALE_MS = 30_000;
 
-function cancelScheduledFlush(scheduled: { current: boolean }) {
+function cancelScheduledFlush(scheduled: { current: boolean }, rafId?: { current: number | null }) {
   scheduled.current = false;
+  if (rafId && rafId.current != null) {
+    window.cancelAnimationFrame(rafId.current);
+    rafId.current = null;
+  }
 }
 
 function scheduleFlushSoon(
   scheduled: { current: boolean },
+  rafId: { current: number | null },
   flush: () => void,
 ): void {
   if (scheduled.current) return;
   scheduled.current = true;
-  const run = () => {
+  rafId.current = window.requestAnimationFrame(() => {
     scheduled.current = false;
+    rafId.current = null;
     flush();
-  };
-  // rAF is frozen while the tab/window is in the background — use a timer so
-  // coalesced ticks still land instead of sitting behind a stuck scheduled flag.
-  if (document.visibilityState === "hidden") {
-    window.setTimeout(run, 0);
-    return;
-  }
-  requestAnimationFrame(run);
+  });
 }
 
 type PendingTick = {
@@ -268,8 +324,8 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string>(() => getAuthToken());
   const pendingRef = useRef<Map<number, PendingTick>>(new Map());
   const streamLtpAtRef = useRef<Map<number, number>>(new Map());
-  const streamLtpTsRef = useRef<Map<number, number>>(new Map());
   const flushScheduledRef = useRef(false);
+  const flushRafRef = useRef<number | null>(null);
   const lastStreamLtpAtRef = useRef(0);
   const esRef = useRef<EventSource | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -378,11 +434,10 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const onLtpSnapshot = (ev: Event) => {
-      const ce = ev as CustomEvent<{ map?: Record<number, number> }>;
+      const ce = ev as CustomEvent<{ map?: Record<number, number>; source?: string }>;
       const snap = ce?.detail?.map;
+      const source = ce?.detail?.source === "focus" ? "focus" : "batch";
       if (!snap || typeof snap !== "object") return;
-      const now = performance.now();
-      const streamGloballyStale = Date.now() - lastStreamLtpAtRef.current > STREAM_GLOBAL_STALE_MS;
       setMap((prev) => {
         let changed = false;
         const next: LtpMapState = { ...prev };
@@ -390,14 +445,11 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           const id = Number(k);
           if (!Number.isFinite(id) || id <= 0) continue;
           if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) continue;
-          const lastStream = streamLtpAtRef.current.get(id);
-          if (lastStream != null && now - lastStream < STREAM_GLOBAL_STALE_MS) {
-            continue;
-          }
-          if (!streamGloballyStale && lastStream != null) {
-            continue;
-          }
-          rememberLiveTick(id, v, null, null);
+          const sockAge = socketPrintAgeMs(id);
+          // Focus REST used to always win. A quote that left 300ms ago then painted 108 over a 106.80 print.
+          if (sockAge != null && sockAge < 500) continue;
+          if (source !== "focus" && sockAge != null && sockAge < 1500) continue;
+          rememberLiveTick(id, v, null, null, true);
           if (next[id] !== v) {
             next[id] = v;
             changed = true;
@@ -423,8 +475,9 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
     setHiLoMap({});
     setSpotDayRef({});
     liveTickPeek.clear();
+    socketPrintAt.clear();
     pendingRef.current.clear();
-    cancelScheduledFlush(flushScheduledRef);
+    cancelScheduledFlush(flushScheduledRef, flushRafRef);
     if (reconnectTimerRef.current != null) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
@@ -533,7 +586,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
             pending.set(id, row);
           }
           row.ema21 = emaNum;
-          scheduleFlushSoon(flushScheduledRef, flushPending);
+          scheduleFlushSoon(flushScheduledRef, flushRafRef, flushPending);
           return;
         }
 
@@ -558,24 +611,48 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
             pending.set(id, row);
           }
           row.atp = atpNum;
-          scheduleFlushSoon(flushScheduledRef, flushPending);
+          scheduleFlushSoon(flushScheduledRef, flushRafRef, flushPending);
           return;
         }
 
         const id = extractId(t);
-        const tickTs =
-          typeof t.ts === "number" && Number.isFinite(t.ts)
-            ? t.ts
-            : typeof t.ts === "string"
-              ? (() => {
-                  const n = Number(t.ts);
-                  return Number.isFinite(n) ? n : null;
-                })()
+        if (!Number.isFinite(id) || id <= 0) return;
+
+        const mcFast =
+          typeof t.messageCode === "number"
+            ? t.messageCode
+            : typeof (t as { MessageCode?: unknown }).MessageCode === "number"
+              ? (t as { MessageCode: number }).MessageCode
+              : 0;
+        const ltpFastRaw =
+          typeof t.ltp === "number" && Number.isFinite(t.ltp) && t.ltp > 0
+            ? t.ltp
+            : typeof t.LastTradedPrice === "number" && Number.isFinite(t.LastTradedPrice) && t.LastTradedPrice > 0
+              ? t.LastTradedPrice
               : null;
-        if (tickTs != null) {
-          const prevTs = streamLtpTsRef.current.get(id);
-          if (prevTs != null && tickTs + 1e-6 < prevTs) return;
+        const restPrint = t._fromRestQuote === true || t._snapshot === true || t._atpOnly === true;
+        const ltpFast = mcFast === 1502 || restPrint ? null : ltpFastRaw;
+        const bidFast = typeof t.bid === "number" && t.bid > 0 ? t.bid : null;
+        const askFast = typeof t.ask === "number" && t.ask > 0 ? t.ask : null;
+        if (ltpFast != null || bidFast != null || askFast != null) {
+          rememberLiveTick(id, ltpFast, bidFast, askFast);
         }
+        // Paint already hit the DOM. Do not walk the packet or re-render the chain on this tick —
+        // that freeze is why a fast drop stayed on 97.85 while XTS had already printed 96.25.
+        if (ltpFast != null) {
+          streamLtpAtRef.current.set(id, performance.now());
+          lastStreamLtpAtRef.current = Date.now();
+          const pending = pendingRef.current;
+          let row = pending.get(id);
+          if (!row) {
+            row = {};
+            pending.set(id, row);
+          }
+          row.ltp = ltpFast;
+          if (typeof t.atp === "number" && t.atp > 0) row.atp = t.atp;
+          return;
+        }
+
         const pcRaw = t.prevClose;
         const pctRaw = t.percentChange;
         const prevClose =
@@ -665,7 +742,10 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
               : null;
         if (emaNum != null) row.ema21 = emaNum;
 
-        let ltp = typeof ltpPicked === "number" ? ltpPicked : NaN;
+        let ltp = restPrint ? NaN : typeof ltpPicked === "number" ? ltpPicked : NaN;
+        if (!restPrint && !(Number.isFinite(ltp) && ltp > 0) && Number.isFinite(ltpFast as number) && (ltpFast as number) > 0) {
+          ltp = ltpFast as number;
+        }
 
         /** Subnormal decoded noise often prints as `0.00` after fixing binary overlap in backend — drop it. */
         if (ltp !== 0 && Number.isFinite(ltp) && Math.abs(ltp) < 1e-9) {
@@ -677,13 +757,16 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
 
         rememberLiveTick(
           id,
-          Number.isFinite(ltp) && ltp > 0 ? ltp : null,
+          mcFast !== 1502 && Number.isFinite(ltp) && ltp > 0 ? ltp : null,
           Number.isFinite(bidN) ? bidN : null,
           Number.isFinite(askN) ? askN : null,
         );
+        if (mcFast !== 1502 && Number.isFinite(ltp) && ltp > 0) {
+          streamLtpAtRef.current.set(id, performance.now());
+          lastStreamLtpAtRef.current = Date.now();
+        }
 
-        if (Number.isFinite(ltp) && ltp > 0) {
-          if (tickTs != null) streamLtpTsRef.current.set(id, tickTs);
+        if (mcFast !== 1502 && Number.isFinite(ltp) && ltp > 0) {
           row.ltp = ltp;
           const prevHiLo = row.hiLo;
           if (!prevHiLo) row.hiLo = { h: ltp, l: ltp };
@@ -694,7 +777,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
             };
           }
         }
-        scheduleFlushSoon(flushScheduledRef, flushPending);
+        scheduleFlushSoon(flushScheduledRef, flushRafRef, flushPending);
     };
 
     let backoffMs = 500;
@@ -722,7 +805,6 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
             if (!t || typeof t !== "object") continue;
             applyStreamTick(t);
           }
-          flushPending();
         } catch {
           /* ignore */
         }
@@ -763,7 +845,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
 
     const flushIv = window.setInterval(() => {
       flushPending();
-    }, 250);
+    }, 50);
 
     staleWatchRef.current = window.setInterval(() => {
       const last = lastStreamLtpAtRef.current;
@@ -793,7 +875,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
-      cancelScheduledFlush(flushScheduledRef);
+      cancelScheduledFlush(flushScheduledRef, flushRafRef);
       if (esRef.current) {
         esRef.current.close();
         esRef.current = null;

@@ -12,7 +12,7 @@ from collections import deque
 from typing import Any
 
 from market.instrument_mapper import get_instrument_mapper
-from market.ltp_pick import apply_feed_ltp, pick_ltp_for_display, print_ts_from_tick
+from market.ltp_pick import apply_feed_ltp, pick_ltp_for_display, print_ts_from_tick, exchange_print_ts
 from market.ema21_engine import get_ema21_engine
 
 _log = logging.getLogger(__name__)
@@ -113,6 +113,7 @@ class TickEngine:
         d = m.enrich_tick(seg_i, token, raw)
         ts_wall = float(d.get("ts") or time.time())
         print_ts = print_ts_from_tick(d, ts_wall)
+        ex_ts = exchange_print_ts(d)
         try:
             mc = int(d.get("messageCode") or d.get("MessageCode") or 0)
         except Exception:
@@ -139,19 +140,21 @@ class TickEngine:
                 ltp_1501,
                 ltp_ts_1501,
                 float(d["_ltp1501"]),
-                float(d.get("_ltp1501_ts") or print_ts),
+                float(d.get("_ltp1501_ts") or ex_ts or print_ts),
+                wall_ok=True,
             )
         if float(d.get("_ltp1502") or 0.0) > 0:
             ltp_1502, ltp_ts_1502 = apply_feed_ltp(
                 ltp_1502,
                 ltp_ts_1502,
                 float(d["_ltp1502"]),
-                float(d.get("_ltp1502_ts") or print_ts),
+                float(d.get("_ltp1502_ts") or ex_ts),
+                wall_ok=False,
             )
-        if mc == 1501 and raw_ltp > 0:
-            ltp_1501, ltp_ts_1501 = apply_feed_ltp(ltp_1501, ltp_ts_1501, raw_ltp, print_ts)
-        elif mc == 1502 and raw_ltp > 0:
-            ltp_1502, ltp_ts_1502 = apply_feed_ltp(ltp_1502, ltp_ts_1502, raw_ltp, print_ts)
+        if mc in (1501, 1512) and raw_ltp > 0:
+            ltp_1501, ltp_ts_1501 = apply_feed_ltp(
+                ltp_1501, ltp_ts_1501, raw_ltp, ex_ts or print_ts, wall_ok=True
+            )
         new_ltp = pick_ltp_for_display(ltp_1501, ltp_1502, ltp_ts_1501, ltp_ts_1502, ts_wall)
         new_bid = float(d.get("bid") or d.get("bid_price") or 0.0)
         new_ask = float(d.get("ask") or d.get("ask_price") or 0.0)
@@ -181,6 +184,7 @@ class TickEngine:
             "timestamp": d.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_wall)),
             "exchangeSegment": seg_i,
             "token": token,
+            "messageCode": int(mc) if mc else int(d.get("messageCode") or 0),
             "bid_qty": int(d.get("bid_qty") or 0),
             "ask_qty": int(d.get("ask_qty") or 0),
         }

@@ -612,6 +612,32 @@ def md_nifty_ladder_open_drive():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.post("/api/md/nifty_snake/hedge_candidates")
+def md_nifty_snake_hedge_candidates():
+    """NIFTY Snake: far-OTM same-side strikes for a ~3–4 Rs long hedge."""
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    expiry = str(data.get("expiry") or data.get("expiryApi") or "").strip()
+    option_type = str(data.get("optionType") or data.get("side") or "").strip().upper()
+    try:
+        spot = float(data.get("spot") or data.get("spotLtp") or 0)
+        step = float(data.get("step") or 50)
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid spot/step"}), 400
+    try:
+        from market.nifty_snake import list_hedge_candidates
+
+        rows = list_hedge_candidates(expiry=expiry, option_type=option_type, spot=spot, step=step)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        app.logger.exception("md_nifty_snake_hedge_candidates failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "candidates": rows, "count": len(rows)})
+
+
 @app.post("/api/md/ema21/bootstrap")
 def md_ema21_bootstrap():
     """Priority OHLC seed for Ramsetu table legs — 1-min candle 5 EMA (Angel parity)."""
@@ -2225,6 +2251,10 @@ def md_subscribe():
                 out["1502"] = _MD_STREAMER.subscribe(instruments=instruments, xts_message_code=1502)
             except Exception as e2:
                 out["1502_notice"] = str(e2)
+            try:
+                out["1512"] = _MD_STREAMER.subscribe(instruments=instruments, xts_message_code=1512)
+            except Exception as e3:
+                out["1512_notice"] = str(e3)
 
         return jsonify({"ok": True, "result": out})
     except Exception as e:
@@ -2473,7 +2503,7 @@ def _flip_quote_pair_maps_from_response(raw: object) -> tuple[dict[int, float], 
     fetch_index_spot_ltp) and merges legacy _extract_* maps — some brokers return shapes the
     recursive visit() misses, which left Flip bootstrap with empty ltpMap/atpMap.
     """
-    from xts_md import _iter_quote_leaf_dicts, _positive_float, _touchline_derived_price
+    from xts_md import _iter_quote_leaf_dicts, _positive_float, _touchline_last_traded_price
 
     ltp_map: dict[int, float] = {}
     atp_map: dict[int, float] = {}
@@ -2532,7 +2562,7 @@ def _flip_quote_pair_maps_from_response(raw: object) -> tuple[dict[int, float], 
         iid = to_iid(leaf)
         if iid is None:
             continue
-        px = _touchline_derived_price(leaf)
+        px = _touchline_last_traded_price(leaf)
         if px is not None and px > 0 and iid not in ltp_map:
             ltp_map[iid] = float(px)
 
@@ -2688,8 +2718,6 @@ def _overlay_tick_engine_quote_maps(
             continue
         ltp = float(row.get("ltp") or 0.0)
         atp = float(row.get("atp") or 0.0)
-        if ltp > 0 and iid not in ltp_map:
-            ltp_map[iid] = ltp
         if atp > 0 and iid not in atp_map:
             atp_map[iid] = atp
 
@@ -2916,30 +2944,53 @@ def md_stream():
                 except queue.Empty:
                     yield sse(": ping\n\n")
                     continue
-                batch = [first]
+                burst: list = [first]
                 while True:
                     try:
-                        batch.append(q.get_nowait())
+                        burst.append(q.get_nowait())
                     except queue.Empty:
                         break
-                if len(batch) > 1:
-                    latest: dict[int, object] = {}
-                    extra: list = []
-                    for p in batch:
-                        if not isinstance(p, dict):
-                            extra.append(p)
-                            continue
-                        try:
-                            tid = int(p.get("exchangeInstrumentID") or p.get("token") or 0)
-                        except Exception:
-                            tid = 0
-                        if tid > 0:
-                            latest[tid] = p
-                        else:
-                            extra.append(p)
-                    batch = extra + list(latest.values())
-                for p in batch:
+                # Small burst: every print, so the number ticks with Snap Quote.
+                # Big backlog only: jump to latest so a fast drop is not stuck on 97.85.
+                if len(burst) <= 24:
+                    for p in burst:
+                        yield sse(f"data: {json.dumps(p, separators=(',', ':'))}\n\n")
+                    continue
+                latest: dict[int, dict] = {}
+                order: list[int] = []
+                extra: list = []
+                for p in burst:
+                    if not isinstance(p, dict):
+                        extra.append(p)
+                        continue
+                    try:
+                        tid = int(p.get("exchangeInstrumentID") or p.get("token") or 0)
+                    except Exception:
+                        tid = 0
+                    if tid <= 0:
+                        extra.append(p)
+                        continue
+                    prev = latest.get(tid)
+                    if prev is None:
+                        order.append(tid)
+                        latest[tid] = p
+                        continue
+                    merged = {**prev, **p}
+                    try:
+                        new_ltp = float(p.get("ltp") or 0.0)
+                    except Exception:
+                        new_ltp = 0.0
+                    try:
+                        prev_ltp = float(prev.get("ltp") or 0.0)
+                    except Exception:
+                        prev_ltp = 0.0
+                    if new_ltp <= 0 and prev_ltp > 0:
+                        merged["ltp"] = prev_ltp
+                    latest[tid] = merged
+                for p in extra:
                     yield sse(f"data: {json.dumps(p, separators=(',', ':'))}\n\n")
+                for tid in order:
+                    yield sse(f"data: {json.dumps(latest[tid], separators=(',', ':'))}\n\n")
         finally:
             try:
                 _MD_STREAMER.remove_listener(q)
@@ -4157,7 +4208,7 @@ if __name__ == "__main__":
     _debug = str(_env("FLASK_DEBUG", "0")).strip().lower() in ("1", "true", "yes", "on")
     _reloader = str(_env("FLASK_RELOADER", "0")).strip().lower() in ("1", "true", "yes", "on")
     app.run(
-        host=str(_env("FLASK_HOST", "127.0.0.1")),
+        host=str(_env("FLASK_HOST", "0.0.0.0")),
         port=int(_env("FLASK_PORT", "5000")),
         debug=_debug,
         use_reloader=_reloader and _debug,

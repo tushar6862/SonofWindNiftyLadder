@@ -10,18 +10,20 @@ export const BAND_HIGH = 105;
 export const BAND_TARGET = 100;
 export const STEP_PTS = 3;
 export const T1_COVER_PCT = 0.3;
-export const T1_HARD_SL_PCT = 0.7;
+export const T1_HARD_SL_PCT = 0.3;
 export const ENTRY_MINUTE = 9 * 60 + 16; // 09:16 IST
 export const EOD_MINUTE = 15 * 60 + 15; // 15:15 IST
 export const LOT_SIZE = 65;
 export const SIZE_MULTS = [1, 2, 3] as const;
-export const TRANCHE_LOTS = [5, 1, 1, 1, 2, 2, 2, 4, 4, 4, 8] as const;
-export const TRANCHE_COUNT = 11;
-export const MAX_PLAN_TICKS = 16;
+export const TRANCHE_LOTS = [8, 2, 2, 2, 2, 3, 3, 4, 4] as const;
+export const TRANCHE_COUNT = TRANCHE_LOTS.length;
+export const MAX_PLAN_TICKS = TRANCHE_COUNT * 2;
 export const LADDER_CLOCK_MS = 25;
 /** Strikes each side of live ATM to subscribe for the ~100 hunt (not the full chain). */
 export const LADDER_HUNT_WINGS = 10;
 export const ROUND_TRIP_COST_PER_LOT = 25;
+export const LOTS_EDIT_MIN = 1;
+export const LOTS_EDIT_MAX = 100;
 
 export type OptionType = "CE" | "PE";
 export type SizeMult = (typeof SIZE_MULTS)[number];
@@ -50,15 +52,18 @@ export type PlanTickInput = {
   nowMs: number;
   armed: boolean;
   awaitRestart: boolean;
+  awaitReload: boolean;
   t1Fill: number | null;
   slots: LadderSlot[];
   ltp: number | null;
   huntPick: HuntPick | null;
+  brokerShortLots: number | null;
 };
 
 export type LadderAction =
   | { kind: "enter_t1"; pick: HuntPick }
-  | { kind: "add"; index: number; lots: number }
+  | { kind: "add"; indices: number[]; lots: number }
+  | { kind: "reload"; indices: number[]; lots: number }
   | { kind: "book"; index: number; lots: number; reason: string };
 
 function istParts(nowMs: number): { hh: number; mm: number; y: number; mo: number; d: number } {
@@ -114,15 +119,20 @@ export function lotsForMult(mult: SizeMult): number[] {
 export function emptySlots(mult: SizeMult = 1): LadderSlot[] {
   return lotsForMult(mult).map((lots, i) => ({
     index: i + 1,
-    lots,
+    lots: clampLots(lots),
     open: false,
     fill: null,
   }));
 }
 
+export function clampLots(n: number): number {
+  if (!Number.isFinite(n)) return LOTS_EDIT_MIN;
+  return Math.min(LOTS_EDIT_MAX, Math.max(LOTS_EDIT_MIN, Math.floor(n)));
+}
+
 export function applySizeToEmptySlots(slots: LadderSlot[], mult: SizeMult): LadderSlot[] {
   const lots = lotsForMult(mult);
-  return slots.map((s, i) => (s.open ? s : { ...s, lots: lots[i] ?? s.lots }));
+  return slots.map((s, i) => (s.open ? s : { ...s, lots: clampLots(lots[i] ?? s.lots) }));
 }
 
 export function cloneSlots(slots: LadderSlot[]): LadderSlot[] {
@@ -132,6 +142,15 @@ export function cloneSlots(slots: LadderSlot[]): LadderSlot[] {
 export function isInTrade(slots: LadderSlot[], t1Fill: number | null): boolean {
   const t1 = slots.find((s) => s.index === 1);
   return Boolean(t1?.open && t1Fill != null && t1Fill > 0);
+}
+
+export function isGridLocked(state: Pick<LadderEngineState, "t1Fill">): boolean {
+  return state.t1Fill != null && state.t1Fill > 0;
+}
+
+/** Side/size lock, overlay, and session still live (open tabs or hard-SL reload). */
+export function isLiveLadder(state: LadderEngineState): boolean {
+  return Boolean(state.awaitReload || isInTrade(state.slots, state.t1Fill) || openLots(state.slots) > 0);
 }
 
 export function openLots(slots: LadderSlot[]): number {
@@ -256,6 +275,26 @@ function firstEmptyExtra(slots: LadderSlot[]): LadderSlot | null {
   return null;
 }
 
+/** Consecutive empty extras from the first hole whose Add is already crossed. No skip. */
+function collectCrossedExtras(slots: LadderSlot[], t1Fill: number, ltp: number): LadderSlot[] {
+  if (!firstEmptyExtra(slots)) return [];
+  const extras = slots.filter((s) => s.index >= 2).sort((a, b) => a.index - b.index);
+  const out: LadderSlot[] = [];
+  for (const s of extras) {
+    if (s.open) {
+      if (out.length) break;
+      continue;
+    }
+    if (ltp >= addLevel(t1Fill, s.index)) out.push(s);
+    else break;
+  }
+  return out;
+}
+
+function collectEmptySlots(slots: LadderSlot[]): LadderSlot[] {
+  return slots.slice().sort((a, b) => a.index - b.index).filter((s) => !s.open);
+}
+
 function validLtp(ltp: number | null | undefined): ltp is number {
   return typeof ltp === "number" && Number.isFinite(ltp) && ltp > 0;
 }
@@ -264,42 +303,67 @@ function bookAction(slot: LadderSlot, reason: string): LadderAction {
   return { kind: "book", index: slot.index, lots: slot.lots, reason };
 }
 
+export function isHardSlReason(reason: string): boolean {
+  return reason.toUpperCase().includes("HARD SL");
+}
+
+export function isEodReason(reason: string): boolean {
+  return reason.toUpperCase().includes("EOD");
+}
+
 /**
- * ONE next action. Caller MUST loop until null (max ~16) so a spike can
- * open T2–T4 in one burst, and a gap-down can book extras then T1 in order.
+ * ONE next action. Caller MUST loop until null so a spike can add T2–T9
+ * in one burst, and a gap-down can book extras then T1 in order.
  * Priority is strict: first match wins.
  */
 export function planTick(input: PlanTickInput): LadderAction | null {
-  const { nowMs, armed, awaitRestart, t1Fill, slots, ltp, huntPick } = input;
-  const trading = isInTrade(slots, t1Fill);
+  const { nowMs, armed, awaitRestart, awaitReload, t1Fill, slots, ltp, huntPick, brokerShortLots } =
+    input;
+  const gridLocked = t1Fill != null && t1Fill > 0;
+  const anyOpen = slots.some((s) => s.open);
 
-  // 1) EOD (istMinuteOfDay >= 15:15)
+  // 1) EOD 15:15 — flatten highest-open. Never reload / never new hunt.
   if (isEod(nowMs)) {
-    if (!trading) return null;
     const hi = highestOpen(slots);
     if (!hi) return null;
     return bookAction(hi, `EOD 15:15 · T${hi.index}`);
   }
 
-  // 2) Not inTrade
-  if (!trading) {
+  // 2) HARD SL — LTP >= t1*1.30: flatten highest-open until flat. Do not add.
+  if (gridLocked && validLtp(ltp) && ltp >= t1HardSlPrice(t1Fill)) {
+    const hi = highestOpen(slots);
+    if (hi) return bookAction(hi, `HARD SL +30% · flatten T${hi.index}`);
+  }
+
+  // 3) HARD-SL RELOAD — same locked t1Fill, T1–T9 full book.
+  if (awaitReload) {
+    if (!armed) return null;
+    if (!gridLocked) return null;
+    if (!validLtp(ltp) || ltp >= t1HardSlPrice(t1Fill)) return null;
+    if (brokerShortLots == null || brokerShortLots > 0) return null;
+    const empty = collectEmptySlots(slots);
+    if (!empty.length) return null;
+    return {
+      kind: "reload",
+      indices: empty.map((s) => s.index),
+      lots: empty.reduce((n, s) => n + s.lots, 0),
+    };
+  }
+
+  // 4) HUNT T1 — not in trade, armed, after 09:16, in-band pick only.
+  if (!anyOpen && !gridLocked) {
     if (!armed || awaitRestart) return null;
     if (!isEntryWindow(nowMs)) return null;
     if (!huntPick) return null;
     return { kind: "enter_t1", pick: huntPick };
   }
 
-  // 3) inTrade but ltp invalid
-  if (!validLtp(ltp) || t1Fill == null || !(t1Fill > 0)) return null;
+  if (!gridLocked) return null;
 
-  // 4) HARD SL: ltp >= t1Fill * 1.70
-  if (ltp >= t1HardSlPrice(t1Fill)) {
-    const hi = highestOpen(slots);
-    if (!hi) return null;
-    return bookAction(hi, `HARD SL +70% · flatten T${hi.index}`);
-  }
+  // 5) Invalid LTP — wait.
+  if (!validLtp(ltp)) return null;
 
-  // 5) T1 COVER path: ltp <= t1Fill * 0.70
+  // 6) T1 cover path LTP <= t1*0.70 → extras first, then T1.
   if (ltp <= t1CoverPrice(t1Fill)) {
     const extra = highestOpenExtra(slots);
     if (extra) {
@@ -310,21 +374,24 @@ export function planTick(input: PlanTickInput): LadderAction | null {
     return null;
   }
 
-  // 6) Extra −3 book (T1 is NEVER booked by this rule)
+  // 7) Extra −3 (T1 is NEVER booked by this rule)
   const highestExtra = highestOpenExtra(slots);
   if (highestExtra && ltp <= bookLevel(t1Fill, highestExtra.index)) {
     return bookAction(highestExtra, `T${highestExtra.index} −3`);
   }
 
-  // 7) Adds only if armed === true (PAUSE blocks this)
+  // 8) Adds if armed — consecutive crossed extras, one combined SELL, no skip.
   if (armed === true) {
-    const next = firstEmptyExtra(slots);
-    if (next && ltp >= addLevel(t1Fill, next.index)) {
-      return { kind: "add", index: next.index, lots: next.lots };
+    const group = collectCrossedExtras(slots, t1Fill, ltp);
+    if (group.length) {
+      return {
+        kind: "add",
+        indices: group.map((s) => s.index),
+        lots: group.reduce((n, s) => n + s.lots, 0),
+      };
     }
   }
 
-  // 8) else null
   return null;
 }
 
@@ -335,8 +402,7 @@ export function nextSquareAllAction(slots: LadderSlot[]): LadderAction | null {
 }
 
 export function reasonAwaitsRestart(reason: string): boolean {
-  const u = reason.toUpperCase();
-  return !u.includes("EOD") && !u.includes("SQUARE");
+  return !isHardSlReason(reason) && !isEodReason(reason);
 }
 
 export type LadderEngineState = {
@@ -344,6 +410,7 @@ export type LadderEngineState = {
   sizeMult: SizeMult;
   armed: boolean;
   awaitRestart: boolean;
+  awaitReload: boolean;
   slots: LadderSlot[];
   t1Fill: number | null;
   strike: number | null;
@@ -358,9 +425,35 @@ export function idleEngineState(
     sizeMult,
     armed: false,
     awaitRestart: false,
+    awaitReload: false,
     slots: emptySlots(sizeMult),
     t1Fill: null,
     strike: null,
+  };
+}
+
+function closeAllKeepLots(slots: LadderSlot[]): LadderSlot[] {
+  return slots.map((s) => ({ ...s, open: false, fill: null }));
+}
+
+function afterFlatten(state: LadderEngineState, slots: LadderSlot[], reason: string): LadderEngineState {
+  if (!slots.every((s) => !s.open)) return { ...state, slots };
+  if (isHardSlReason(reason) && state.t1Fill != null && state.t1Fill > 0 && state.strike != null) {
+    return {
+      ...state,
+      slots: closeAllKeepLots(slots),
+      awaitReload: true,
+      awaitRestart: false,
+    };
+  }
+  return {
+    ...state,
+    slots: closeAllKeepLots(slots),
+    t1Fill: null,
+    strike: null,
+    armed: false,
+    awaitReload: false,
+    awaitRestart: reasonAwaitsRestart(reason),
   };
 }
 
@@ -373,55 +466,42 @@ export function applyFilledAction(
   const slots = cloneSlots(state.slots);
   if (action.kind === "enter_t1") {
     const t1 = slots.find((s) => s.index === 1);
+    const print = fillPx > 0 ? fillPx : action.pick.ltp;
     if (t1) {
       t1.open = true;
-      t1.fill = fillPx;
+      t1.fill = print;
     }
     return {
       ...state,
-      t1Fill: fillPx,
+      t1Fill: print,
+      awaitReload: false,
       strike: action.pick.strike,
       optionType: action.pick.optionType,
       slots,
       awaitRestart: false,
     };
   }
-  if (action.kind === "add") {
-    const slot = slots.find((s) => s.index === action.index);
-    if (slot) {
-      slot.open = true;
-      slot.fill = fillPx;
+  if (action.kind === "add" || action.kind === "reload") {
+    for (const idx of action.indices) {
+      const slot = slots.find((s) => s.index === idx);
+      if (slot) {
+        slot.open = true;
+        slot.fill = fillPx;
+      }
     }
-    return { ...state, slots };
+    const fullBook = slots.every((s) => s.open);
+    return {
+      ...state,
+      slots,
+      awaitReload: action.kind === "reload" && !fullBook,
+    };
   }
   const slot = slots.find((s) => s.index === action.index);
   if (slot) {
     slot.open = false;
     slot.fill = null;
   }
-  if (action.index === 1) {
-    return {
-      ...state,
-      slots: emptySlots(state.sizeMult),
-      t1Fill: null,
-      strike: null,
-      armed: false,
-      awaitRestart: reasonAwaitsRestart(action.reason),
-    };
-  }
-  return { ...state, slots };
-}
-
-/** If broker reports T1 fill and no extras are open yet, replace t1Fill (shifts the grid). */
-export function maybeConfirmT1Fill(state: LadderEngineState, confirmedFill: number): LadderEngineState {
-  if (!isInTrade(state.slots, state.t1Fill)) return state;
-  if (!(confirmedFill > 0) || !Number.isFinite(confirmedFill)) return state;
-  const extrasOpen = state.slots.some((s) => s.open && s.index > 1);
-  if (extrasOpen) return state;
-  const slots = cloneSlots(state.slots);
-  const t1 = slots.find((s) => s.index === 1);
-  if (t1) t1.fill = confirmedFill;
-  return { ...state, t1Fill: confirmedFill, slots };
+  return afterFlatten(state, slots, action.reason);
 }
 
 export type ReconcileResult = {
@@ -440,8 +520,11 @@ export function reconcileBrokerShortLots(
   state: LadderEngineState,
   brokerShortLots: number,
 ): ReconcileResult {
-  const trading = isInTrade(state.slots, state.t1Fill);
+  const trading = isInTrade(state.slots, state.t1Fill) || openLots(state.slots) > 0;
   const brokerLots = Math.max(0, Math.floor(brokerShortLots));
+  if (state.awaitReload && brokerLots <= 0) {
+    return { state, phantomClosed: [], brokerFlat: true };
+  }
   if (trading && brokerLots <= 0) {
     return {
       state: idleEngineState(state.optionType, state.sizeMult),
@@ -503,6 +586,7 @@ export function localNewDayReset(state: LadderEngineState): LadderEngineState {
     ...state,
     armed: false,
     awaitRestart: false,
+    awaitReload: false,
     slots: emptySlots(state.sizeMult),
     t1Fill: null,
     strike: null,
@@ -513,9 +597,9 @@ export function uiReset(state: LadderEngineState): LadderEngineState {
   return idleEngineState(state.optionType, state.sizeMult);
 }
 
-/** Persist while armed or still in trade. Clear after square-all / all books / idle. */
+/** Persist while armed or still in trade (incl. T1 working / hard-SL reload). */
 export function ladderSessionActive(state: LadderEngineState): boolean {
-  return Boolean(state.armed || isInTrade(state.slots, state.t1Fill));
+  return Boolean(state.armed || isLiveLadder(state));
 }
 
 export const LADDER_STORE_KEY = "sow_nifty_ladder_v1";
@@ -547,7 +631,7 @@ function sanitizeIid(raw: unknown): number | null {
   return Math.floor(raw);
 }
 
-function sanitizeSlots(raw: unknown, sizeMult: SizeMult): LadderSlot[] | null {
+function sanitizeSlots(raw: unknown, _sizeMult: SizeMult): LadderSlot[] | null {
   if (!Array.isArray(raw) || raw.length !== TRANCHE_COUNT) return null;
   const slots: LadderSlot[] = [];
   for (let i = 0; i < TRANCHE_COUNT; i++) {
@@ -565,15 +649,10 @@ function sanitizeSlots(raw: unknown, sizeMult: SizeMult): LadderSlot[] | null {
     if (open && fill == null) return null;
     slots.push({
       index,
-      lots: Math.max(1, Math.floor(lots)),
+      lots: clampLots(lots),
       open,
       fill: open ? fill : null,
     });
-  }
-  const expected = lotsForMult(sizeMult);
-  const anyOpen = slots.some((s) => s.open);
-  if (!anyOpen) {
-    return slots.map((s, i) => ({ ...s, lots: expected[i] ?? s.lots }));
   }
   return slots;
 }
@@ -607,25 +686,29 @@ export function sanitizeLadderEngine(raw: unknown): LadderEngineState | null {
   if (!slots) return null;
   const t1 = slots.find((s) => s.index === 1);
   const t1FillRaw = rec.t1Fill;
-  let t1Fill =
-    typeof t1FillRaw === "number" && Number.isFinite(t1FillRaw) && t1FillRaw > 0 ? t1FillRaw : null;
-  if (t1?.open && t1.fill != null && t1.fill > 0) {
-    t1Fill = t1Fill ?? t1.fill;
-  }
+  const t1Fill =
+    typeof t1FillRaw === "number" && Number.isFinite(t1FillRaw) && t1FillRaw > 0
+      ? t1FillRaw
+      : t1?.open && t1.fill != null && t1.fill > 0
+        ? t1.fill
+        : null;
   const strikeRaw = rec.strike;
   const strike =
     typeof strikeRaw === "number" && Number.isFinite(strikeRaw) && strikeRaw > 0
       ? strikeRaw
       : null;
+  const awaitReload = Boolean(rec.awaitReload) && t1Fill != null && strike != null;
   const engine: LadderEngineState = {
     optionType,
     sizeMult,
     armed: Boolean(rec.armed),
     awaitRestart: Boolean(rec.awaitRestart),
+    awaitReload,
     slots,
     t1Fill,
     strike,
   };
+  if (engine.awaitReload && (engine.strike == null || engine.t1Fill == null)) return null;
   if (isInTrade(engine.slots, engine.t1Fill) && (engine.strike == null || engine.t1Fill == null)) {
     return null;
   }

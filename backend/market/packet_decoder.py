@@ -125,6 +125,30 @@ def _decode_touchline_1501_payload(payload: bytes, start: int = 0):
     )
 
 
+def _decode_ltp_1512_payload(payload: bytes, start: int = 0):
+    off = start
+    if off + 2 > len(payload):
+        return None, start
+    code = struct.unpack_from("<H", payload, off)[0]
+    off += 2
+    if code != 1512:
+        return None, start
+    off, ex_seg, ex_id = _read_common_header(payload, off)
+    ltp = 0.0
+    if off + 8 <= len(payload):
+        ltp = float(struct.unpack_from("<d", payload, off)[0])
+        off += 8
+    return (
+        {
+            "MessageCode": 1512,
+            "ExchangeSegment": ex_seg,
+            "ExchangeInstrumentID": ex_id,
+            "Touchline": {"LastTradedPrice": ltp},
+        },
+        off,
+    )
+
+
 def _decode_marketdepth_1502_sdk_payload(payload: bytes, start: int = 0):
     off = start
     if off + 2 > len(payload):
@@ -280,6 +304,8 @@ def _decode_inner_messages(payload: bytes) -> list[dict[str, Any]]:
                     if legacy:
                         out.append(legacy)
                     break
+            elif peek == 1512:
+                parsed, end = _decode_ltp_1512_payload(payload, pos)
             elif peek == 1510:
                 parsed, end = _decode_open_interest_1510_payload(payload, pos)
             else:
@@ -307,7 +333,7 @@ def _instrument_int(x: Any) -> int | None:
 
 def _msg_to_dashboard_row(msg: dict[str, Any]) -> dict[str, Any] | None:
     mc = msg.get("MessageCode")
-    if mc not in (1501, 1502):
+    if mc not in (1501, 1502, 1512):
         return None
     seg_raw = msg.get("ExchangeSegment")
     tid = _instrument_int(msg.get("ExchangeInstrumentID"))
@@ -388,6 +414,12 @@ def _msg_to_dashboard_row(msg: dict[str, Any]) -> dict[str, Any] | None:
         "exchangeInstrumentID": tid,
         "ts": time.time(),
     }
+    if int(mc) in (1501, 1512) and ltp > 0:
+        out["_ltp1501"] = ltp
+        out["_ltp1501_ts"] = float(out["exchange_ts"] or wall)
+    elif int(mc) == 1502 and ltp > 0:
+        out["_ltp1502"] = ltp
+        out["_ltp1502_ts"] = float(out["exchange_ts"] or 0.0)
     # Previous-session close vs live LTP (TopBar day change — not drift vs chain snapshot).
     if prev_close > 0 and ltp > 0 and abs(prev_close - ltp) >= max(0.01, ltp * 1e-5):
         out["prevClose"] = prev_close

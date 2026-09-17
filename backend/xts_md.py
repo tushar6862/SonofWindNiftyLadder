@@ -9,7 +9,7 @@ from typing import Any, Callable, Iterable
 
 import requests
 
-from market.ltp_pick import apply_feed_ltp, pick_ltp_for_display, print_ts_from_tick
+from market.ltp_pick import apply_feed_ltp, exchange_print_ts, pick_ltp_for_display, print_ts_from_tick
 from market.packet_decoder import decode_xts_binary_packet
 
 
@@ -58,7 +58,8 @@ XTS_MD_ROOT = _env("XTS_MD_ROOT", "https://trading.investeria.in").rstrip("/")
 XTS_MD_SOURCE = _env("XTS_MD_SOURCE", "WEBAPI")
 XTS_MD_SOCKETIO_PATH = _env("XTS_MD_SOCKETIO_PATH", "apibinarymarketdata/socket.io")
 XTS_MD_PUBLISH_FORMAT = _env("XTS_MD_PUBLISH_FORMAT", "JSON")
-XTS_MD_BROADCAST_MODE = _env("XTS_MD_BROADCAST_MODE", "Full")
+# Partial = tick-to-tick 1501/1512-json-partial (Snap Quote LTP). Full = slow snapshots.
+XTS_MD_BROADCAST_MODE = _env("XTS_MD_BROADCAST_MODE", "Partial")
 # Brokers often reject one bad token in a batch — cap chunk size via env when needed (e.g. 32).
 # Many XTS gateways reject >100 instruments per REST subscribe (see e-quotes-0003 in OEM docs).
 XTS_MD_SUBSCRIBE_CHUNK = max(8, min(int(_env("XTS_MD_SUBSCRIBE_CHUNK", "96")), 100))
@@ -70,6 +71,8 @@ XTS_MD_ATP_REFRESH_SEC = max(0.0, float(_env("XTS_MD_ATP_REFRESH_SEC", "1.5") or
 XTS_MD_ATP_CHUNK = max(8, min(int(_env("XTS_MD_ATP_CHUNK", "40")), 100))
 # Symphony CandleDataEvent (message 1505) — opt-in; doubles subscription count.
 XTS_MD_SUBSCRIBE_1505 = str(_env("XTS_MD_SUBSCRIBE_1505", "0")).strip().lower() not in ("0", "false", "no", "off")
+# 1512 = Snap Quote LTP event (tick-to-tick LastTradedPrice). Default on with 1501.
+XTS_MD_SUBSCRIBE_1512 = str(_env("XTS_MD_SUBSCRIBE_1512", "1")).strip().lower() not in ("0", "false", "no", "off")
 # Reconnect Socket.IO when no binary ticks for this many seconds (ATP refresh does not count).
 XTS_MD_SOCKET_STALE_SEC = max(15.0, float(_env("XTS_MD_SOCKET_STALE_SEC", "45") or "45"))
 
@@ -135,6 +138,322 @@ def _symphony_candle_fields(data: Any) -> dict[str, Any] | None:
     return out
 
 
+def _plausible_md_px(x: float) -> bool:
+    if not (x > 0) or x != x:
+        return False
+    if 1e9 <= x < 2e10:
+        return False
+    if x >= 1e12:
+        return False
+    return True
+
+
+def _tick_from_xts_partial_str(raw: str, message_code: int) -> dict[str, Any] | None:
+    s = str(raw or "").strip().replace("|", ",")
+    if not s:
+        return None
+    if ":" in s and any(k in s.lower() for k in ("ltp:", "lt:", "t:", "p:")):
+        parts: dict[str, str] = {}
+        for kv in s.split(","):
+            if ":" not in kv:
+                continue
+            k, v = kv.split(":", 1)
+            parts[k.strip().lower()] = v.strip()
+        tok = parts.get("t") or parts.get("token") or ""
+        seg = 0
+        tid = 0
+        if "_" in tok:
+            a, b = tok.split("_", 1)
+            try:
+                tid = int(b)
+            except Exception:
+                tid = 0
+            if a.isdigit():
+                try:
+                    seg = int(a)
+                except Exception:
+                    seg = 0
+        else:
+            try:
+                tid = int(tok)
+            except Exception:
+                tid = 0
+        try:
+            ltp = float(
+                parts.get("ltp")
+                or parts.get("lt")
+                or parts.get("p")
+                or parts.get("lasttradedprice")
+                or 0.0
+            )
+        except Exception:
+            ltp = 0.0
+        try:
+            bid = float(parts.get("bp") or parts.get("b") or parts.get("bid") or 0.0)
+        except Exception:
+            bid = 0.0
+        try:
+            ask = float(parts.get("ap") or parts.get("a") or parts.get("ask") or 0.0)
+        except Exception:
+            ask = 0.0
+        try:
+            atp = float(parts.get("atp") or parts.get("avg") or 0.0)
+        except Exception:
+            atp = 0.0
+        try:
+            ltt = float(parts.get("ltt") or parts.get("lasttradedtime") or parts.get("tt") or 0.0)
+        except Exception:
+            ltt = 0.0
+        if tid <= 0:
+            return None
+        if int(message_code) == 1502:
+            ltp = 0.0
+        return _dashboard_tick_from_fields(message_code, seg, tid, ltp, bid, ask, atp, ltt)
+    cols = [c.strip() for c in s.split(",") if c.strip() != ""]
+    if len(cols) >= 2 and int(message_code) in (1501, 1512):
+        start = 0
+        try:
+            if int(float(cols[0])) in (1501, 1512, 1502):
+                start = 1
+        except Exception:
+            start = 0
+        n = len(cols) - start
+        if n == 2:
+            tok = cols[start]
+            try:
+                ltp_i = float(cols[start + 1])
+            except Exception:
+                return None
+            if "_" in tok:
+                seg_i, tid_i = _seg_tid_from_t_token(tok)
+            else:
+                try:
+                    tid_i = int(float(tok))
+                except Exception:
+                    tid_i = 0
+                seg_i = 0
+            if tid_i > 0 and _plausible_md_px(ltp_i):
+                return _dashboard_tick_from_fields(int(message_code), seg_i, tid_i, ltp_i, 0.0, 0.0, 0.0)
+        if n >= 3:
+            try:
+                seg_i = int(float(cols[start]))
+                tid_i = int(float(cols[start + 1]))
+                third = float(cols[start + 2])
+            except Exception:
+                return None
+            ltp_off = 2
+            ltp_i = third
+            if not _plausible_md_px(third) and n >= 4:
+                try:
+                    ltp_i = float(cols[start + 3])
+                    ltp_off = 3
+                except Exception:
+                    return None
+            ltt_i = 0.0
+            ltt_off = ltp_off + 6
+            if n > ltt_off:
+                try:
+                    ltt_i = float(cols[start + ltt_off])
+                except Exception:
+                    ltt_i = 0.0
+            atp_i = 0.0
+            atp_off = ltp_off + 5
+            if n > atp_off:
+                try:
+                    atp_i = float(cols[start + atp_off])
+                except Exception:
+                    atp_i = 0.0
+            if tid_i > 0 and _plausible_md_px(ltp_i):
+                return _dashboard_tick_from_fields(
+                    int(message_code), seg_i, tid_i, ltp_i, 0.0, 0.0, atp_i, ltt_i
+                )
+    return None
+
+
+def _unix_print_ts(v: float) -> float:
+    if v > 1e12:
+        v /= 1000.0
+    if v > 1e9:
+        return float(v)
+    return 0.0
+
+
+def _dashboard_tick_from_fields(
+    message_code: int,
+    seg: int,
+    tid: int,
+    ltp: float,
+    bid: float,
+    ask: float,
+    atp: float,
+    ltt: float = 0.0,
+) -> dict[str, Any]:
+    wall = time.time()
+    ex_ts = _unix_print_ts(float(ltt or 0.0))
+    out: dict[str, Any] = {
+        "symbol": "",
+        "ltp": float(ltp or 0.0),
+        "atp": float(atp or 0.0),
+        "bid": float(bid or 0.0),
+        "ask": float(ask or 0.0),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall)),
+        "segment": int(seg or 0),
+        "token": int(tid),
+        "messageCode": int(message_code),
+        "exchangeSegment": int(seg or 0),
+        "exchangeInstrumentID": int(tid),
+        "ts": wall,
+        "exchange_ts": ex_ts,
+    }
+    if ex_ts > 0:
+        out["LastTradedTime"] = ex_ts
+    if int(message_code) in (1501, 1512) and ltp > 0:
+        out["_ltp1501"] = float(ltp)
+        out["_ltp1501_ts"] = ex_ts or wall
+    elif int(message_code) == 1502:
+        # Depth: bid/ask only. Never copy book px into Snap Quote LTP.
+        if float(ltp or 0.0) > 0:
+            out["_ltp1502"] = float(ltp)
+            out["_ltp1502_ts"] = ex_ts
+    return out
+
+
+def _seg_tid_from_t_token(tok: object) -> tuple[int, int]:
+    s = str(tok or "").strip()
+    if "_" not in s:
+        try:
+            return 0, int(s)
+        except Exception:
+            return 0, 0
+    a, b = s.split("_", 1)
+    tid = 0
+    seg = 0
+    try:
+        tid = int(b)
+    except Exception:
+        return 0, 0
+    if a.isdigit():
+        try:
+            seg = int(a)
+        except Exception:
+            seg = 0
+    return seg, tid
+
+
+def _tick_from_xts_json_leaf(leaf: dict[str, Any], message_code: int) -> dict[str, Any] | None:
+    tok = leaf.get("t") or leaf.get("T")
+    seg, tid = _seg_tid_from_t_token(tok) if tok else (0, 0)
+    if tid <= 0:
+        tid = first_exchange_instrument_id(leaf) or 0
+    if tid <= 0:
+        return None
+    if seg <= 0:
+        try:
+            seg = int(leaf.get("ExchangeSegment") or leaf.get("exchangeSegment") or leaf.get("segment") or 0)
+        except Exception:
+            seg = 0
+    ltp = float(
+        _positive_float(leaf.get("ltp") or leaf.get("LTP") or leaf.get("p") or leaf.get("P"))
+        or _touchline_last_traded_price(leaf)
+        or 0.0
+    )
+    tl = leaf.get("Touchline") or leaf.get("touchline") or leaf.get("TouchLine") or leaf.get("touchLine")
+    if not isinstance(tl, dict):
+        tl = {}
+    bid = 0.0
+    ask = 0.0
+    bi = tl.get("BidInfo") if isinstance(tl.get("BidInfo"), dict) else leaf.get("BidInfo")
+    ai = tl.get("AskInfo") if isinstance(tl.get("AskInfo"), dict) else leaf.get("AskInfo")
+    if isinstance(bi, dict):
+        bid = float(_positive_float(bi.get("Price") or bi.get("price")) or 0.0)
+    if isinstance(ai, dict):
+        ask = float(_positive_float(ai.get("Price") or ai.get("price")) or 0.0)
+    if bid <= 0:
+        bid = float(_positive_float(leaf.get("BidPrice") or leaf.get("bid") or tl.get("BidPrice")) or 0.0)
+    if ask <= 0:
+        ask = float(_positive_float(leaf.get("AskPrice") or leaf.get("ask") or tl.get("AskPrice")) or 0.0)
+    atp = float(
+        _positive_float(tl.get("AverageTradedPrice") or leaf.get("AverageTradedPrice") or leaf.get("atp")) or 0.0
+    )
+    ltt = float(
+        _positive_float(
+            leaf.get("LastTradedTime")
+            or leaf.get("lastTradedTime")
+            or tl.get("LastTradedTime")
+            or tl.get("lastTradedTime")
+            or leaf.get("ltt")
+        )
+        or 0.0
+    )
+    if ltp <= 0 and bid <= 0 and ask <= 0 and atp <= 0:
+        return None
+    if int(message_code) == 1502:
+        ltp = 0.0
+    return _dashboard_tick_from_fields(message_code, seg, int(tid), ltp, bid, ask, atp, ltt)
+
+
+def _ticks_from_xts_json_event(data: Any, message_code: int) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    def walk(x: Any) -> None:
+        if x is None:
+            return
+        if isinstance(x, (bytes, bytearray, memoryview)):
+            try:
+                x = bytes(x).decode("utf-8", "replace")
+            except Exception:
+                return
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return
+            if s[0] in "{[":
+                try:
+                    walk(json.loads(s))
+                    return
+                except Exception:
+                    pass
+            tick = _tick_from_xts_partial_str(s, message_code)
+            if tick:
+                out.append(tick)
+            return
+        if isinstance(x, list):
+            for y in x:
+                walk(y)
+            return
+        if isinstance(x, dict):
+            if x.get("t") is not None and (
+                x.get("ltp") is not None
+                or x.get("LTP") is not None
+                or x.get("LastTradedPrice") is not None
+                or x.get("p") is not None
+                or x.get("P") is not None
+            ):
+                tick = _tick_from_xts_json_leaf(x, message_code)
+                if tick:
+                    out.append(tick)
+                return
+            leaves = list(_iter_quote_leaf_dicts(x))
+            if leaves:
+                for leaf in leaves:
+                    if isinstance(leaf, dict):
+                        tick = _tick_from_xts_json_leaf(leaf, message_code)
+                        if tick:
+                            out.append(tick)
+                if out:
+                    return
+            tick = _tick_from_xts_json_leaf(x, message_code)
+            if tick:
+                out.append(tick)
+                return
+            for v in x.values():
+                if isinstance(v, (str, list, dict)):
+                    walk(v)
+
+    walk(data)
+    return out
+
+
 def _md_tick_message_code(tick: dict[str, Any]) -> int:
     try:
         return int(tick.get("messageCode") or tick.get("MessageCode") or 0)
@@ -157,7 +476,7 @@ def _md_tick_ltp(tick: dict[str, Any]) -> float:
 
 
 def _md_tick_ts(tick: dict[str, Any]) -> float:
-    return print_ts_from_tick(tick, time.time())
+    return exchange_print_ts(tick)
 
 
 def _merge_preserve_price_fields(prev: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
@@ -177,8 +496,8 @@ def _coalesce_merge_ticks(prev: dict[str, Any], new: dict[str, Any]) -> dict[str
     """
     Merge coalesced socket ticks for the same instrument.
 
-    Track 1501 (touchline) and 1502 (depth) ATP separately; display ATP prefers 1501
-    (XTS Snap Quote Mace) but LTP uses the newest last-trade print (tick-to-tick).
+    Track 1501 (touchline) and 1502 (depth) ATP separately; display ATP and LTP both
+    prefer 1501 (XTS Snap Quote Mace / LastTradedPrice). Depth is bid/ask only.
     """
     out = _merge_preserve_price_fields(prev, {**prev, **new})
     atp1501 = float(prev.get("_atp1501") or 0.0)
@@ -205,10 +524,10 @@ def _coalesce_merge_ticks(prev: dict[str, Any], new: dict[str, Any]) -> dict[str
         if l <= 0:
             continue
         ts = _md_tick_ts(t)
-        if mc == 1501:
-            ltp1501, ltp_ts_1501 = apply_feed_ltp(ltp1501, ltp_ts_1501, l, ts)
+        if mc in (1501, 1512):
+            ltp1501, ltp_ts_1501 = apply_feed_ltp(ltp1501, ltp_ts_1501, l, ts or time.time(), wall_ok=True)
         elif mc == 1502:
-            ltp1502, ltp_ts_1502 = apply_feed_ltp(ltp1502, ltp_ts_1502, l, ts)
+            ltp1502, ltp_ts_1502 = apply_feed_ltp(ltp1502, ltp_ts_1502, l, ts, wall_ok=False)
         # 1505 candle events must not drive touchline LTP (minute close ≠ live tick).
     out["_ltp1501"] = ltp1501
     out["_ltp1502"] = ltp1502
@@ -217,8 +536,6 @@ def _coalesce_merge_ticks(prev: dict[str, Any], new: dict[str, Any]) -> dict[str
     picked = pick_ltp_for_display(ltp1501, ltp1502, ltp_ts_1501, ltp_ts_1502)
     if picked > 0:
         out["ltp"] = picked
-    if atp1501 > 0:
-        out["messageCode"] = 1501
     return out
 
 
@@ -1268,8 +1585,37 @@ def _expand_json_strings(obj: Any, depth: int = 0) -> Any:
     return obj
 
 
+def _touchline_last_traded_price(block: dict[str, Any]) -> float | None:
+    """XTS Snap Quote LTP field only — never Close/Open/High/mid."""
+    if not isinstance(block, dict):
+        return None
+    keys = (
+        "LastTradedPrice",
+        "lastTradedPrice",
+        "LastTradePrice",
+        "lastTradePrice",
+        "LTP",
+        "ltp",
+    )
+
+    def pick(d: dict[str, Any]) -> float | None:
+        for k in keys:
+            n = _positive_float(d.get(k))
+            if n is not None:
+                return n
+        return None
+
+    n = pick(block)
+    if n is not None:
+        return n
+    tl = block.get("Touchline") or block.get("touchline") or block.get("TouchLine") or block.get("touchLine")
+    if isinstance(tl, dict):
+        return pick(tl)
+    return None
+
+
 def _touchline_derived_price(block: dict[str, Any]) -> float | None:
-    """When LastTradedPrice is 0 (common for indices pre-open), use close / book / mid."""
+    """Index/pre-open fallback when LastTradedPrice is 0. Not used for option hunt LTP."""
     if not isinstance(block, dict):
         return None
 
@@ -1979,6 +2325,8 @@ class MarketDataStreamer:
         self._coalesce_last_flush = time.monotonic()
         self._coalesce_flush_stop: threading.Event | None = None
         self._coalesce_flush_started = False
+        self._sink_q: Queue = Queue(maxsize=20000)
+        self._sink_started = False
         self._latest_sse: dict[int, dict[str, Any]] = {}
         self._atp_refresh_stop: threading.Event | None = None
         self._atp_thread_started = False
@@ -2205,6 +2553,32 @@ class MarketDataStreamer:
         def _on_disconnect():
             self.schedule_ensure_socket_alive()
 
+        @self._sid.on("1501-json-full")
+        def _on_1501_full(_data):
+            # Full snapshot parse was holding the socket thread. Next last-trade waited behind it.
+            self._touch_socket_rx()
+
+        @self._sid.on("1501-json-partial")
+        def _on_1501_partial(data):
+            self._ingest_json_md(1501, data)
+
+        @self._sid.on("1502-json-full")
+        def _on_1502_full(_data):
+            self._touch_socket_rx()
+
+        @self._sid.on("1502-json-partial")
+        def _on_1502_partial(_data):
+            # Depth packets must not delay the Snap Quote print.
+            self._touch_socket_rx()
+
+        @self._sid.on("1512-json-full")
+        def _on_1512_full(_data):
+            self._touch_socket_rx()
+
+        @self._sid.on("1512-json-partial")
+        def _on_1512_partial(data):
+            self._ingest_json_md(1512, data)
+
         @self._sid.on("1505-json-full")
         def _on_1505_full(data):
             self._ingest_symphony_candle(data)
@@ -2212,6 +2586,8 @@ class MarketDataStreamer:
         @self._sid.on("1505-json-partial")
         def _on_1505_partial(data):
             self._ingest_symphony_candle(data)
+
+        # No catch-all: it fired again after the named handlers and parsed every packet twice.
 
         url = self._client.socket_url()
         self._sid.connect(url, transports=["websocket"], socketio_path=XTS_MD_SOCKETIO_PATH)
@@ -2230,11 +2606,29 @@ class MarketDataStreamer:
                 self.subscribe(instruments=instruments, xts_message_code=1502)
             except Exception:
                 pass
+        if XTS_MD_SUBSCRIBE_1512:
+            try:
+                self.subscribe(instruments=instruments, xts_message_code=1512)
+            except Exception:
+                pass
         if XTS_MD_SUBSCRIBE_1505:
             try:
                 self.subscribe(instruments=instruments, xts_message_code=1505)
             except Exception:
                 pass
+
+    def _ingest_json_md(self, message_code: int, data: Any, *, snapshot: bool = False) -> None:
+        """XTS JSON socket. Partial = Snap Quote last trade. Full must not rewind that print."""
+        try:
+            self._touch_socket_rx()
+            for tick in _ticks_from_xts_json_event(data, int(message_code)):
+                if snapshot:
+                    tick = {**tick, "_snapshot": True}
+                    tick.pop("ltp", None)
+                    tick.pop("_ltp1501", None)
+                self._publish(tick)
+        except Exception:
+            return
 
     def _ingest_symphony_candle(self, data: Any) -> None:
         """Symphony CandleDataEvent (1505) — update EMA only; never overwrite live LTP/Mace."""
@@ -2389,6 +2783,7 @@ class MarketDataStreamer:
             start = int(self._atp_refresh_offset) % n
             self._atp_refresh_offset = (start + chunk_sz) % max(n, 1)
             chunk = [instruments[(start + i) % n] for i in range(min(chunk_sz, n))]
+            merged_ltp: dict[int, float] = {}
             try:
                 raw = client.get_quote(
                     instruments=chunk,
@@ -2396,10 +2791,11 @@ class MarketDataStreamer:
                     publish_format="JSON",
                 )
                 merged_atp.update(_extract_atp_map_from_quote_response(raw))
+                merged_ltp.update(_extract_ltp_map_from_quote_response(raw))
             except Exception:
                 return
 
-            if not merged_atp:
+            if not merged_atp and not merged_ltp:
                 return
 
             seg_by_tid: dict[int, int] = {}
@@ -2407,13 +2803,17 @@ class MarketDataStreamer:
                 for s, t in self._subs:
                     seg_by_tid[int(t)] = int(s)
 
-            all_tids = set(merged_atp.keys())
+            all_tids = set(merged_atp.keys()) | set(merged_ltp.keys())
             for tid in all_tids:
                 ik = int(tid)
                 atp = float(merged_atp.get(ik) or 0.0)
+                ltp = float(merged_ltp.get(ik) or 0.0)
                 prev = te.get_token_row(ik) or {}
                 prev_atp = float(prev.get("atp") or 0.0)
+                prev_ltp = float(prev.get("ltp") or 0.0)
                 atp_changed = atp > 0 and abs(prev_atp - atp) >= 1e-4
+                # REST quote LTP lags Snap Quote in a fast move. Mace only — never paint LTP from here.
+                _ = ltp, prev_ltp
                 if not atp_changed:
                     continue
                 row = prev
@@ -2476,6 +2876,16 @@ class MarketDataStreamer:
                     tid_i = int(row["exchangeInstrumentID"])
                     self._subs.add((seg, tid_i))
                     self._sub_tokens.add(tid_i)
+
+        if int(xts_message_code) == 1501 and XTS_MD_SUBSCRIBE_1512:
+            for seg in sorted(by_seg.keys()):
+                rows = by_seg[seg]
+                for i in range(0, len(rows), chunk_sz):
+                    chunk = rows[i : i + chunk_sz]
+                    try:
+                        self._client.subscribe(instruments=chunk, xts_message_code=1512)
+                    except Exception:
+                        pass
 
         if int(xts_message_code) == 1501 and XTS_MD_SUBSCRIBE_1505:
             for seg in sorted(by_seg.keys()):
@@ -2643,22 +3053,107 @@ class MarketDataStreamer:
                     tick[k] = v
             self._enqueue_listener(q, self._sse_payload(tick))
 
+    def _paint_payload(self, tick: dict[str, Any]) -> dict[str, Any]:
+        """Lock-free last-trade payload. Do not read TickEngine — that wait was the 9:15 paint lag."""
+        try:
+            tid = int(tick.get("exchangeInstrumentID") or tick.get("token") or 0)
+        except Exception:
+            tid = 0
+        if tid <= 0:
+            return tick
+        try:
+            mc_i = int(tick.get("messageCode") or tick.get("MessageCode") or 0)
+        except Exception:
+            mc_i = 0
+        out: dict[str, Any] = {"exchangeInstrumentID": tid}
+        seg = tick.get("exchangeSegment", tick.get("segment"))
+        if seg is not None:
+            out["exchangeSegment"] = seg
+        if mc_i:
+            out["messageCode"] = mc_i
+        if tick.get("_atpOnly"):
+            out["_atpOnly"] = True
+        # Snapshot / REST quote must not rewind a Snap Quote last-trade print.
+        paint_ltp = not tick.get("_snapshot") and not tick.get("_fromRestQuote") and not tick.get("_atpOnly")
+        try:
+            ltp = float(tick.get("ltp") or 0.0)
+        except Exception:
+            ltp = 0.0
+        if paint_ltp and mc_i in (1501, 1512) and ltp > 0:
+            out["ltp"] = ltp
+        elif paint_ltp and mc_i != 1502 and ltp > 0:
+            out["ltp"] = ltp
+        for k in (
+            "bid",
+            "ask",
+            "atp",
+            "prevClose",
+            "percentChange",
+            "dayOpen",
+            "dayHigh",
+            "dayLow",
+            "ema21",
+            "oi",
+            "volume",
+        ):
+            v = tick.get(k)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if fv != fv:
+                continue
+            if k == "percentChange" or fv > 0:
+                out[k] = fv
+        return out
+
+    def _push_sse(self, payload: dict[str, Any]) -> None:
+        try:
+            tid = int(payload.get("exchangeInstrumentID") or 0)
+            if tid > 0:
+                if payload.get("_atpOnly") or payload.get("_ema21Only"):
+                    prev = self._latest_sse.get(tid) or {}
+                    self._latest_sse[tid] = {**prev, **payload}
+                else:
+                    self._latest_sse[tid] = payload
+        except Exception:
+            pass
+        for q in self._listeners_snapshot:
+            self._enqueue_listener(q, payload)
+
+    def _ensure_sink_thread(self) -> None:
+        if self._sink_started:
+            return
+        self._sink_started = True
+        threading.Thread(target=self._sink_loop, name="md-tick-sink", daemon=True).start()
+
+    def _sink_loop(self) -> None:
+        """TickEngine normalize stays off the socket thread so the next print can paint immediately."""
+        while True:
+            try:
+                tick = self._sink_q.get()
+            except Exception:
+                continue
+            if tick is None:
+                return
+            sink = self._pipeline_sink
+            if not sink:
+                continue
+            try:
+                sink(tick)
+            except Exception:
+                pass
+
     def _enqueue_listener(self, q: Queue, payload: dict[str, Any]) -> None:
         try:
             q.put_nowait(payload)
         except Full:
-            # Drop stale backlog — browser was falling behind (seconds-late LTP).
             try:
-                while True:
-                    q.get_nowait()
+                q.get_nowait()
             except Empty:
                 pass
-            snap = list(self._latest_sse.values())
-            for p in snap:
-                try:
-                    q.put_nowait(p)
-                except Full:
-                    break
             try:
                 q.put_nowait(payload)
             except Exception:
@@ -2720,9 +3215,34 @@ class MarketDataStreamer:
                     atp_v = 0.0
             out: dict[str, Any] = {
                 "exchangeInstrumentID": token,
-                "ltp": row.get("ltp"),
-                "ts": float(row.get("ts") or time.time()),
             }
+            mc = tick.get("messageCode") or row.get("messageCode")
+            mc_i = int(mc or 0)
+            if mc_i:
+                out["messageCode"] = mc_i
+            try:
+                tick_ltp = float(tick.get("ltp") or 0.0)
+            except Exception:
+                tick_ltp = 0.0
+            try:
+                row_ltp = float(row.get("ltp") or 0.0)
+            except Exception:
+                row_ltp = 0.0
+            try:
+                ltp_1501 = float(row.get("_ltp1501") or 0.0)
+            except Exception:
+                ltp_1501 = 0.0
+            # Snap Quote last trade = 1501 / 1512. 1502 book often reprints bid as ltp.
+            if mc_i in (1501, 1512) and tick_ltp > 0:
+                out["ltp"] = tick_ltp
+            elif ltp_1501 > 0:
+                out["ltp"] = ltp_1501
+            elif mc_i != 1502 and tick_ltp > 0:
+                out["ltp"] = tick_ltp
+            elif mc_i != 1502 and row_ltp > 0:
+                out["ltp"] = row_ltp
+            if tick.get("_fromRestQuote"):
+                out["_fromRestQuote"] = True
             if atp_v > 0:
                 out["atp"] = atp_v
             seg = tick.get("exchangeSegment")
@@ -2748,26 +3268,22 @@ class MarketDataStreamer:
             return tick
 
     def _deliver_tick(self, tick: dict[str, Any]) -> None:
-        sink = self._pipeline_sink
-        if sink:
+        # Paint first. TickEngine used to run on the socket thread and held the next 1501 print.
+        self._push_sse(self._paint_payload(tick))
+        self._ensure_sink_thread()
+        try:
+            self._sink_q.put_nowait(tick)
+        except Full:
             try:
-                sink(tick)
+                self._sink_q.get_nowait()
+            except Empty:
+                pass
+            try:
+                self._sink_q.put_nowait(tick)
             except Exception:
                 pass
-
-        payload = self._sse_payload(tick)
-        try:
-            tid = int(payload.get("exchangeInstrumentID") or 0)
-            if tid > 0:
-                if payload.get("_atpOnly") or payload.get("_ema21Only"):
-                    prev = self._latest_sse.get(tid) or {}
-                    self._latest_sse[tid] = {**prev, **payload}
-                else:
-                    self._latest_sse[tid] = payload
         except Exception:
             pass
-        for q in self._listeners_snapshot:
-            self._enqueue_listener(q, payload)
 
     def _flush_coalesced(self) -> None:
         with self._coalesce_lock:
