@@ -2913,6 +2913,51 @@ def md_instruments_by_id():
         return jsonify({"ok": False, "error": str(e), "detail": repr(e)}), 500
 
 
+def _sse_is_last_trade(p) -> bool:
+    """True only for a socket last-trade. ATP/REST/depth must not ride this path."""
+    if not isinstance(p, dict):
+        return False
+    if p.get("_atpOnly") or p.get("_snapshot") or p.get("_fromRestQuote"):
+        return False
+    try:
+        ltp = float(p.get("ltp") or 0.0)
+    except Exception:
+        return False
+    if ltp <= 0:
+        return False
+    try:
+        mc = int(p.get("messageCode") or 0)
+    except Exception:
+        mc = 0
+    return mc != 1502
+
+
+def _sse_collapse_non_ltp(events: list) -> list:
+    """Mace/snapshot flood: latest per token. Never keep a REST LTP on the payload."""
+    latest: dict[int, dict] = {}
+    order: list[int] = []
+    extra: list = []
+    for p in events:
+        if not isinstance(p, dict):
+            extra.append(p)
+            continue
+        try:
+            tid = int(p.get("exchangeInstrumentID") or p.get("token") or 0)
+        except Exception:
+            tid = 0
+        if tid <= 0:
+            extra.append(p)
+            continue
+        row = dict(p)
+        if row.get("_atpOnly") or row.get("_snapshot") or row.get("_fromRestQuote"):
+            row.pop("ltp", None)
+            row.pop("_ltp1501", None)
+        if tid not in latest:
+            order.append(tid)
+        latest[tid] = row
+    return extra + [latest[tid] for tid in order]
+
+
 @app.get("/api/md/stream")
 def md_stream():
     username = (_current_user() or "").strip().upper()
@@ -2942,7 +2987,12 @@ def md_stream():
                 try:
                     first = q.get(timeout=15)
                 except queue.Empty:
-                    yield sse(": ping\n\n")
+                    counts = {}
+                    try:
+                        counts = _MD_STREAMER.feed_rx_counts()
+                    except Exception:
+                        counts = {}
+                    yield sse(": ping " + json.dumps(counts, separators=(",", ":")) + "\n\n")
                     continue
                 burst: list = [first]
                 while True:
@@ -2950,47 +3000,22 @@ def md_stream():
                         burst.append(q.get_nowait())
                     except queue.Empty:
                         break
-                # Small burst: every print, so the number ticks with Snap Quote.
-                # Big backlog only: jump to latest so a fast drop is not stuck on 97.85.
-                if len(burst) <= 24:
-                    for p in burst:
-                        yield sse(f"data: {json.dumps(p, separators=(',', ':'))}\n\n")
-                    continue
-                latest: dict[int, dict] = {}
-                order: list[int] = []
-                extra: list = []
+                # Last-trade prints always go out in order. A fast move used to
+                # exceed 24 events (40 ATP dumps every 1.5s) and collapse to
+                # latest-per-token. That merge stamped `_atpOnly` onto the LTP,
+                # the browser skipped the print, and a lagged REST quote painted
+                # 3–4 points behind XTS.
+                prints: list = []
+                rest: list = []
                 for p in burst:
-                    if not isinstance(p, dict):
-                        extra.append(p)
-                        continue
-                    try:
-                        tid = int(p.get("exchangeInstrumentID") or p.get("token") or 0)
-                    except Exception:
-                        tid = 0
-                    if tid <= 0:
-                        extra.append(p)
-                        continue
-                    prev = latest.get(tid)
-                    if prev is None:
-                        order.append(tid)
-                        latest[tid] = p
-                        continue
-                    merged = {**prev, **p}
-                    try:
-                        new_ltp = float(p.get("ltp") or 0.0)
-                    except Exception:
-                        new_ltp = 0.0
-                    try:
-                        prev_ltp = float(prev.get("ltp") or 0.0)
-                    except Exception:
-                        prev_ltp = 0.0
-                    if new_ltp <= 0 and prev_ltp > 0:
-                        merged["ltp"] = prev_ltp
-                    latest[tid] = merged
-                for p in extra:
+                    if _sse_is_last_trade(p):
+                        prints.append(p)
+                    else:
+                        rest.append(p)
+                for p in prints:
                     yield sse(f"data: {json.dumps(p, separators=(',', ':'))}\n\n")
-                for tid in order:
-                    yield sse(f"data: {json.dumps(latest[tid], separators=(',', ':'))}\n\n")
+                for p in _sse_collapse_non_ltp(rest):
+                    yield sse(f"data: {json.dumps(p, separators=(',', ':'))}\n\n")
         finally:
             try:
                 _MD_STREAMER.remove_listener(q)

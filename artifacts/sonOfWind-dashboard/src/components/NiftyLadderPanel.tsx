@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChainResolved } from "@/types/market";
-import { useLiveLtp, peekLiveTick, socketPrintAgeMs } from "@/context/LiveLtpContext";
+import { useLiveLtp, peekLiveTick, socketPrintAgeMs, SOCKET_LTP_BEATS_REST_MS } from "@/context/LiveLtpContext";
 import { FastLtp } from "@/components/FastLtp";
 import { useSubscribeTouchline } from "@/lib/mdRegistry";
 import { refreshQuotesFromRest, refreshPaintLtpFromRest } from "@/lib/atpSeed";
@@ -959,8 +959,9 @@ export default function NiftyLadderPanel({ chain }: { chain: ChainResolved; qty?
     const loop = () => {
       if (cancelled) return;
       const age = socketPrintAgeMs(paintIid);
-      if (age != null && age < 500) {
-        window.setTimeout(loop, 120);
+      // Socket last-trade is the XTS print. REST fill only after a long gap — a 500ms quote rewinds a fast move.
+      if (age != null && age < SOCKET_LTP_BEATS_REST_MS) {
+        window.setTimeout(loop, 250);
         return;
       }
       void refreshPaintLtpFromRest(inst, () => cancelled).finally(() => {

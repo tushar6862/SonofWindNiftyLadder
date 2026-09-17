@@ -13,6 +13,43 @@ from market.ltp_pick import apply_feed_ltp, exchange_print_ts, pick_ltp_for_disp
 from market.packet_decoder import decode_xts_binary_packet
 
 
+def _unwrap_md_payload(data: Any) -> Any:
+    """Socket JSON is sometimes zlib bytes. Inflate before the partial parser."""
+    import zlib
+
+    raw: bytes | None = None
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        raw = bytes(data)
+    if raw is None:
+        return data
+    if len(raw) >= 2 and raw[0] == 0x78:
+        try:
+            raw = zlib.decompress(raw)
+        except Exception:
+            pass
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return raw
+
+
+def _bytes_from_packet_str(s: str) -> bytes:
+    import base64
+    import binascii
+
+    text = str(s or "").strip()
+    if not text:
+        return b""
+    try:
+        return base64.b64decode(text, validate=False)
+    except (binascii.Error, ValueError):
+        pass
+    try:
+        return text.encode("latin-1", "ignore")
+    except Exception:
+        return b""
+
+
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else str(v)
@@ -2340,6 +2377,10 @@ class MarketDataStreamer:
         self._ensure_alive_scheduled = False
         self._last_ensure_alive_mono = 0.0
         self._last_soft_reconnect_mono = 0.0
+        self._rx_counts: dict[str, int] = {}
+        self._partial_paint_mono: dict[int, float] = {}
+        self._json_full_q: Queue = Queue(maxsize=64)
+        self._json_full_started = False
 
     def _refresh_listener_snapshot(self) -> None:
         self._listeners_snapshot = tuple(self._listeners)
@@ -2387,6 +2428,12 @@ class MarketDataStreamer:
 
     def _touch_socket_rx(self) -> None:
         self._last_socket_rx_mono = time.monotonic()
+
+    def _bump_rx(self, kind: str) -> None:
+        self._rx_counts[kind] = int(self._rx_counts.get(kind) or 0) + 1
+
+    def feed_rx_counts(self) -> dict[str, int]:
+        return dict(self._rx_counts)
 
     def _publish_ema21_only(self, tid: int, ema21: float, seg: int | None = None) -> None:
         """Push EMA update without touching live LTP / Mace."""
@@ -2536,17 +2583,10 @@ class MarketDataStreamer:
         @self._sid.on("xts-binary-packet")
         def _on_packet(data):
             try:
-                if isinstance(data, str):
-                    return
-                if isinstance(data, (list, tuple)):
-                    blob = b"".join(bytes(x) for x in data if not isinstance(x, str))
-                else:
-                    blob = bytes(data)
                 self._touch_socket_rx()
-                for tick in decode_xts_binary_packet(blob):
-                    self._publish(tick)
+                self._bump_rx("binary")
+                self._publish_binary_packet(data)
             except Exception:
-                # swallow; keep socket alive
                 return
 
         @self._sid.on("disconnect")
@@ -2554,12 +2594,15 @@ class MarketDataStreamer:
             self.schedule_ensure_socket_alive()
 
         @self._sid.on("1501-json-full")
-        def _on_1501_full(_data):
-            # Full snapshot parse was holding the socket thread. Next last-trade waited behind it.
+        def _on_1501_full(data):
+            # Parse off the socket thread so a chain snapshot cannot hold the next print.
             self._touch_socket_rx()
+            self._bump_rx("1501-full")
+            self._queue_full_md(1501, data)
 
         @self._sid.on("1501-json-partial")
         def _on_1501_partial(data):
+            self._bump_rx("1501-partial")
             self._ingest_json_md(1501, data)
 
         @self._sid.on("1502-json-full")
@@ -2572,12 +2615,47 @@ class MarketDataStreamer:
             self._touch_socket_rx()
 
         @self._sid.on("1512-json-full")
-        def _on_1512_full(_data):
+        def _on_1512_full(data):
             self._touch_socket_rx()
+            self._bump_rx("1512-full")
+            self._queue_full_md(1512, data)
 
         @self._sid.on("1512-json-partial")
         def _on_1512_partial(data):
+            self._bump_rx("1512-partial")
             self._ingest_json_md(1512, data)
+
+        @self._sid.on("*")
+        def _on_unhandled(event, *args):
+            # Brokers rename events. Named handlers already ran; this only catches the rest.
+            name = str(event or "").lower()
+            if name in (
+                "xts-binary-packet",
+                "1501-json-full",
+                "1501-json-partial",
+                "1502-json-full",
+                "1502-json-partial",
+                "1512-json-full",
+                "1512-json-partial",
+                "1505-json-full",
+                "1505-json-partial",
+                "disconnect",
+                "connect",
+            ):
+                return
+            self._touch_socket_rx()
+            self._bump_rx("other:" + name[:40])
+            data = args[0] if args else None
+            if "1512" in name:
+                if "full" in name:
+                    self._queue_full_md(1512, data)
+                else:
+                    self._ingest_json_md(1512, data)
+            elif "1501" in name:
+                if "full" in name:
+                    self._queue_full_md(1501, data)
+                else:
+                    self._ingest_json_md(1501, data)
 
         @self._sid.on("1505-json-full")
         def _on_1505_full(data):
@@ -2587,7 +2665,7 @@ class MarketDataStreamer:
         def _on_1505_partial(data):
             self._ingest_symphony_candle(data)
 
-        # No catch-all: it fired again after the named handlers and parsed every packet twice.
+        # No catch-all on named events: it parsed every packet twice. Unknown names are handled above.
 
         url = self._client.socket_url()
         self._sid.connect(url, transports=["websocket"], socketio_path=XTS_MD_SOCKETIO_PATH)
@@ -2617,17 +2695,112 @@ class MarketDataStreamer:
             except Exception:
                 pass
 
-    def _ingest_json_md(self, message_code: int, data: Any, *, snapshot: bool = False) -> None:
-        """XTS JSON socket. Partial = Snap Quote last trade. Full must not rewind that print."""
+    def _publish_binary_packet(self, data: Any) -> None:
+        """xts-binary-packet is bytes, a Buffer list, or a string. A string used to be dropped, so Snap Quote LTP never reached SSE."""
+        if isinstance(data, str):
+            s = data.strip()
+            if not s:
+                return
+            low = s.lower()
+            if s[0] in "{[" or "ltp:" in low or low.startswith("t:") or "lasttradedprice" in low:
+                self._ingest_json_md(1501, s)
+                return
+            blob = _bytes_from_packet_str(s)
+            ticks = list(decode_xts_binary_packet(blob)) if blob else []
+            if not ticks:
+                try:
+                    ticks = list(decode_xts_binary_packet(s.encode("latin-1", "ignore")))
+                except Exception:
+                    ticks = []
+            for tick in ticks:
+                self._publish(tick)
+            return
+        if isinstance(data, dict) and str(data.get("type") or "") == "Buffer" and isinstance(data.get("data"), list):
+            try:
+                blob = bytes(int(x) & 0xFF for x in data["data"])
+            except Exception:
+                return
+            for tick in decode_xts_binary_packet(blob):
+                self._publish(tick)
+            return
+        if isinstance(data, (list, tuple)):
+            if data and isinstance(data[0], str):
+                for item in data:
+                    if isinstance(item, str):
+                        self._publish_binary_packet(item)
+                return
+            try:
+                blob = b"".join(bytes(x) for x in data if not isinstance(x, str))
+            except Exception:
+                return
+            if blob:
+                for tick in decode_xts_binary_packet(blob):
+                    self._publish(tick)
+            return
+        try:
+            blob = bytes(data)
+        except Exception:
+            return
+        if blob:
+            for tick in decode_xts_binary_packet(blob):
+                self._publish(tick)
+
+    def _ensure_json_full_thread(self) -> None:
+        if self._json_full_started:
+            return
+        self._json_full_started = True
+        threading.Thread(
+            target=self._json_full_loop,
+            name="md-json-full",
+            daemon=True,
+        ).start()
+
+    def _queue_full_md(self, message_code: int, data: Any) -> None:
+        self._ensure_json_full_thread()
+        item = (int(message_code), data)
+        try:
+            self._json_full_q.put_nowait(item)
+        except Full:
+            try:
+                self._json_full_q.get_nowait()
+            except Empty:
+                pass
+            try:
+                self._json_full_q.put_nowait(item)
+            except Exception:
+                pass
+
+    def _json_full_loop(self) -> None:
+        while True:
+            try:
+                code, data = self._json_full_q.get()
+            except Exception:
+                continue
+            try:
+                self._ingest_json_md(int(code), data, full_snap=True)
+            except Exception:
+                pass
+
+    def _ingest_json_md(self, message_code: int, data: Any, *, snapshot: bool = False, full_snap: bool = False) -> None:
+        """XTS JSON socket. Partial and 1512/1501 full both carry Snap Quote last trade."""
         try:
             self._touch_socket_rx()
-            for tick in _ticks_from_xts_json_event(data, int(message_code)):
+            data = _unwrap_md_payload(data)
+            ticks = _ticks_from_xts_json_event(data, int(message_code))
+            if not ticks:
+                self._bump_rx("json-empty")
+            for tick in ticks:
                 if snapshot:
                     tick = {**tick, "_snapshot": True}
                     tick.pop("ltp", None)
                     tick.pop("_ltp1501", None)
+                elif full_snap:
+                    tick = {**tick, "_fullSnap": True}
+                if float(tick.get("ltp") or 0.0) > 0 and not tick.get("_snapshot"):
+                    self._bump_rx("ltp-pub")
                 self._publish(tick)
         except Exception:
+            self._bump_rx("json-err")
             return
 
     def _ingest_symphony_candle(self, data: Any) -> None:
@@ -3074,7 +3247,12 @@ class MarketDataStreamer:
         if tick.get("_atpOnly"):
             out["_atpOnly"] = True
         # Snapshot / REST quote must not rewind a Snap Quote last-trade print.
+        # A slower 1501/1512-json-full must not rewind a tick that already painted.
         paint_ltp = not tick.get("_snapshot") and not tick.get("_fromRestQuote") and not tick.get("_atpOnly")
+        if paint_ltp and tick.get("_fullSnap") and tid > 0:
+            last_partial = float(self._partial_paint_mono.get(tid) or 0.0)
+            if last_partial > 0 and (time.monotonic() - last_partial) < 1.5:
+                paint_ltp = False
         try:
             ltp = float(tick.get("ltp") or 0.0)
         except Exception:
@@ -3269,7 +3447,16 @@ class MarketDataStreamer:
 
     def _deliver_tick(self, tick: dict[str, Any]) -> None:
         # Paint first. TickEngine used to run on the socket thread and held the next 1501 print.
-        self._push_sse(self._paint_payload(tick))
+        payload = self._paint_payload(tick)
+        if not tick.get("_fullSnap") and not tick.get("_atpOnly") and not tick.get("_snapshot"):
+            try:
+                if float(payload.get("ltp") or 0.0) > 0:
+                    tid = int(payload.get("exchangeInstrumentID") or 0)
+                    if tid > 0:
+                        self._partial_paint_mono[tid] = time.monotonic()
+            except Exception:
+                pass
+        self._push_sse(payload)
         self._ensure_sink_thread()
         try:
             self._sink_q.put_nowait(tick)

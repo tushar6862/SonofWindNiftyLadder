@@ -51,6 +51,9 @@ const ltpPaintListeners = new Map<number, Set<(ltp: number) => void>>();
 /** Socket last-trade time only. REST must not stamp this — a slow quote was rewinding the print. */
 const socketPrintAt = new Map<number, number>();
 
+/** REST get_quote lags Snap Quote by several ticks in a fast move. Do not paint it over a live socket print. */
+export const SOCKET_LTP_BEATS_REST_MS = 8000;
+
 /** Ms since the last socket last-trade for this token. null if the socket has not printed. */
 export function socketPrintAgeMs(id: number): number | null {
   if (!Number.isFinite(id) || id <= 0) return null;
@@ -117,6 +120,7 @@ function rememberLiveTick(
   if (!(nextLtp > 0) && nextBid == null && nextAsk == null) return;
   const ltpChanged = nextLtp > 0 && nextLtp !== prev?.ltp;
   const bookChanged = nextBid !== prev?.bid || nextAsk !== prev?.ask;
+  if (fromRest && socketPrintAt.has(id)) return;
   if (ltpChanged && !fromRest) socketPrintAt.set(id, now);
   liveTickPeek.set(id, {
     ltp: nextLtp,
@@ -436,7 +440,6 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
     const onLtpSnapshot = (ev: Event) => {
       const ce = ev as CustomEvent<{ map?: Record<number, number>; source?: string }>;
       const snap = ce?.detail?.map;
-      const source = ce?.detail?.source === "focus" ? "focus" : "batch";
       if (!snap || typeof snap !== "object") return;
       setMap((prev) => {
         let changed = false;
@@ -447,8 +450,8 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) continue;
           const sockAge = socketPrintAgeMs(id);
           // Focus REST used to always win. A quote that left 300ms ago then painted 108 over a 106.80 print.
-          if (sockAge != null && sockAge < 500) continue;
-          if (source !== "focus" && sockAge != null && sockAge < 1500) continue;
+          // 500ms was still short enough that a fast-move quote (3–4 points behind Snap Quote) painted over the socket.
+          if (sockAge != null && sockAge < SOCKET_LTP_BEATS_REST_MS) continue;
           rememberLiveTick(id, v, null, null, true);
           if (next[id] !== v) {
             next[id] = v;

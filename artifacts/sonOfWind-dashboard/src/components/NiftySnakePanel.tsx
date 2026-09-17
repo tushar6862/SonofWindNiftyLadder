@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChainResolved } from "@/types/market";
-import { useLiveLtp, peekLiveTick } from "@/context/LiveLtpContext";
+import { useLiveLtp, peekLiveTick, socketPrintAgeMs, SOCKET_LTP_BEATS_REST_MS } from "@/context/LiveLtpContext";
 import { FastLtp } from "@/components/FastLtp";
 import { useSubscribeTouchline } from "@/lib/mdRegistry";
-import { refreshQuotesFromRest } from "@/lib/atpSeed";
+import { refreshPaintLtpFromRest, refreshQuotesFromRest } from "@/lib/atpSeed";
 import { peekTouchPx } from "@/lib/liveQuote";
 import { fmtPnl, fmtPrice } from "@/lib/formatNumber";
 import { apiFetch } from "@/lib/backend";
@@ -81,6 +81,7 @@ import {
 } from "@/lib/niftySnakeRules";
 
 const OPTION_QUOTE_POLL_MS = 8000;
+const SNAP_QUOTE_LTP_GAP_MS = 250;
 const BROKER_CONFIRM_HITS = 2;
 const SELL_GRACE_MS = 6000;
 const HEDGE_RETRY_MS = 20000;
@@ -1071,8 +1072,29 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
 
   const huntIid = huntPick ? resolveIid(chain, huntPick.strike, huntPick.optionType) : null;
   const nearestIid = nearest ? resolveIid(chain, nearest.strike, nearest.optionType) : null;
-  const huntLive = peekTouchPx(huntIid, ltps) ?? huntPick?.ltp ?? null;
   const paintIid = lotsOpen > 0 || engine.awaitReload ? iid : huntIid ?? nearestIid;
+
+  useEffect(() => {
+    if (!seg || paintIid == null || !Number.isFinite(paintIid) || paintIid <= 0) return;
+    let cancelled = false;
+    const inst = { exchangeSegment: seg, exchangeInstrumentID: paintIid };
+    const loop = () => {
+      if (cancelled) return;
+      const age = socketPrintAgeMs(paintIid);
+      // Same as Ladder: XTS Snap Quote last-trade wins. REST only fills a long gap.
+      if (age != null && age < SOCKET_LTP_BEATS_REST_MS) {
+        window.setTimeout(loop, 250);
+        return;
+      }
+      void refreshPaintLtpFromRest(inst, () => cancelled).finally(() => {
+        if (!cancelled) window.setTimeout(loop, SNAP_QUOTE_LTP_GAP_MS);
+      });
+    };
+    loop();
+    return () => {
+      cancelled = true;
+    };
+  }, [seg, paintIid]);
 
   const statusNote = !nifty
     ? "NIFTY only — switch index"
@@ -1273,11 +1295,12 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
             const showLevels = gridLocked && f != null && f > 0;
             const addPx = showLevels ? sellLevel(f, s.index) : null;
             const bookPx = s.index === 1 ? coverPx : showLevels ? bookLevel(f, s.index) : null;
+            const addLiveIid = s.index === 1 && !showLevels ? (huntIid ?? nearestIid) : null;
             const addVal =
               s.index === 1
                 ? showLevels
                   ? fmtPrice(engine.t1Fill)
-                  : fmtPrice(huntLive)
+                  : null
                 : fmtPrice(addPx);
             return (
               <div key={s.index} className={`nl-block${s.open ? " nl-block--open" : ""}`}>
@@ -1294,7 +1317,13 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
                   </div>
                   <div className="nl-block__cell">
                     <span className="nl-block__label">Add</span>
-                    <span className="nl-block__num">{addVal}</span>
+                    <span className="nl-block__num">
+                      {addLiveIid != null ? (
+                        <FastLtp iid={addLiveIid} className="tabular-nums" />
+                      ) : (
+                        addVal
+                      )}
+                    </span>
                   </div>
                   <div className="nl-block__cell">
                     <span className="nl-block__label">Book</span>
