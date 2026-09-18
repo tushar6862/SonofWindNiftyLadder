@@ -20,6 +20,8 @@ export const MAX_PLAN_TICKS = TRANCHE_COUNT * 3;
 export const SNAKE_CLOCK_MS = 25;
 export const SNAKE_HUNT_WINGS = 8;
 export const ROUND_TRIP_COST_PER_LOT = 25;
+/** Far-OTM long hedge BUY — off; short-only (SELL entry / BUY cover-exit). */
+export const ENABLE_HEDGES = false;
 export const HEDGE_PREMIUM_LOW = 3;
 export const HEDGE_PREMIUM_HIGH = 4;
 export const HEDGE_PREMIUM_TARGET = 3.5;
@@ -507,7 +509,7 @@ export function nextSquareAllAction(state: SnakeEngineState): SnakeAction | null
 }
 
 export function hedgesNeeded(state: SnakeEngineState): SnakeHedge[] {
-  if (isEod()) return [];
+  if (!ENABLE_HEDGES || isEod()) return [];
   const out: SnakeHedge[] = [];
   for (const h of state.hedges) {
     if (h.open) continue;

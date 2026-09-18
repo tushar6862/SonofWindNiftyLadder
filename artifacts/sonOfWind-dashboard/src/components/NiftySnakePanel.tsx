@@ -23,6 +23,7 @@ import {
   BAND_TARGET,
   EV_MTM_FLAT,
   EV_NIFTY_SNAKE_FLAT,
+  ENABLE_HEDGES,
   HEDGE_PREMIUM_HIGH,
   HEDGE_PREMIUM_LOW,
   LOT_SIZE,
@@ -599,7 +600,7 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
   );
 
   const buyNeededHedges = useCallback(async () => {
-    if (hedgeBusyRef.current || squareAllReqRef.current) return;
+    if (!ENABLE_HEDGES || hedgeBusyRef.current || squareAllReqRef.current) return;
     if (isEod()) return;
     const st = engineRef.current;
     const ltp = peekTouchPx(iidRef.current, ltpsRef.current);
@@ -1326,11 +1327,20 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
                 </div>
                 <div className="text-[10px] font-semibold text-muted-foreground tabular-nums">
                   Qty {qtyForLots(s.lots)}
-                  {" · "}
-                  Hedge T{s.index}{" "}
-                  {hedge?.open && hedge.strike != null
-                    ? `${hedge.strike.toLocaleString("en-IN")} @ ${fmtPrice(hedge.fill)}`
-                    : `~${HEDGE_PREMIUM_LOW}–${HEDGE_PREMIUM_HIGH}`}
+                  {ENABLE_HEDGES ? (
+                    <>
+                      {" · "}
+                      Hedge T{s.index}{" "}
+                      {hedge?.open && hedge.strike != null
+                        ? `${hedge.strike.toLocaleString("en-IN")} @ ${fmtPrice(hedge.fill)}`
+                        : `~${HEDGE_PREMIUM_LOW}–${HEDGE_PREMIUM_HIGH}`}
+                    </>
+                  ) : hedge?.open && hedge.strike != null ? (
+                    <>
+                      {" · "}
+                      Hedge T{s.index} {hedge.strike.toLocaleString("en-IN")} @ {fmtPrice(hedge.fill)} (closing only)
+                    </>
+                  ) : null}
                 </div>
               </div>
             );
@@ -1344,9 +1354,10 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
           {!logs.length ? (
             <p className="ramsetu-glass-empty text-[12px]">
               START dabao — 09:16 ke baad selected CE/PE pe {BAND_LOW}–{BAND_HIGH} (prefer ~{BAND_TARGET}). Same
-              strike short grid T1–T7 lots {TRANCHE_LOTS.join(", ")}. Extras +3, book −3. T1 cover −30% / hard SL
-              +30% original fill se. Hard SL ke baad same legs re-SELL jab LTP SL ke neeche aaye. PAUSE pe naya
-              sell nahi, exits chalu. Nifty Ladder se alag engine hai.
+              strike short-only grid T1–T7 lots {TRANCHE_LOTS.join(", ")} — no long hedge BUY. Extras +3, book −3.
+              T1 cover −30% / hard SL +30% original fill se (cover BUY = short exit). Hard SL ke baad same legs
+              re-SELL jab LTP SL ke neeche aaye. PAUSE pe naya sell nahi, exits chalu. Nifty Ladder se alag
+              engine hai.
             </p>
           ) : (
             <ul className="space-y-1.5">

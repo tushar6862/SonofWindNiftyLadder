@@ -1217,9 +1217,10 @@ export default function NiftyLadderPanel({ chain }: { chain: ChainResolved; qty?
           <div className="ramsetu-glass-toolbar__label mb-2">Log</div>
           {!logs.length ? (
             <p className="ramsetu-glass-empty text-[12px]">
-              START dabao — 09:16 ke baad selected CE/PE pe ~{BAND_TARGET} premium hunt. Same strike ladder,
-              extras har +3 (gap-fill, no skip), book −3, T1 −30% / hard SL +30%, flatten 15:15.
-              T1–T9 default 8,2,2,2,2,3,3,4,4 lots. Grid locks on T1 print, never XTS avg.
+              START dabao — 09:16 ke baad selected CE/PE pe ~{BAND_TARGET} premium hunt. Same strike
+              short-only ladder (SELL entry) — no long hedge. Extras har +3 (gap-fill, no skip), book −3,
+              T1 −30% / hard SL +30% (cover BUY = short exit), flatten 15:15. T1–T9 default
+              8,2,2,2,2,3,3,4,4 lots. Grid locks on T1 print, never XTS avg.
             </p>
           ) : (
             <ul className="space-y-1.5">
