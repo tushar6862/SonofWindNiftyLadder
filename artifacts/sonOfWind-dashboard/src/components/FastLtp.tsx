@@ -22,7 +22,8 @@ export const FastLtp = memo(function FastLtp({
     const cur = peekLiveLtp(iid);
     el.textContent = cur != null ? cur.toFixed(2) : "—";
     return subscribeLiveLtp(iid, (px) => {
-      el.textContent = px.toFixed(2);
+      const node = ref.current;
+      if (node) node.textContent = px.toFixed(2);
     });
   }, [iid]);
   return <Tag ref={ref as never} className={className} />;

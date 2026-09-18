@@ -465,6 +465,110 @@ def md_start():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.post("/api/md/hot_focus")
+def md_hot_focus():
+    """Pin LIVE/hunt instrument(s) for ~200ms touchline LTP — keeps painted strike near XTS Snap Quote."""
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    instruments = data.get("instruments") or []
+    if not isinstance(instruments, list):
+        return jsonify({"ok": False, "error": "instruments[] required"}), 400
+    try:
+        _ensure_market_streamer(username)
+        from market.dashboard_connector import wire_market_streamer
+
+        wire_market_streamer(_MD_STREAMER)
+        out = _MD_STREAMER.set_hot_focus(instruments)
+        return jsonify({"ok": True, **out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/fyers/status")
+def fyers_status():
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    try:
+        from market.fyers_ltp import auth_login_url, get_fyers_ltp_feed, fyers_enabled
+
+        feed = get_fyers_ltp_feed()
+        st = feed.status()
+        return jsonify(
+            {
+                "ok": True,
+                **st,
+                "loginUrl": auth_login_url() if fyers_enabled() and not st.get("authed") else None,
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/fyers/login_url")
+def fyers_login_url():
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    try:
+        from market.fyers_ltp import auth_login_url, fyers_enabled
+
+        if not fyers_enabled():
+            return jsonify({"ok": False, "error": "Fyers not configured"}), 400
+        return jsonify({"ok": True, "url": auth_login_url()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/fyers/callback")
+def fyers_callback():
+    """Exchange Fyers auth_code for access_token (daily login)."""
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("auth_code") or data.get("code") or "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "auth_code required"}), 400
+    try:
+        from market.fyers_ltp import exchange_auth_code, get_fyers_ltp_feed
+
+        exchange_auth_code(code)
+        feed = get_fyers_ltp_feed()
+        feed.set_ltp_handler(_MD_STREAMER.publish_fyers_ltp)
+        feed.on_auth_success()
+        return jsonify({"ok": True, "authed": True, "message": "Fyers LTP connected"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/fyers/topbar_focus")
+def fyers_topbar_focus():
+    """Pin Spot + VIX + ATM CE/PE so TopBar metrics paint from Fyers."""
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    try:
+        from market.fyers_ltp import fyers_enabled, get_fyers_ltp_feed
+
+        if not fyers_enabled():
+            return jsonify({"ok": False, "error": "Fyers not configured"}), 400
+        feed = get_fyers_ltp_feed()
+        feed.set_ltp_handler(_MD_STREAMER.publish_fyers_ltp)
+        out = feed.set_topbar_instruments(
+            index_key=str(data.get("index") or "NIFTY"),
+            spot=data.get("spot") if isinstance(data.get("spot"), dict) else None,
+            vix=data.get("vix") if isinstance(data.get("vix"), dict) else None,
+            options=data.get("options") if isinstance(data.get("options"), list) else [],
+        )
+        return jsonify({"ok": True, **out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.post("/api/md/dada/range")
 def md_dada_range():
     """DADA strategy: first 15-min (09:15–09:30 IST) spot HIGH / LOW."""
@@ -2914,10 +3018,16 @@ def md_instruments_by_id():
 
 
 def _sse_is_last_trade(p) -> bool:
-    """True only for a socket last-trade. ATP/REST/depth must not ride this path."""
+    """True for socket / Fyers last-trade. ATP/REST/hot-focus must not ride this path."""
     if not isinstance(p, dict):
         return False
-    if p.get("_atpOnly") or p.get("_snapshot") or p.get("_fromRestQuote"):
+    if (
+        p.get("_atpOnly")
+        or p.get("_snapshot")
+        or p.get("_fromRestQuote")
+        or p.get("_gapFill")
+        or p.get("_hotLtp")
+    ):
         return False
     try:
         ltp = float(p.get("ltp") or 0.0)
@@ -2925,6 +3035,8 @@ def _sse_is_last_trade(p) -> bool:
         return False
     if ltp <= 0:
         return False
+    if p.get("_fyersLtp") is True:
+        return True
     try:
         mc = int(p.get("messageCode") or 0)
     except Exception:
@@ -2994,17 +3106,43 @@ def md_stream():
                         counts = {}
                     yield sse(": ping " + json.dumps(counts, separators=(",", ":")) + "\n\n")
                     continue
+                # Last-trade: emit immediately — do not wait to drain ATP flood (that was the flow break).
+                if _sse_is_last_trade(first):
+                    yield sse(f"data: {json.dumps(first, separators=(',', ':'))}\n\n")
+                    while True:
+                        try:
+                            p = q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if _sse_is_last_trade(p):
+                            yield sse(f"data: {json.dumps(p, separators=(',', ':'))}\n\n")
+                        else:
+                            # Collapse remaining non-LTP in this drain.
+                            rest = [p]
+                            while True:
+                                try:
+                                    rest.append(q.get_nowait())
+                                except queue.Empty:
+                                    break
+                            prints2: list = []
+                            other: list = []
+                            for x in rest:
+                                if _sse_is_last_trade(x):
+                                    prints2.append(x)
+                                else:
+                                    other.append(x)
+                            for x in prints2:
+                                yield sse(f"data: {json.dumps(x, separators=(',', ':'))}\n\n")
+                            for x in _sse_collapse_non_ltp(other):
+                                yield sse(f"data: {json.dumps(x, separators=(',', ':'))}\n\n")
+                            break
+                    continue
                 burst: list = [first]
                 while True:
                     try:
                         burst.append(q.get_nowait())
                     except queue.Empty:
                         break
-                # Last-trade prints always go out in order. A fast move used to
-                # exceed 24 events (40 ATP dumps every 1.5s) and collapse to
-                # latest-per-token. That merge stamped `_atpOnly` onto the LTP,
-                # the browser skipped the print, and a lagged REST quote painted
-                # 3–4 points behind XTS.
                 prints: list = []
                 rest: list = []
                 for p in burst:

@@ -14,3 +14,7 @@ redis>=5.0.0
 # Morning sentiment LLM parse (Moneycontrol → Gemini)
 google-genai>=1.0.0
 
+# Fyers LIVE LTP (optional). Prefer quotes poll — full SDK needs aiohttp (broken on Py3.14).
+# For WS: pip install path\to\fyers_apiv3-*.whl --no-deps  (and a setuptools that still has pkg_resources)
+websocket-client>=1.6.0
+

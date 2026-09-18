@@ -1,6 +1,7 @@
 import { Redirect, Route, Switch } from "wouter";
 import { useAuth } from "@/auth/AuthContext";
 import DashboardPage from "@/pages/Dashboard";
+import FyersCallbackPage from "@/pages/FyersCallback";
 import LoginPage from "@/pages/Login";
 import NotFound from "@/pages/not-found";
 import React from "react";
@@ -16,6 +17,7 @@ export default function App() {
   return (
     <Switch>
       <Route path="/login" component={LoginPage} />
+      <Route path="/fyers/callback" component={FyersCallbackPage} />
       <Route path="/">
         <PrivateRoute component={DashboardPage} />
       </Route>

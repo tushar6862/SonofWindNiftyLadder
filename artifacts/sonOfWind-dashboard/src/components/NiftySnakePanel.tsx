@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChainResolved } from "@/types/market";
-import { useLiveLtp, peekLiveTick, socketPrintAgeMs, SOCKET_LTP_BEATS_REST_MS } from "@/context/LiveLtpContext";
+import { useLiveLtp, peekLiveTick } from "@/context/LiveLtpContext";
 import { FastLtp } from "@/components/FastLtp";
 import { useSubscribeTouchline } from "@/lib/mdRegistry";
-import { refreshPaintLtpFromRest, refreshQuotesFromRest } from "@/lib/atpSeed";
+import { refreshQuotesFromRest } from "@/lib/atpSeed";
+import { setHotFocus } from "@/lib/hotFocus";
 import { peekTouchPx } from "@/lib/liveQuote";
 import { fmtPnl, fmtPrice } from "@/lib/formatNumber";
 import { apiFetch } from "@/lib/backend";
@@ -81,7 +82,6 @@ import {
 } from "@/lib/niftySnakeRules";
 
 const OPTION_QUOTE_POLL_MS = 8000;
-const SNAP_QUOTE_LTP_GAP_MS = 250;
 const BROKER_CONFIRM_HITS = 2;
 const SELL_GRACE_MS = 6000;
 const HEDGE_RETRY_MS = 20000;
@@ -1075,24 +1075,14 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
   const paintIid = lotsOpen > 0 || engine.awaitReload ? iid : huntIid ?? nearestIid;
 
   useEffect(() => {
-    if (!seg || paintIid == null || !Number.isFinite(paintIid) || paintIid <= 0) return;
-    let cancelled = false;
-    const inst = { exchangeSegment: seg, exchangeInstrumentID: paintIid };
-    const loop = () => {
-      if (cancelled) return;
-      const age = socketPrintAgeMs(paintIid);
-      // Same as Ladder: XTS Snap Quote last-trade wins. REST only fills a long gap.
-      if (age != null && age < SOCKET_LTP_BEATS_REST_MS) {
-        window.setTimeout(loop, 250);
-        return;
-      }
-      void refreshPaintLtpFromRest(inst, () => cancelled).finally(() => {
-        if (!cancelled) window.setTimeout(loop, SNAP_QUOTE_LTP_GAP_MS);
-      });
-    };
-    loop();
+    if (!seg || paintIid == null || !Number.isFinite(paintIid) || paintIid <= 0) {
+      setHotFocus("snake", []);
+      return;
+    }
+    // Server hot-focus (~120ms touchline) owns LIVE. Client REST poll was fighting the socket and freezing ticks.
+    setHotFocus("snake", [{ exchangeSegment: seg, exchangeInstrumentID: paintIid }]);
     return () => {
-      cancelled = true;
+      setHotFocus("snake", []);
     };
   }, [seg, paintIid]);
 

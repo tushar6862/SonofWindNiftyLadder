@@ -44,15 +44,40 @@ export type LiveTickPeek = {
   ask: number | null;
   ltpAt: number;
   bookAt: number;
+  /** Exchange last-trade time (unix sec). Older prints must not rewind LIVE. */
+  printTs?: number;
 };
 
 const liveTickPeek = new Map<number, LiveTickPeek>();
 const ltpPaintListeners = new Map<number, Set<(ltp: number) => void>>();
-/** Socket last-trade time only. REST must not stamp this — a slow quote was rewinding the print. */
+/** Socket / Fyers last-trade time. REST must not stamp this. */
 const socketPrintAt = new Map<number, number>();
+/** Tokens currently receiving Fyers LTP — XTS LTP must not overwrite while fresh. */
+const fyersPrintAt = new Map<number, number>();
 
-/** REST get_quote lags Snap Quote by several ticks in a fast move. Do not paint it over a live socket print. */
-export const SOCKET_LTP_BEATS_REST_MS = 8000;
+/** REST seeds only when socket/Fyers quiet. */
+export const SOCKET_LTP_BEATS_REST_MS = 2000;
+export const FYERS_LTP_BEATS_XTS_MS = 2000;
+
+export function fyersBeatsXts(id: number): boolean {
+  if (!Number.isFinite(id) || id <= 0) return false;
+  const t = fyersPrintAt.get(id);
+  if (t == null) return false;
+  return performance.now() - t < FYERS_LTP_BEATS_XTS_MS;
+}
+
+/** True while EventSource `/api/md/stream` is OPEN. */
+let mdStreamLive = false;
+
+export function isMdStreamLive(): boolean {
+  return mdStreamLive;
+}
+
+/** True when a fresh socket last-trade must not be overwritten by REST. */
+export function socketBeatsRest(id: number): boolean {
+  const age = socketPrintAgeMs(id);
+  return age != null && age < SOCKET_LTP_BEATS_REST_MS;
+}
 
 /** Ms since the last socket last-trade for this token. null if the socket has not printed. */
 export function socketPrintAgeMs(id: number): number | null {
@@ -111,6 +136,7 @@ function rememberLiveTick(
   bid: number | null,
   ask: number | null,
   fromRest = false,
+  printTs: number | null = null,
 ): void {
   const prev = liveTickPeek.get(id);
   const now = performance.now();
@@ -118,21 +144,44 @@ function rememberLiveTick(
   const nextBid = bid != null && bid > 0 ? bid : prev?.bid ?? null;
   const nextAsk = ask != null && ask > 0 ? ask : prev?.ask ?? null;
   if (!(nextLtp > 0) && nextBid == null && nextAsk == null) return;
+  // Stale exchange print must never rewind LIVE (SS: stuck 90.00 while XTS already 89.10).
+  const prevPrint = prev?.printTs ?? 0;
+  if (
+    printTs != null &&
+    printTs > 0 &&
+    prevPrint > 0 &&
+    printTs + 1e-6 < prevPrint &&
+    nextLtp > 0 &&
+    ltp != null
+  ) {
+    return;
+  }
   const ltpChanged = nextLtp > 0 && nextLtp !== prev?.ltp;
   const bookChanged = nextBid !== prev?.bid || nextAsk !== prev?.ask;
-  if (fromRest && socketPrintAt.has(id)) return;
+  // Fresh socket print wins. REST only after socket quiet (no forever freeze).
+  if (fromRest && socketBeatsRest(id)) return;
   if (ltpChanged && !fromRest) socketPrintAt.set(id, now);
+  const nextPrintTs =
+    printTs != null && printTs > 0 ? printTs : ltpChanged && !fromRest ? prevPrint || undefined : prev?.printTs;
   liveTickPeek.set(id, {
     ltp: nextLtp,
     bid: nextBid,
     ask: nextAsk,
     ltpAt: ltpChanged ? now : prev?.ltpAt ?? (nextLtp > 0 ? now : 0),
     bookAt: bookChanged ? now : prev?.bookAt ?? 0,
+    printTs: nextPrintTs,
   });
+  // Paint DOM listeners first — before React map flush.
   if (ltpChanged) {
     const subs = ltpPaintListeners.get(id);
     if (subs) {
-      for (const cb of subs) cb(nextLtp);
+      for (const cb of subs) {
+        try {
+          cb(nextLtp);
+        } catch {
+          /* ignore */
+        }
+      }
     }
   }
 }
@@ -448,10 +497,8 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           const id = Number(k);
           if (!Number.isFinite(id) || id <= 0) continue;
           if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) continue;
-          const sockAge = socketPrintAgeMs(id);
-          // Focus REST used to always win. A quote that left 300ms ago then painted 108 over a 106.80 print.
-          // 500ms was still short enough that a fast-move quote (3–4 points behind Snap Quote) painted over the socket.
-          if (sockAge != null && sockAge < SOCKET_LTP_BEATS_REST_MS) continue;
+          // Fresh socket owns LIVE. Quiet socket → allow quote seed so price does not freeze.
+          if (socketBeatsRest(id)) continue;
           rememberLiveTick(id, v, null, null, true);
           if (next[id] !== v) {
             next[id] = v;
@@ -633,12 +680,105 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
             : typeof t.LastTradedPrice === "number" && Number.isFinite(t.LastTradedPrice) && t.LastTradedPrice > 0
               ? t.LastTradedPrice
               : null;
-        const restPrint = t._fromRestQuote === true || t._snapshot === true || t._atpOnly === true;
-        const ltpFast = mcFast === 1502 || restPrint ? null : ltpFastRaw;
+        const gapFill = t._gapFill === true || t._fromRestQuote === true || t._hotLtp === true;
+        const fyersLtp = t._fyersLtp === true;
+        // Fyers LIVE / TopBar LTP — paint first; blocks XTS LTP for this token while fresh.
+        if (fyersLtp && ltpFastRaw != null) {
+          const printTsRaw =
+            typeof t.exchange_ts === "number" && t.exchange_ts > 1e9
+              ? t.exchange_ts
+              : typeof t.LastTradedTime === "number" && t.LastTradedTime > 1e9
+                ? t.LastTradedTime > 1e12
+                  ? t.LastTradedTime / 1000
+                  : t.LastTradedTime
+                : null;
+          rememberLiveTick(id, ltpFastRaw, null, null, false, printTsRaw);
+          fyersPrintAt.set(id, performance.now());
+          socketPrintAt.set(id, performance.now());
+          streamLtpAtRef.current.set(id, performance.now());
+          lastStreamLtpAtRef.current = Date.now();
+          const pending = pendingRef.current;
+          let row = pending.get(id);
+          if (!row) {
+            row = {};
+            pending.set(id, row);
+          }
+          row.ltp = ltpFastRaw;
+          const parsePx = (raw: unknown): number | undefined => {
+            if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw;
+            return undefined;
+          };
+          const prevClose = parsePx(t.prevClose);
+          const dayOpen = parsePx(t.dayOpen);
+          let dayHigh = parsePx(t.dayHigh);
+          let dayLow = parsePx(t.dayLow);
+          if (dayHigh !== undefined && dayLow !== undefined && dayHigh + 1e-9 < dayLow) {
+            [dayHigh, dayLow] = [dayLow, dayHigh];
+          }
+          const pctFeed =
+            typeof t.percentChange === "number" && Number.isFinite(t.percentChange) ? t.percentChange : undefined;
+          if (
+            prevClose !== undefined ||
+            dayOpen !== undefined ||
+            dayHigh !== undefined ||
+            dayLow !== undefined ||
+            pctFeed !== undefined
+          ) {
+            const spotDay: SpotDayRefMap[number] = { ...row.spotDay };
+            if (prevClose !== undefined) spotDay.prevClose = prevClose;
+            if (dayOpen !== undefined) spotDay.dayOpen = dayOpen;
+            if (dayHigh !== undefined) spotDay.dayHigh = dayHigh;
+            if (dayLow !== undefined) spotDay.dayLow = dayLow;
+            if (pctFeed !== undefined) spotDay.percentChange = pctFeed;
+            row.spotDay = spotDay;
+          }
+          scheduleFlushSoon(flushScheduledRef, flushRafRef, flushPending);
+          return;
+        }
+        // Gap-fill / hot touchline only when socket/Fyers is quiet — never rewind a fresh print.
+        if (gapFill) {
+          if (ltpFastRaw != null && !socketBeatsRest(id) && !fyersBeatsXts(id)) {
+            rememberLiveTick(id, ltpFastRaw, null, null, true);
+            const pending = pendingRef.current;
+            let row = pending.get(id);
+            if (!row) {
+              row = {};
+              pending.set(id, row);
+            }
+            row.ltp = ltpFastRaw;
+            if (typeof t.atp === "number" && t.atp > 0) row.atp = t.atp;
+            scheduleFlushSoon(flushScheduledRef, flushRafRef, flushPending);
+          } else if (typeof t.atp === "number" && t.atp > 0) {
+            const pending = pendingRef.current;
+            let row = pending.get(id);
+            if (!row) {
+              row = {};
+              pending.set(id, row);
+            }
+            row.atp = t.atp;
+            scheduleFlushSoon(flushScheduledRef, flushRafRef, flushPending);
+          }
+          return;
+        }
+        const restPrint = t._snapshot === true || t._atpOnly === true;
+        // While Fyers is painting this token, ignore XTS LTP (ATP/book still ok).
+        const ltpFast =
+          fyersBeatsXts(id) || mcFast === 1502 || restPrint ? null : ltpFastRaw;
         const bidFast = typeof t.bid === "number" && t.bid > 0 ? t.bid : null;
         const askFast = typeof t.ask === "number" && t.ask > 0 ? t.ask : null;
-        if (ltpFast != null || bidFast != null || askFast != null) {
-          rememberLiveTick(id, ltpFast, bidFast, askFast);
+        const printTsRaw =
+          typeof t.exchange_ts === "number" && t.exchange_ts > 1e9
+            ? t.exchange_ts
+            : typeof t.LastTradedTime === "number" && t.LastTradedTime > 1e9
+              ? t.LastTradedTime > 1e12
+                ? t.LastTradedTime / 1000
+                : t.LastTradedTime
+              : null;
+        // Book updates must not rewrite LTP — pass null ltp when this packet has no last-trade.
+        if (ltpFast != null) {
+          rememberLiveTick(id, ltpFast, bidFast, askFast, false, printTsRaw);
+        } else if (bidFast != null || askFast != null) {
+          rememberLiveTick(id, null, bidFast, askFast);
         }
         // Paint already hit the DOM. Do not walk the packet or re-render the chain on this tick —
         // that freeze is why a fast drop stayed on 97.85 while XTS had already printed 96.25.
@@ -795,6 +935,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
 
       es.onopen = () => {
         backoffMs = 500;
+        mdStreamLive = true;
       };
 
       es.onmessage = (ev) => {
@@ -804,16 +945,23 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           const ticks = Array.isArray(batchRaw)
             ? (batchRaw as Record<string, unknown>[])
             : [parsed];
+          // Paint last-trade first. ATP flood must not delay the Snap Quote number under CPU load.
+          const prints: Record<string, unknown>[] = [];
+          const rest: Record<string, unknown>[] = [];
           for (const t of ticks) {
             if (!t || typeof t !== "object") continue;
-            applyStreamTick(t);
+            if (t._atpOnly === true || t._ema21Only === true) rest.push(t);
+            else prints.push(t);
           }
+          for (const t of prints) applyStreamTick(t);
+          for (const t of rest) applyStreamTick(t);
         } catch {
           /* ignore */
         }
       };
 
       es.onerror = () => {
+        mdStreamLive = false;
         es.close();
         if (esRef.current === es) esRef.current = null;
         if (reconnectTimerRef.current != null) return;
@@ -867,6 +1015,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
     window.addEventListener("focus", resumeStream);
 
     return () => {
+      mdStreamLive = false;
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("focus", resumeStream);
       if (staleWatchRef.current != null) {

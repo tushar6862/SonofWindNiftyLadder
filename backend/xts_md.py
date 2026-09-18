@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable
@@ -11,6 +12,94 @@ import requests
 
 from market.ltp_pick import apply_feed_ltp, exchange_print_ts, pick_ltp_for_display, print_ts_from_tick
 from market.packet_decoder import decode_xts_binary_packet
+
+
+class SseTickPipe:
+    """SSE listener pipe: last-trade lane is always drained before ATP/noise."""
+
+    __slots__ = ("_cond", "_ltp", "_other", "_max", "_size")
+
+    def __init__(self, maxsize: int = 12000):
+        self._cond = threading.Condition()
+        self._ltp: deque[dict[str, Any]] = deque()
+        self._other: deque[dict[str, Any]] = deque()
+        self._max = max(64, int(maxsize))
+        self._size = 0
+
+    def qsize(self) -> int:
+        return int(self._size)
+
+    def put_nowait(self, payload: dict[str, Any], *, priority: bool = False) -> None:
+        with self._cond:
+            if self._size >= self._max:
+                if not priority:
+                    raise Full
+                # Priority last-trade: drop oldest noise first, then oldest LTP.
+                if self._other:
+                    self._other.popleft()
+                    self._size -= 1
+                elif self._ltp:
+                    self._ltp.popleft()
+                    self._size -= 1
+                else:
+                    raise Full
+            if priority:
+                self._ltp.append(payload)
+            else:
+                self._other.append(payload)
+            self._size += 1
+            self._cond.notify()
+
+    def get(self, timeout: float | None = None) -> dict[str, Any]:
+        with self._cond:
+            if timeout is None:
+                while self._size <= 0:
+                    self._cond.wait()
+            else:
+                end = time.monotonic() + float(timeout)
+                while self._size <= 0:
+                    remaining = end - time.monotonic()
+                    if remaining <= 0:
+                        raise Empty
+                    self._cond.wait(remaining)
+            if self._ltp:
+                self._size -= 1
+                return self._ltp.popleft()
+            if self._other:
+                self._size -= 1
+                return self._other.popleft()
+            raise Empty
+
+    def get_nowait(self) -> dict[str, Any]:
+        with self._cond:
+            if self._ltp:
+                self._size -= 1
+                return self._ltp.popleft()
+            if self._other:
+                self._size -= 1
+                return self._other.popleft()
+            raise Empty
+
+
+def _sse_payload_is_ltp_print(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("_atpOnly") or payload.get("_ema21Only") or payload.get("_snapshot"):
+        return False
+    if payload.get("_gapFill") or payload.get("_fromRestQuote") or payload.get("_hotLtp"):
+        return False
+    try:
+        if float(payload.get("ltp") or 0.0) <= 0:
+            return False
+    except Exception:
+        return False
+    if payload.get("_fyersLtp") is True:
+        return True
+    try:
+        mc = int(payload.get("messageCode") or 0)
+    except Exception:
+        mc = 0
+    return mc != 1502
 
 
 def _unwrap_md_payload(data: Any) -> Any:
@@ -94,7 +183,10 @@ def _md_auth_failed(data: Any = None, snippet: str = "", status_code: int | None
 XTS_MD_ROOT = _env("XTS_MD_ROOT", "https://trading.investeria.in").rstrip("/")
 XTS_MD_SOURCE = _env("XTS_MD_SOURCE", "WEBAPI")
 XTS_MD_SOCKETIO_PATH = _env("XTS_MD_SOCKETIO_PATH", "apibinarymarketdata/socket.io")
-XTS_MD_PUBLISH_FORMAT = _env("XTS_MD_PUBLISH_FORMAT", "JSON")
+# Binary = denser last-trade. JSON kept as failover if Binary yields no LTP.
+XTS_MD_PUBLISH_FORMAT = _env("XTS_MD_PUBLISH_FORMAT", "Binary")
+# Runtime flip target (Binary <-> JSON) when ltp-pub stays empty after connect.
+_ACTIVE_PUBLISH_FORMAT = str(XTS_MD_PUBLISH_FORMAT or "Binary").strip() or "Binary"
 # Partial = tick-to-tick 1501/1512-json-partial (Snap Quote LTP). Full = slow snapshots.
 XTS_MD_BROADCAST_MODE = _env("XTS_MD_BROADCAST_MODE", "Partial")
 # Brokers often reject one bad token in a batch — cap chunk size via env when needed (e.g. 32).
@@ -104,14 +196,20 @@ XTS_MD_SUBSCRIBE_CHUNK = max(8, min(int(_env("XTS_MD_SUBSCRIBE_CHUNK", "96")), 1
 _COALESCE_MS_RAW = float(_env("XTS_MD_COALESCE_MS", "0") or "0")
 XTS_MD_COALESCE_SEC = max(0.0, _COALESCE_MS_RAW / 1000.0)
 # Server-side touchline ATP refresh → pushed on existing SSE (replaces browser atp_snapshot polling).
-XTS_MD_ATP_REFRESH_SEC = max(0.0, float(_env("XTS_MD_ATP_REFRESH_SEC", "1.5") or "0"))
-XTS_MD_ATP_CHUNK = max(8, min(int(_env("XTS_MD_ATP_CHUNK", "40")), 100))
+# 1.5s × 40 legs at 9:15 flooded the SSE queue under CPU load and delayed Snap Quote LTP by 3–4 pts.
+XTS_MD_ATP_REFRESH_SEC = max(0.0, float(_env("XTS_MD_ATP_REFRESH_SEC", "4") or "0"))
+XTS_MD_ATP_CHUNK = max(8, min(int(_env("XTS_MD_ATP_CHUNK", "24")), 100))
+# Skip enqueueing ATP-only SSE when a listener queue already has this many pending events.
+XTS_MD_ATP_SSE_MAX_Q = max(32, min(int(_env("XTS_MD_ATP_SSE_MAX_Q", "128")), 2000))
 # Symphony CandleDataEvent (message 1505) — opt-in; doubles subscription count.
 XTS_MD_SUBSCRIBE_1505 = str(_env("XTS_MD_SUBSCRIBE_1505", "0")).strip().lower() not in ("0", "false", "no", "off")
 # 1512 = Snap Quote LTP event (tick-to-tick LastTradedPrice). Default on with 1501.
 XTS_MD_SUBSCRIBE_1512 = str(_env("XTS_MD_SUBSCRIBE_1512", "1")).strip().lower() not in ("0", "false", "no", "off")
 # Reconnect Socket.IO when no binary ticks for this many seconds (ATP refresh does not count).
 XTS_MD_SOCKET_STALE_SEC = max(15.0, float(_env("XTS_MD_SOCKET_STALE_SEC", "45") or "45"))
+# LIVE / hunt focus: single-token touchline poll so the painted strike tracks XTS when the socket is quiet.
+XTS_MD_HOT_FOCUS_SEC = max(0.05, float(_env("XTS_MD_HOT_FOCUS_SEC", "0.05") or "0.05"))
+XTS_MD_HOT_FOCUS_SOCKET_GUARD_SEC = max(0.5, float(_env("XTS_MD_HOT_FOCUS_SOCKET_GUARD_SEC", "2.0") or "2.0"))
 
 
 def _parse_symphony_candle_partial(raw: str) -> dict[str, Any] | None:
@@ -219,12 +317,21 @@ def _tick_from_xts_partial_str(raw: str, message_code: int) -> dict[str, Any] | 
             ltp = float(
                 parts.get("ltp")
                 or parts.get("lt")
-                or parts.get("p")
                 or parts.get("lasttradedprice")
                 or 0.0
             )
         except Exception:
             ltp = 0.0
+        if ltp <= 0 and int(message_code) in (1501, 1512):
+            try:
+                ltp = float(parts.get("p") or 0.0)
+            except Exception:
+                ltp = 0.0
+        # Never treat bid/ask keys as last trade.
+        if parts.get("ap") or parts.get("bp") or parts.get("ask") or parts.get("bid"):
+            if "ltp" not in parts and "lt" not in parts and "lasttradedprice" not in parts:
+                if int(message_code) == 1502 or ("p" not in parts and ltp <= 0):
+                    ltp = 0.0
         try:
             bid = float(parts.get("bp") or parts.get("b") or parts.get("bid") or 0.0)
         except Exception:
@@ -390,10 +497,13 @@ def _tick_from_xts_json_leaf(leaf: dict[str, Any], message_code: int) -> dict[st
         except Exception:
             seg = 0
     ltp = float(
-        _positive_float(leaf.get("ltp") or leaf.get("LTP") or leaf.get("p") or leaf.get("P"))
+        _positive_float(leaf.get("ltp") or leaf.get("LTP") or leaf.get("LastTradedPrice") or leaf.get("lastTradedPrice"))
         or _touchline_last_traded_price(leaf)
         or 0.0
     )
+    # Partial shorthand ``p:`` is last trade on 1501/1512 — never Bid/Ask.
+    if ltp <= 0 and int(message_code) in (1501, 1512):
+        ltp = float(_positive_float(leaf.get("p") or leaf.get("P")) or 0.0)
     tl = leaf.get("Touchline") or leaf.get("touchline") or leaf.get("TouchLine") or leaf.get("touchLine")
     if not isinstance(tl, dict):
         tl = {}
@@ -994,10 +1104,11 @@ class XtsMarketDataClient:
     def socket_url(self) -> str:
         if not self._md:
             raise RuntimeError("marketdata session not initialized")
+        fmt = str(_ACTIVE_PUBLISH_FORMAT or XTS_MD_PUBLISH_FORMAT or "Binary").strip() or "Binary"
         return (
             f"{XTS_MD_ROOT}/?token={self._md.token}"
             f"&userID={self._md.user_id}"
-            f"&publishFormat={XTS_MD_PUBLISH_FORMAT}"
+            f"&publishFormat={fmt}"
             f"&broadcastMode={XTS_MD_BROADCAST_MODE}"
         )
 
@@ -2354,8 +2465,8 @@ class MarketDataStreamer:
         self._sid = None
         self._subs: set[tuple[int, int]] = set()  # (seg, id)
         self._sub_tokens: set[int] = set()  # instrument id — match ticks even if packet segment differs
-        self._listeners: set[Queue] = set()
-        self._listeners_snapshot: tuple[Queue, ...] = ()
+        self._listeners: set[SseTickPipe] = set()
+        self._listeners_snapshot: tuple[SseTickPipe, ...] = ()
         self._pipeline_sink: Callable[[dict[str, Any]], None] | None = None
         self._coalesce_lock = threading.Lock()
         self._coalesce: dict[tuple[int, int], dict[str, Any]] = {}
@@ -2378,9 +2489,16 @@ class MarketDataStreamer:
         self._last_ensure_alive_mono = 0.0
         self._last_soft_reconnect_mono = 0.0
         self._rx_counts: dict[str, int] = {}
+        self._connect_mono = time.monotonic()
+        self._format_flipped = False
         self._partial_paint_mono: dict[int, float] = {}
         self._json_full_q: Queue = Queue(maxsize=64)
         self._json_full_started = False
+        self._hot_lock = threading.Lock()
+        self._hot_tokens: dict[int, int] = {}  # tid -> exchangeSegment
+        self._hot_last_ltp: dict[int, float] = {}
+        self._hot_focus_stop: threading.Event | None = None
+        self._hot_focus_started = False
 
     def _refresh_listener_snapshot(self) -> None:
         self._listeners_snapshot = tuple(self._listeners)
@@ -2419,6 +2537,14 @@ class MarketDataStreamer:
             wstop.set()
         self._watchdog_started = False
         self._watchdog_stop = None
+        hstop = self._hot_focus_stop
+        if hstop is not None:
+            hstop.set()
+        self._hot_focus_started = False
+        self._hot_focus_stop = None
+        with self._hot_lock:
+            self._hot_tokens.clear()
+            self._hot_last_ltp.clear()
         if sid is not None:
             try:
                 sid.disconnect()
@@ -2431,6 +2557,171 @@ class MarketDataStreamer:
 
     def _bump_rx(self, kind: str) -> None:
         self._rx_counts[kind] = int(self._rx_counts.get(kind) or 0) + 1
+
+    def set_hot_focus(self, instruments: list[dict[str, Any]]) -> dict[str, Any]:
+        """Pin LIVE tokens for touchline seed until socket last-trade arrives (then socket-only)."""
+        next_map: dict[int, int] = {}
+        for inst in instruments or []:
+            try:
+                seg = int(inst.get("exchangeSegment") or inst.get("ExchangeSegment") or 0)
+                tid = int(inst.get("exchangeInstrumentID") or inst.get("ExchangeInstrumentID") or 0)
+            except Exception:
+                continue
+            if tid <= 0:
+                continue
+            if seg <= 0:
+                with self._lock:
+                    for s, t in self._subs:
+                        if int(t) == tid and int(s) > 0:
+                            seg = int(s)
+                            break
+            if seg <= 0:
+                continue
+            next_map[tid] = seg
+        with self._hot_lock:
+            self._hot_tokens = next_map
+        self._ensure_hot_focus_thread()
+        if next_map:
+            threading.Thread(target=self._refresh_hot_focus_once, name="md-hot-focus-once", daemon=True).start()
+        fyers_out: dict[str, Any] = {}
+        try:
+            from market.fyers_ltp import fyers_enabled, get_fyers_ltp_feed
+
+            if fyers_enabled():
+                feed = get_fyers_ltp_feed()
+                feed.set_ltp_handler(self.publish_fyers_ltp)
+                fyers_out = feed.set_hot_instruments(
+                    [{"exchangeSegment": seg, "exchangeInstrumentID": tid} for tid, seg in next_map.items()]
+                )
+        except Exception as e:
+            fyers_out = {"ok": False, "error": str(e)}
+        return {
+            "ok": True,
+            "count": len(next_map),
+            "tokens": sorted(next_map.keys()),
+            "fyers": fyers_out,
+        }
+
+    def publish_fyers_ltp(
+        self,
+        tid: int,
+        seg: int,
+        ltp: float,
+        ltt: float = 0.0,
+        extras: dict[str, float] | None = None,
+    ) -> None:
+        """Paint LIVE / TopBar from Fyers (priority last-trade path)."""
+        try:
+            tid_i = int(tid)
+            ltp_f = float(ltp)
+        except Exception:
+            return
+        if tid_i <= 0 or ltp_f <= 0:
+            return
+        tick: dict[str, Any] = {
+            "exchangeInstrumentID": tid_i,
+            "exchangeSegment": int(seg) if int(seg or 0) > 0 else 2,
+            "messageCode": 1501,
+            "ltp": ltp_f,
+            "_ltp1501": ltp_f,
+            "_fyersLtp": True,
+        }
+        try:
+            if float(ltt or 0.0) > 1e9:
+                tick["exchange_ts"] = float(ltt)
+                tick["LastTradedTime"] = float(ltt)
+        except Exception:
+            pass
+        if isinstance(extras, dict):
+            for k in ("prevClose", "dayOpen", "dayHigh", "dayLow", "percentChange"):
+                try:
+                    v = float(extras.get(k) or 0.0)
+                except Exception:
+                    continue
+                if k == "percentChange":
+                    if abs(v) > 1e-12:
+                        tick[k] = v
+                elif v > 0:
+                    tick[k] = v
+        self._deliver_tick(tick)
+
+    def _ensure_hot_focus_thread(self) -> None:
+        with self._lock:
+            if self._hot_focus_started:
+                return
+            self._hot_focus_stop = threading.Event()
+            self._hot_focus_started = True
+            stop = self._hot_focus_stop
+        threading.Thread(
+            target=self._hot_focus_loop,
+            args=(stop,),
+            name="md-hot-focus",
+            daemon=True,
+        ).start()
+
+    def _hot_focus_loop(self, stop: threading.Event) -> None:
+        while not stop.wait(XTS_MD_HOT_FOCUS_SEC):
+            try:
+                self._refresh_hot_focus_once()
+            except Exception:
+                pass
+
+    def _refresh_hot_focus_once(self) -> None:
+        """Seed LIVE LTP from touchline only while socket has been quiet (~250ms)."""
+        with self._hot_lock:
+            hot = dict(self._hot_tokens)
+        if not hot:
+            return
+        client = self._client
+        if not client:
+            return
+        instruments = [
+            {"exchangeSegment": int(seg), "exchangeInstrumentID": int(tid)}
+            for tid, seg in hot.items()
+            if int(tid) > 0 and int(seg) > 0
+        ]
+        if not instruments:
+            return
+        try:
+            raw = client.get_quote(
+                instruments=instruments,
+                xts_message_code=1501,
+                publish_format="JSON",
+            )
+        except Exception:
+            return
+        ltp_map = _extract_ltp_map_from_quote_response(raw)
+        atp_map = _extract_atp_map_from_quote_response(raw)
+        now = time.monotonic()
+        guard = max(0.5, float(XTS_MD_HOT_FOCUS_SOCKET_GUARD_SEC))
+        for tid, seg in hot.items():
+            ik = int(tid)
+            ltp = float(ltp_map.get(ik) or 0.0)
+            if ltp <= 0:
+                continue
+            last_partial = float(self._partial_paint_mono.get(ik) or 0.0)
+            # Socket Snap Quote owns LIVE while prints are flowing — REST must not stick a high print.
+            if last_partial > 0 and (now - last_partial) < guard:
+                continue
+            prev_hot = float(self._hot_last_ltp.get(ik) or 0.0)
+            if prev_hot > 0 and abs(prev_hot - ltp) < 1e-6:
+                continue
+            self._hot_last_ltp[ik] = ltp
+            tick: dict[str, Any] = {
+                "exchangeInstrumentID": ik,
+                "exchangeSegment": int(seg),
+                "messageCode": 1501,
+                "ltp": ltp,
+                "_ltp1501": ltp,
+                "_gapFill": True,
+                "_fromRestQuote": True,
+                "_hotLtp": True,
+            }
+            atp = float(atp_map.get(ik) or 0.0)
+            if atp > 0:
+                tick["atp"] = atp
+                tick["_atp1501"] = atp
+            self._deliver_tick(tick)
 
     def feed_rx_counts(self) -> dict[str, int]:
         return dict(self._rx_counts)
@@ -2561,11 +2852,58 @@ class MarketDataStreamer:
         ).start()
 
     def _watchdog_loop(self, stop: threading.Event) -> None:
-        while not stop.wait(30.0):
+        while not stop.wait(5.0):
+            try:
+                self._maybe_flip_publish_format()
+            except Exception:
+                pass
             try:
                 self.schedule_ensure_socket_alive()
             except Exception:
                 pass
+
+    def _maybe_flip_publish_format(self) -> None:
+        """If Binary/JSON yields packets but zero LTP for ~4s, flip format once and soft-reconnect."""
+        global _ACTIVE_PUBLISH_FORMAT
+        if self._format_flipped:
+            return
+        if time.monotonic() - float(self._connect_mono or 0.0) < 4.0:
+            return
+        with self._lock:
+            if not self._started or not self._api_key or not self._api_secret:
+                return
+            key = self._api_key
+            secret = self._api_secret
+            instruments = [
+                {"exchangeSegment": int(s), "exchangeInstrumentID": int(t)}
+                for s, t in sorted(self._subs)
+                if int(s) > 0 and int(t) > 0
+            ]
+        if not instruments:
+            return
+        counts = self.feed_rx_counts()
+        if int(counts.get("ltp-pub") or 0) > 0:
+            return
+        # Need some socket traffic so we know the pipe is alive but LTP-empty.
+        traffic = (
+            int(counts.get("binary") or 0)
+            + int(counts.get("1501-partial") or 0)
+            + int(counts.get("1512-partial") or 0)
+            + int(counts.get("binary-empty") or 0)
+        )
+        if traffic <= 0:
+            return
+        cur = str(_ACTIVE_PUBLISH_FORMAT or "Binary").strip().lower()
+        nxt = "JSON" if cur == "binary" else "Binary"
+        _ACTIVE_PUBLISH_FORMAT = nxt
+        self._format_flipped = True
+        self._bump_rx("format-flip:" + nxt)
+        self._rx_counts["ltp-pub"] = 0
+        self._connect_mono = time.monotonic()
+        try:
+            self._soft_reconnect_socket(key, secret, instruments, reuse_client=True)
+        except Exception:
+            pass
 
     def _connect(self, api_key: str, api_secret: str, *, reuse_client: bool = False) -> None:
         client = self._client if (reuse_client and self._client is not None) else None
@@ -2575,6 +2913,7 @@ class MarketDataStreamer:
             client.login()
         # Assign only after a token exists so REST never sees a token-less client.
         self._client = client
+        self._connect_mono = time.monotonic()
 
         import socketio  # lazy import
 
@@ -2696,7 +3035,23 @@ class MarketDataStreamer:
                 pass
 
     def _publish_binary_packet(self, data: Any) -> None:
-        """xts-binary-packet is bytes, a Buffer list, or a string. A string used to be dropped, so Snap Quote LTP never reached SSE."""
+        """xts-binary-packet is bytes, a Buffer list, or a string. Publish every decoded last-trade."""
+
+        def _emit(blob: bytes) -> None:
+            if not blob:
+                self._bump_rx("binary-empty")
+                return
+            n = 0
+            for tick in decode_xts_binary_packet(blob):
+                if float(tick.get("ltp") or 0.0) > 0:
+                    n += 1
+                    self._bump_rx("ltp-pub")
+                self._publish(tick)
+            if n:
+                self._bump_rx("binary-ltp")
+            else:
+                self._bump_rx("binary-empty")
+
         if isinstance(data, str):
             s = data.strip()
             if not s:
@@ -2706,22 +3061,19 @@ class MarketDataStreamer:
                 self._ingest_json_md(1501, s)
                 return
             blob = _bytes_from_packet_str(s)
-            ticks = list(decode_xts_binary_packet(blob)) if blob else []
-            if not ticks:
-                try:
-                    ticks = list(decode_xts_binary_packet(s.encode("latin-1", "ignore")))
-                except Exception:
-                    ticks = []
-            for tick in ticks:
-                self._publish(tick)
+            if blob:
+                _emit(blob)
+                return
+            try:
+                _emit(s.encode("latin-1", "ignore"))
+            except Exception:
+                pass
             return
         if isinstance(data, dict) and str(data.get("type") or "") == "Buffer" and isinstance(data.get("data"), list):
             try:
-                blob = bytes(int(x) & 0xFF for x in data["data"])
+                _emit(bytes(int(x) & 0xFF for x in data["data"]))
             except Exception:
-                return
-            for tick in decode_xts_binary_packet(blob):
-                self._publish(tick)
+                pass
             return
         if isinstance(data, (list, tuple)):
             if data and isinstance(data[0], str):
@@ -2730,20 +3082,14 @@ class MarketDataStreamer:
                         self._publish_binary_packet(item)
                 return
             try:
-                blob = b"".join(bytes(x) for x in data if not isinstance(x, str))
+                _emit(b"".join(bytes(x) for x in data if not isinstance(x, str)))
             except Exception:
-                return
-            if blob:
-                for tick in decode_xts_binary_packet(blob):
-                    self._publish(tick)
+                pass
             return
         try:
-            blob = bytes(data)
+            _emit(bytes(data))
         except Exception:
-            return
-        if blob:
-            for tick in decode_xts_binary_packet(blob):
-                self._publish(tick)
+            pass
 
     def _ensure_json_full_thread(self) -> None:
         if self._json_full_started:
@@ -2985,7 +3331,8 @@ class MarketDataStreamer:
                 prev_atp = float(prev.get("atp") or 0.0)
                 prev_ltp = float(prev.get("ltp") or 0.0)
                 atp_changed = atp > 0 and abs(prev_atp - atp) >= 1e-4
-                # REST quote LTP lags Snap Quote in a fast move. Mace only — never paint LTP from here.
+                # Bulk refresh is Mace only. LIVE hot-token poll owns REST LTP gap-fill —
+                # bulk LTP used to stamp as a socket print and freeze LIVE 0.5–4 pts behind XTS.
                 _ = ltp, prev_ltp
                 if not atp_changed:
                     continue
@@ -3246,13 +3593,19 @@ class MarketDataStreamer:
             out["messageCode"] = mc_i
         if tick.get("_atpOnly"):
             out["_atpOnly"] = True
-        # Snapshot / REST quote must not rewind a Snap Quote last-trade print.
-        # A slower 1501/1512-json-full must not rewind a tick that already painted.
-        paint_ltp = not tick.get("_snapshot") and not tick.get("_fromRestQuote") and not tick.get("_atpOnly")
+        # Snapshot / ATP-only must not rewind a Snap Quote last-trade print.
+        # Gap-fill REST may carry ltp (flagged) so LIVE is not blank when socket is quiet.
+        paint_ltp = not tick.get("_snapshot") and not tick.get("_atpOnly")
         if paint_ltp and tick.get("_fullSnap") and tid > 0:
             last_partial = float(self._partial_paint_mono.get(tid) or 0.0)
             if last_partial > 0 and (time.monotonic() - last_partial) < 1.5:
                 paint_ltp = False
+        if tick.get("_gapFill") or tick.get("_fromRestQuote"):
+            out["_gapFill"] = True
+        if tick.get("_hotLtp"):
+            out["_hotLtp"] = True
+        if tick.get("_fyersLtp"):
+            out["_fyersLtp"] = True
         try:
             ltp = float(tick.get("ltp") or 0.0)
         except Exception:
@@ -3261,6 +3614,13 @@ class MarketDataStreamer:
             out["ltp"] = ltp
         elif paint_ltp and mc_i != 1502 and ltp > 0:
             out["ltp"] = ltp
+        try:
+            ex_ts = float(tick.get("exchange_ts") or tick.get("LastTradedTime") or 0.0)
+            if ex_ts > 1e9:
+                out["exchange_ts"] = ex_ts
+                out["LastTradedTime"] = ex_ts
+        except Exception:
+            pass
         for k in (
             "bid",
             "ask",
@@ -3298,7 +3658,15 @@ class MarketDataStreamer:
                     self._latest_sse[tid] = payload
         except Exception:
             pass
+        atp_only = bool(payload.get("_atpOnly") or payload.get("_ema21Only"))
         for q in self._listeners_snapshot:
+            if atp_only:
+                try:
+                    if q.qsize() >= XTS_MD_ATP_SSE_MAX_Q:
+                        # Keep last-trade path clear during a 9:15 burst / 100% CPU.
+                        continue
+                except Exception:
+                    pass
             self._enqueue_listener(q, payload)
 
     def _ensure_sink_thread(self) -> None:
@@ -3324,30 +3692,32 @@ class MarketDataStreamer:
             except Exception:
                 pass
 
-    def _enqueue_listener(self, q: Queue, payload: dict[str, Any]) -> None:
+    def _enqueue_listener(self, q: SseTickPipe, payload: dict[str, Any]) -> None:
+        """Last-trade goes on the priority lane so LIVE paints before ATP noise."""
+        priority = _sse_payload_is_ltp_print(payload)
         try:
-            q.put_nowait(payload)
+            q.put_nowait(payload, priority=priority)
+            return
         except Full:
-            try:
-                q.get_nowait()
-            except Empty:
-                pass
-            try:
-                q.put_nowait(payload)
-            except Exception:
-                pass
+            pass
+        except Exception:
+            return
+        if not priority:
+            return
+        try:
+            q.put_nowait(payload, priority=True)
         except Exception:
             pass
 
-    def add_listener(self) -> Queue:
-        q: Queue = Queue(maxsize=12000)
+    def add_listener(self) -> SseTickPipe:
+        q = SseTickPipe(maxsize=12000)
         with self._lock:
             self._listeners.add(q)
             self._refresh_listener_snapshot()
         self._prime_listener_queue(q)
         return q
 
-    def remove_listener(self, q: Queue):
+    def remove_listener(self, q: SseTickPipe):
         with self._lock:
             self._listeners.discard(q)
             self._refresh_listener_snapshot()
@@ -3448,12 +3818,25 @@ class MarketDataStreamer:
     def _deliver_tick(self, tick: dict[str, Any]) -> None:
         # Paint first. TickEngine used to run on the socket thread and held the next 1501 print.
         payload = self._paint_payload(tick)
-        if not tick.get("_fullSnap") and not tick.get("_atpOnly") and not tick.get("_snapshot"):
+        # Stamp freshness only when last-trade LTP actually changes.
+        # Re-stamping same LTP blocked hot-focus / next print for hundreds of ms.
+        # Fyers LIVE LTP stamps the same way so XTS REST cannot rewind it.
+        if (
+            not tick.get("_fullSnap")
+            and not tick.get("_atpOnly")
+            and not tick.get("_snapshot")
+            and not tick.get("_gapFill")
+            and not tick.get("_fromRestQuote")
+            and not tick.get("_hotLtp")
+        ) or tick.get("_fyersLtp"):
             try:
-                if float(payload.get("ltp") or 0.0) > 0:
-                    tid = int(payload.get("exchangeInstrumentID") or 0)
-                    if tid > 0:
+                new_ltp = float(payload.get("ltp") or 0.0)
+                tid = int(payload.get("exchangeInstrumentID") or 0)
+                if tid > 0 and new_ltp > 0:
+                    prev = float(self._hot_last_ltp.get(tid) or 0.0)
+                    if prev <= 0 or abs(prev - new_ltp) >= 1e-6:
                         self._partial_paint_mono[tid] = time.monotonic()
+                        self._hot_last_ltp[tid] = new_ltp
             except Exception:
                 pass
         self._push_sse(payload)
@@ -3495,7 +3878,20 @@ class MarketDataStreamer:
                     break
 
         gap = XTS_MD_COALESCE_SEC
-        if gap <= 0:
+        # Snap Quote last-trade must never wait on coalesce — 9:15 burst was skipping 3–4 prints.
+        try:
+            mc = int(tick.get("messageCode") or tick.get("MessageCode") or 0)
+        except Exception:
+            mc = 0
+        try:
+            ltp_now = float(tick.get("ltp") or 0.0)
+        except Exception:
+            ltp_now = 0.0
+        if (
+            gap <= 0
+            or tick.get("_atpOnly")
+            or (mc in (1501, 1512) and ltp_now > 0 and not tick.get("_snapshot"))
+        ):
             self._deliver_tick(tick)
             return
 

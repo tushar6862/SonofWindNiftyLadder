@@ -10,6 +10,8 @@ import { liveAtmStrikeForChain } from "@/lib/liveAtmStrike";
 import { fmtPct, fmtPrice } from "@/lib/formatNumber";
 import { useLocation } from "wouter";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { apiFetch } from "@/lib/backend";
+import { setFyersTopbarFocus } from "@/lib/hotFocus";
 
 const INDICES: readonly IndexName[] = ["SENSEX", "NIFTY", "BANKNIFTY"];
 
@@ -172,11 +174,36 @@ export default function TopBar({
   const [, navigate] = useLocation();
   const hilo = useLiveHiLo();
   const spotDayRefByToken = useLiveSpotDayRef();
+  const [fyersAuthed, setFyersAuthed] = useState(false);
+  const [fyersBusy, setFyersBusy] = useState(false);
 
   useEffect(() => {
     const t = setInterval(() => setTime(new Date()), 1000);
     return () => clearInterval(t);
   }, []);
+
+  useEffect(() => {
+    if (state.status !== "authed") return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = (await apiFetch("/api/fyers/status")) as {
+          ok?: boolean;
+          authed?: boolean;
+          enabled?: boolean;
+        };
+        if (!cancelled && res?.ok) setFyersAuthed(Boolean(res.authed));
+      } catch {
+        /* ignore */
+      }
+    };
+    void poll();
+    const iv = window.setInterval(poll, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(iv);
+    };
+  }, [state.status]);
 
   const handleIndexChange = (idx: IndexName) => {
     onIndexChange(idx);
@@ -278,6 +305,30 @@ export default function TopBar({
       : null;
   const tickCe = useTickLtp(atmRow?.ce ?? null);
   const tickPe = useTickLtp(atmRow?.pe ?? null);
+
+  useEffect(() => {
+    if (!chain || !fyersAuthed) return;
+    const spotSeg = Number(chain.spotSegment) || 0;
+    const spotTok = Number(chain.spotToken) || 0;
+    const vixSeg =
+      typeof chain.vixSegment === "number" && chain.vixSegment > 0 ? chain.vixSegment : 1;
+    const vixTok = typeof chain.vixInstrumentId === "number" ? chain.vixInstrumentId : 0;
+    const optSeg = Number(chain.optionSegment) || 2;
+    const options: { exchangeSegment: number; exchangeInstrumentID: number }[] = [];
+    if (atmRow?.ce && atmRow.ce > 0) {
+      options.push({ exchangeSegment: optSeg, exchangeInstrumentID: atmRow.ce });
+    }
+    if (atmRow?.pe && atmRow.pe > 0) {
+      options.push({ exchangeSegment: optSeg, exchangeInstrumentID: atmRow.pe });
+    }
+    setFyersTopbarFocus({
+      index,
+      spot: spotTok > 0 && spotSeg > 0 ? { exchangeSegment: spotSeg, exchangeInstrumentID: spotTok } : null,
+      vix: vixTok > 0 ? { exchangeSegment: vixSeg, exchangeInstrumentID: vixTok } : null,
+      options,
+    });
+  }, [chain, index, fyersAuthed, atmRow?.ce, atmRow?.pe]);
+
   const ceLt = tickCe != null && tickCe > 0 ? tickCe : undefined;
   const peLt = tickPe != null && tickPe > 0 ? tickPe : undefined;
   const atmStraddle =
@@ -478,6 +529,41 @@ export default function TopBar({
 
           <div className="ml-auto flex items-center gap-1.5">
             <span className="sow-glass-topbar-pill tabular-nums">{fmtClock(time)}</span>
+
+            <button
+              type="button"
+              disabled={fyersBusy}
+              title={
+                fyersAuthed
+                  ? "Spot / VIX / ATM / LIVE LTP = Fyers"
+                  : "Connect Fyers for TopBar + LIVE LTP (once per day)"
+              }
+              className={`sow-glass-topbar-pill text-[11px] font-semibold ${
+                fyersAuthed ? "text-emerald-600" : "text-amber-600"
+              }`}
+              onClick={async () => {
+                if (fyersAuthed) return;
+                setFyersBusy(true);
+                try {
+                  const res = (await apiFetch("/api/fyers/login_url")) as {
+                    ok?: boolean;
+                    url?: string;
+                    error?: string;
+                  };
+                  if (res?.url) {
+                    window.location.href = res.url;
+                    return;
+                  }
+                  window.alert(res?.error || "Fyers login URL nahi mila");
+                } catch (e) {
+                  window.alert(e instanceof Error ? e.message : String(e));
+                } finally {
+                  setFyersBusy(false);
+                }
+              }}
+            >
+              {fyersAuthed ? "Fyers MD" : fyersBusy ? "Fyers…" : "Connect Fyers"}
+            </button>
 
             {state.status === "authed" && (
               <div className="sow-glass-topbar-profile" title={`Signed in · ${state.username}`}>
