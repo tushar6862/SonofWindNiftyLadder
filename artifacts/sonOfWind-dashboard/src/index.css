@@ -2924,9 +2924,12 @@ body.sow-has-dashboard-bg {
 
 /* ── Nifty Ladder ───────────────────────────────────────────── */
 .nl-toolbar {
+  position: relative;
+  z-index: 60;
   display: flex;
   flex-direction: column;
   gap: 2px;
+  overflow: visible;
 }
 
 .nl-chip {
@@ -3008,6 +3011,117 @@ body.sow-has-dashboard-bg {
 
 .nl-toggle__btn--pe.nl-toggle__btn--on {
   background: linear-gradient(145deg, hsl(0 72% 48% / 0.95) 0%, hsl(0 68% 38% / 0.98) 100%);
+}
+
+.nl-strike-dd__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid hsl(var(--foreground) / 0.14);
+  background: hsl(var(--card) / 0.55);
+  backdrop-filter: blur(10px) saturate(1.25);
+  -webkit-backdrop-filter: blur(10px) saturate(1.25);
+  color: hsl(var(--foreground));
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 hsl(0 0% 100% / 0.1);
+}
+
+.nl-strike-dd__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.nl-strike-dd__btn--open {
+  border-color: hsl(213 70% 48% / 0.55);
+}
+
+.nl-strike-dd__label {
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.nl-strike-dd__strike {
+  color: hsl(var(--muted-foreground));
+  font-weight: 700;
+}
+
+.nl-strike-dd__badge {
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: hsl(0 0% 100%);
+  background: linear-gradient(145deg, hsl(213 78% 48% / 0.95) 0%, hsl(213 72% 40% / 0.98) 100%);
+}
+
+.nl-strike-dd__badge--pe {
+  background: linear-gradient(145deg, hsl(0 72% 48% / 0.95) 0%, hsl(0 68% 38% / 0.98) 100%);
+}
+
+.nl-strike-dd__caret {
+  margin-left: 2px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.nl-strike-dd__menu {
+  position: fixed;
+  z-index: 400;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  border-radius: 12px;
+  border: 1px solid hsl(var(--foreground) / 0.14);
+  background: hsl(var(--card) / 0.92);
+  backdrop-filter: blur(16px) saturate(1.35);
+  -webkit-backdrop-filter: blur(16px) saturate(1.35);
+  box-shadow:
+    inset 0 1px 0 hsl(0 0% 100% / 0.12),
+    0 12px 32px hsl(214 60% 12% / 0.35);
+}
+
+.light-theme .nl-strike-dd__menu {
+  background: hsl(0 0% 100% / 0.96);
+  border-color: hsl(213 45% 72%);
+  box-shadow:
+    inset 0 1px 0 hsl(0 0% 100% / 1),
+    0 12px 28px hsl(213 55% 45% / 0.16);
+}
+
+.nl-strike-dd__opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 0;
+  background: transparent;
+  color: hsl(var(--foreground));
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  text-align: left;
+}
+
+.nl-strike-dd__opt:hover {
+  background: hsl(var(--foreground) / 0.06);
+}
+
+.nl-strike-dd__opt--on {
+  background: hsl(213 70% 45% / 0.18);
+}
+
+.light-theme .nl-strike-dd__opt--on {
+  background: hsl(213 80% 92%);
 }
 
 .nl-btn-again {

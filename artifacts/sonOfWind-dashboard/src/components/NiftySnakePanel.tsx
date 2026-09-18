@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ChainResolved } from "@/types/market";
 import { useLiveLtp, peekLiveTick } from "@/context/LiveLtpContext";
 import { FastLtp } from "@/components/FastLtp";
@@ -17,6 +18,7 @@ import {
 } from "@/lib/ixPortfolio";
 import { expectedLadderFill, ixOrderRejectedMessage, ladderOrderPricing, XTS_IX_ORDER_BASE } from "@/lib/xtsOrder";
 import { toast } from "@/hooks/use-toast";
+import { liveAtmStrikeForChain } from "@/lib/liveAtmStrike";
 import {
   BAND_HIGH,
   BAND_LOW,
@@ -27,6 +29,7 @@ import {
   HEDGE_PREMIUM_HIGH,
   HEDGE_PREMIUM_LOW,
   LOT_SIZE,
+  MANUAL_STRIKE_OFFSETS,
   MAX_PLAN_TICKS,
   ROUND_TRIP_COST_PER_LOT,
   SNAKE_CLOCK_MS,
@@ -35,12 +38,14 @@ import {
   UNDERLYING,
   applyFilledAction,
   applySize,
+  atmOffsetTag,
   avgFill,
   bookExpense,
   bookLevel,
   buildHedges,
   clearSnakeSession,
   closestTo72,
+  formatAtmOffsetLabel,
   hedgeLotsOpen,
   hedgeWindowLabel,
   hedgesNeeded,
@@ -59,10 +64,12 @@ import {
   openLots,
   openMtm,
   pickHedgePremium,
+  pickManualStrike,
   pickNear72,
   planTick,
   qtyForLots,
   reconcileBrokerShortLots,
+  resolveManualStrike,
   saveSnakeSession,
   sellLevel,
   shortBookedPnl,
@@ -73,8 +80,10 @@ import {
   uiReset,
   windowLabel,
   type ChainPremiumRow,
+  type EntryMode,
   type HedgeWindow,
   type HuntPick,
+  type ManualStrikeOffset,
   type OptionType,
   type SizeMult,
   type SnakeAction,
@@ -155,6 +164,115 @@ function ltpFromMap(map: Record<string, number> | undefined, iid: number): numbe
   if (!map) return null;
   const raw = map[String(iid)] ?? map[iid as unknown as string];
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : null;
+}
+
+function ManualStrikeDropdown({
+  atm,
+  step,
+  optionType,
+  offset,
+  disabled,
+  onChange,
+}: {
+  atm: number;
+  step: number;
+  optionType: OptionType;
+  offset: ManualStrikeOffset;
+  disabled?: boolean;
+  onChange: (offset: ManualStrikeOffset) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState({ top: 0, left: 0, width: 200 });
+
+  const placeMenu = () => {
+    const el = ref.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setMenuPos({ top: r.bottom + 4, left: r.left, width: Math.max(r.width, 220) });
+  };
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    placeMenu();
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onWin = () => placeMenu();
+    window.addEventListener("resize", onWin);
+    window.addEventListener("scroll", onWin, true);
+    return () => {
+      window.removeEventListener("resize", onWin);
+      window.removeEventListener("scroll", onWin, true);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (ref.current?.contains(t) || menuRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const selectedStrike = resolveManualStrike(atm, offset, step);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((o) => !o)}
+        className={`nl-strike-dd__btn${open ? " nl-strike-dd__btn--open" : ""}`}
+      >
+        <span className="nl-strike-dd__label">{formatAtmOffsetLabel(offset)}</span>
+        <span className="nl-strike-dd__strike tabular-nums">{selectedStrike.toLocaleString("en-IN")}</span>
+        <span className={`nl-strike-dd__badge${optionType === "PE" ? " nl-strike-dd__badge--pe" : ""}`}>
+          {optionType}
+        </span>
+        <span className="nl-strike-dd__caret" aria-hidden>
+          ▾
+        </span>
+      </button>
+      {open &&
+        !disabled &&
+        createPortal(
+          <div
+            ref={menuRef}
+            className="nl-strike-dd__menu"
+            style={{ top: menuPos.top, left: menuPos.left, minWidth: menuPos.width }}
+          >
+            {MANUAL_STRIKE_OFFSETS.map((off) => {
+              const strike = resolveManualStrike(atm, off, step);
+              const on = off === offset;
+              return (
+                <button
+                  key={off}
+                  type="button"
+                  className={`nl-strike-dd__opt${on ? " nl-strike-dd__opt--on" : ""}`}
+                  onClick={() => {
+                    onChange(off);
+                    setOpen(false);
+                  }}
+                >
+                  <span className="nl-strike-dd__label">{formatAtmOffsetLabel(off)}</span>
+                  <span className="nl-strike-dd__strike tabular-nums">{strike.toLocaleString("en-IN")}</span>
+                  <span className={`nl-strike-dd__badge${optionType === "PE" ? " nl-strike-dd__badge--pe" : ""}`}>
+                    {optionType}
+                  </span>
+                </button>
+              );
+            })}
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
 }
 
 export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?: number }) {
@@ -405,10 +523,25 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
   const huntFromLive = useCallback((): HuntPick | null => {
     const st = engineRef.current;
     if (isLiveSnake(st) || st.awaitReload || st.t1Fill != null) return null;
-    const rows = chainPremiumRows(chainRef.current, ltpsRef.current);
-    const pick = pickNear72(rows, st.optionType);
+    const ch = chainRef.current;
+    const spot =
+      typeof ltpsRef.current[ch.spotToken] === "number" && ltpsRef.current[ch.spotToken]! > 0
+        ? ltpsRef.current[ch.spotToken]!
+        : ch.spotLtp;
+    const rows = chainPremiumRows(ch, ltpsRef.current);
+    const step = typeof ch.step === "number" && ch.step > 0 ? ch.step : 50;
+    const pick =
+      st.entryMode === "manual"
+        ? pickManualStrike(
+            rows,
+            st.optionType,
+            liveAtmStrikeForChain(ch, typeof spot === "number" ? spot : undefined),
+            st.manualStrikeOffset,
+            step,
+          )
+        : pickNear72(rows, st.optionType);
     if (!pick) return null;
-    const instrumentId = resolveIid(chainRef.current, pick.strike, pick.optionType);
+    const instrumentId = resolveIid(ch, pick.strike, pick.optionType);
     if (!instrumentId) return null;
     const touch = peekTouchPx(instrumentId, ltpsRef.current);
     if (touch && touch > 0) return { ...pick, ltp: touch };
@@ -827,6 +960,7 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
           ltp,
           huntPick: huntFromLive(),
           brokerShortLots: brokerShortLotsRef.current,
+          entryMode: st.entryMode ?? "auto",
         });
         if (!action) break;
         if (!uiBusy) {
@@ -968,8 +1102,21 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
       pushLog("RESUME extras on +3 (books, cover, hard SL stay live)", "info");
       toast({ title: "Nifty Snake resumed", description: "Adds on +3 are live again." });
     } else if (!isEntryWindow(now)) {
-      pushLog(`Armed — waiting for 09:16 IST, then hunt ${BAND_LOW}–${BAND_HIGH}`, "info");
+      if (st.entryMode === "manual") {
+        pushLog(
+          `Armed — waiting for 09:16 IST, then MANUAL ${atmOffsetTag(st.manualStrikeOffset)} (no band)`,
+          "info",
+        );
+      } else {
+        pushLog(`Armed — waiting for 09:16 IST, then hunt ${BAND_LOW}–${BAND_HIGH}`, "info");
+      }
       toast({ title: "Nifty Snake armed", description: "Entry after 09:16 IST." });
+    } else if (st.entryMode === "manual") {
+      pushLog(`START — MANUAL ${atmOffsetTag(st.manualStrikeOffset)} · no band · direct T1`, "info");
+      toast({
+        title: "Nifty Snake started",
+        description: `Manual ${atmOffsetTag(st.manualStrikeOffset)} — enter on live print.`,
+      });
     } else {
       pushLog(`START — hunting ~${BAND_TARGET} premium in ${BAND_LOW}–${BAND_HIGH}`, "info");
       toast({
@@ -1060,8 +1207,37 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
     sync(next);
   };
 
+  const controlsLocked = gridLocked || engine.awaitReload;
+
+  const setEntryMode = (entryMode: EntryMode) => {
+    const st = engineRef.current;
+    if (openLots(st.slots) > 0 || st.awaitReload || st.t1Fill != null || st.entryMode === entryMode) return;
+    const next: SnakeEngineState = { ...st, entryMode, manualStrikeOffset: 0 };
+    engineRef.current = next;
+    sync(next);
+  };
+
+  const setManualOffset = (manualStrikeOffset: ManualStrikeOffset) => {
+    const st = engineRef.current;
+    if (openLots(st.slots) > 0 || st.awaitReload || st.t1Fill != null || st.manualStrikeOffset === manualStrikeOffset) {
+      return;
+    }
+    const next: SnakeEngineState = { ...st, manualStrikeOffset };
+    engineRef.current = next;
+    sync(next);
+  };
+
   const rows = useMemo(() => chainPremiumRows(chain, ltps), [chain, ltps, clockMs]);
-  const huntPick = !gridLocked && !engine.awaitReload ? pickNear72(rows, engine.optionType) : null;
+  const step = typeof chain.step === "number" && chain.step > 0 ? chain.step : 50;
+  const liveAtm = liveAtmStrikeForChain(chain, typeof spotLive === "number" ? spotLive : undefined);
+  const huntPick =
+    !gridLocked && !engine.awaitReload
+      ? engine.entryMode === "manual"
+        ? pickManualStrike(rows, engine.optionType, liveAtm, engine.manualStrikeOffset, step)
+        : pickNear72(rows, engine.optionType)
+      : null;
+  const manualDisplayStrike =
+    engine.entryMode === "manual" ? resolveManualStrike(liveAtm, engine.manualStrikeOffset, step) : null;
   const nearest = closestTo72(rows, engine.optionType);
   const avg = avgFill(engine.slots);
   const lotsOpen = openLots(engine.slots);
@@ -1071,7 +1247,11 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
   const primaryLabel = engine.awaitRestart ? "START AGAIN" : "START";
   const net = pnl.gross - pnl.expense;
 
-  const huntIid = huntPick ? resolveIid(chain, huntPick.strike, huntPick.optionType) : null;
+  const huntIid = huntPick
+    ? resolveIid(chain, huntPick.strike, huntPick.optionType)
+    : manualDisplayStrike != null
+      ? resolveIid(chain, manualDisplayStrike, engine.optionType)
+      : null;
   const nearestIid = nearest ? resolveIid(chain, nearest.strike, nearest.optionType) : null;
   const paintIid = lotsOpen > 0 || engine.awaitReload ? iid : huntIid ?? nearestIid;
 
@@ -1151,6 +1331,37 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
             </div>
           </div>
 
+          <div className="flex flex-col gap-1">
+            <span className="ramsetu-glass-toolbar__label">Entry</span>
+            <div className="nl-toggle">
+              {(["auto", "manual"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  disabled={controlsLocked}
+                  onClick={() => setEntryMode(mode)}
+                  className={`nl-toggle__btn${engine.entryMode === mode ? " nl-toggle__btn--on" : ""}`}
+                >
+                  {mode === "auto" ? "Auto" : "Manual"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {engine.entryMode === "manual" && (
+            <div className="flex flex-col gap-1 min-w-[160px]">
+              <span className="ramsetu-glass-toolbar__label">Strike</span>
+              <ManualStrikeDropdown
+                atm={liveAtm}
+                step={step}
+                optionType={engine.optionType}
+                offset={engine.manualStrikeOffset}
+                disabled={controlsLocked}
+                onChange={setManualOffset}
+              />
+            </div>
+          )}
+
           <div className="flex flex-col gap-1 min-w-[120px]">
             <span className="ramsetu-glass-toolbar__label">Window</span>
             <span className="font-semibold tabular-nums text-foreground">{windowLabel(clockMs)}</span>
@@ -1206,7 +1417,13 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
           </div>
 
           <div className="ramsetu-glass-card ramsetu-glass-card--center">
-            <div className="ramsetu-glass-card__badge">HUNT PICK · {engine.optionType}</div>
+            <div className="ramsetu-glass-card__badge">
+              {engine.strike != null
+                ? `HUNT PICK · ${engine.optionType}`
+                : engine.entryMode === "manual"
+                  ? `MANUAL PICK · ${engine.optionType}`
+                  : `HUNT PICK · ${engine.optionType}`}
+            </div>
             <div
               className={`ramsetu-glass-card__strike tabular-nums ${
                 engine.optionType === "PE" ? "ramsetu-glass-card__strike--pe" : "text-cd-green"
@@ -1216,24 +1433,34 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
                 ? `${engine.strike.toLocaleString("en-IN")} ${engine.optionType}`
                 : huntPick
                   ? `${huntPick.strike.toLocaleString("en-IN")} ${engine.optionType}`
-                  : "—"}
+                  : engine.entryMode === "manual" && manualDisplayStrike != null
+                    ? `${manualDisplayStrike.toLocaleString("en-IN")} ${engine.optionType}`
+                    : "—"}
             </div>
             <div className="ramsetu-glass-card__rule">
               {engine.strike != null
                 ? "Strike locked"
-                : huntPick
-                  ? (
-                      <>
-                        LTP <FastLtp iid={huntIid} className="tabular-nums" /> · band {BAND_LOW}–{BAND_HIGH}
-                      </>
-                    )
-                  : nearest
+                : engine.entryMode === "manual"
+                  ? huntPick
                     ? (
                         <>
-                          Nearest {nearest.strike} @ <FastLtp iid={nearestIid} className="tabular-nums" /> (outside band)
+                          LTP <FastLtp iid={huntIid} className="tabular-nums" /> · {atmOffsetTag(engine.manualStrikeOffset)} · no band
                         </>
                       )
-                    : `No print in ${BAND_LOW}–${BAND_HIGH}`}
+                    : `${atmOffsetTag(engine.manualStrikeOffset)} · no band`
+                  : huntPick
+                    ? (
+                        <>
+                          LTP <FastLtp iid={huntIid} className="tabular-nums" /> · band {BAND_LOW}–{BAND_HIGH}
+                        </>
+                      )
+                    : nearest
+                      ? (
+                          <>
+                            Nearest {nearest.strike} @ <FastLtp iid={nearestIid} className="tabular-nums" /> (outside band)
+                          </>
+                        )
+                      : `No print in ${BAND_LOW}–${BAND_HIGH}`}
             </div>
           </div>
 

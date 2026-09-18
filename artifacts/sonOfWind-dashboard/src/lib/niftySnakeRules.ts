@@ -33,6 +33,9 @@ export const SNAKE_STORE_KEY = "sow_nifty_snake_v1";
 export type OptionType = "CE" | "PE";
 export type SizeMult = (typeof SIZE_MULTS)[number];
 export type HedgeWindow = 1 | 2 | 3 | 4 | 5 | 6 | 7;
+export type EntryMode = "auto" | "manual";
+export const MANUAL_STRIKE_OFFSETS = [-3, -2, -1, 0, 1, 2, 3] as const;
+export type ManualStrikeOffset = (typeof MANUAL_STRIKE_OFFSETS)[number];
 
 export type SnakeSlot = {
   index: number;
@@ -67,6 +70,8 @@ export type HuntPick = {
 export type SnakeEngineState = {
   optionType: OptionType;
   sizeMult: SizeMult;
+  entryMode: EntryMode;
+  manualStrikeOffset: ManualStrikeOffset;
   armed: boolean;
   awaitRestart: boolean;
   awaitReload: boolean;
@@ -98,6 +103,8 @@ export type PlanTickInput = {
   ltp: number | null;
   huntPick: HuntPick | null;
   brokerShortLots: number | null;
+  /** Manual skips premium-band gate; Auto keeps 70–75 filter. */
+  entryMode?: EntryMode;
 };
 
 const HEDGE_COVERS: { window: HedgeWindow; covers: number[] }[] = [
@@ -219,11 +226,18 @@ export function buildHedges(slots: SnakeSlot[]): SnakeHedge[] {
   });
 }
 
-export function idleEngineState(optionType: OptionType = "CE", sizeMult: SizeMult = 1): SnakeEngineState {
+export function idleEngineState(
+  optionType: OptionType = "CE",
+  sizeMult: SizeMult = 1,
+  entryMode: EntryMode = "auto",
+  manualStrikeOffset: ManualStrikeOffset = 0,
+): SnakeEngineState {
   const slots = emptySlots(sizeMult);
   return {
     optionType,
     sizeMult,
+    entryMode: sanitizeEntryMode(entryMode),
+    manualStrikeOffset: sanitizeManualStrikeOffset(manualStrikeOffset),
     armed: false,
     awaitRestart: false,
     awaitReload: false,
@@ -335,6 +349,47 @@ export function pickNear72(rows: ChainPremiumRow[], optionType: OptionType): Hun
   return candidates[0] ?? null;
 }
 
+export function formatAtmOffsetLabel(offset: ManualStrikeOffset): string {
+  if (offset === 0) return "ATM";
+  return offset > 0 ? `ATM + ${offset}` : `ATM − ${Math.abs(offset)}`;
+}
+
+export function atmOffsetTag(offset: ManualStrikeOffset): string {
+  if (offset === 0) return "ATM";
+  return offset > 0 ? `ATM+${offset}` : `ATM−${Math.abs(offset)}`;
+}
+
+export function resolveManualStrike(atm: number, offset: ManualStrikeOffset, step: number): number {
+  const s = typeof step === "number" && step > 0 ? step : 50;
+  return atm + offset * s;
+}
+
+/** Manual entry: fixed ATM±offset strike — any live print (no band filter). */
+export function pickManualStrike(
+  rows: ChainPremiumRow[],
+  optionType: OptionType,
+  atm: number,
+  offset: ManualStrikeOffset,
+  step: number,
+): HuntPick | null {
+  if (!(typeof atm === "number" && Number.isFinite(atm) && atm > 0)) return null;
+  const strike = resolveManualStrike(atm, offset, step);
+  const row = rows.find((r) => r.strike === strike);
+  if (!row) return null;
+  const ltp = sideLtp(row, optionType);
+  if (ltp == null) return null;
+  return { strike, ltp, optionType };
+}
+
+export function sanitizeEntryMode(raw: unknown): EntryMode {
+  return raw === "manual" ? "manual" : "auto";
+}
+
+export function sanitizeManualStrikeOffset(raw: unknown): ManualStrikeOffset {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  return MANUAL_STRIKE_OFFSETS.includes(n as ManualStrikeOffset) ? (n as ManualStrikeOffset) : 0;
+}
+
 export function closestTo72(rows: ChainPremiumRow[], optionType: OptionType): HuntPick | null {
   const candidates: HuntPick[] = [];
   for (const row of rows) {
@@ -436,8 +491,20 @@ function shortsFlat(slots: SnakeSlot[]): boolean {
  * Hedge buys are the panel's job (live quotes). Hedge sells ride EOD / square-all.
  */
 export function planTick(input: PlanTickInput): SnakeAction | null {
-  const { nowMs, armed, awaitRestart, awaitReload, reloadIndices, t1Fill, slots, hedges, ltp, huntPick, brokerShortLots } =
-    input;
+  const {
+    nowMs,
+    armed,
+    awaitRestart,
+    awaitReload,
+    reloadIndices,
+    t1Fill,
+    slots,
+    hedges,
+    ltp,
+    huntPick,
+    brokerShortLots,
+    entryMode = "auto",
+  } = input;
   const gridLocked = t1Fill != null && t1Fill > 0;
   const anyOpen = slots.some((s) => s.open);
 
@@ -493,7 +560,8 @@ export function planTick(input: PlanTickInput): SnakeAction | null {
   if (!anyOpen && !gridLocked && !awaitReload) {
     if (!armed || awaitRestart) return null;
     if (!isEntryWindow(nowMs)) return null;
-    if (!huntPick || !inPremiumBand(huntPick.ltp)) return null;
+    if (!huntPick) return null;
+    if (entryMode !== "manual" && !inPremiumBand(huntPick.ltp)) return null;
     return { kind: "enter_t1", pick: huntPick };
   }
 
@@ -716,7 +784,7 @@ export function reconcileBrokerShortLots(state: SnakeEngineState, brokerShortLot
   if (trading && brokerLots <= 0) {
     return {
       state: {
-        ...idleEngineState(state.optionType, state.sizeMult),
+        ...idleEngineState(state.optionType, state.sizeMult, state.entryMode, state.manualStrikeOffset),
         awaitRestart: true,
         hedges: cloneHedges(state.hedges),
       },
@@ -741,11 +809,11 @@ export function reconcileBrokerShortLots(state: SnakeEngineState, brokerShortLot
 }
 
 export function localNewDayReset(state: SnakeEngineState): SnakeEngineState {
-  return idleEngineState(state.optionType, state.sizeMult);
+  return idleEngineState(state.optionType, state.sizeMult, state.entryMode, state.manualStrikeOffset);
 }
 
 export function uiReset(state: SnakeEngineState): SnakeEngineState {
-  return idleEngineState(state.optionType, state.sizeMult);
+  return idleEngineState(state.optionType, state.sizeMult, state.entryMode, state.manualStrikeOffset);
 }
 
 export type SnakeLogKind = "info" | "entry" | "exit" | "warn";
@@ -858,6 +926,8 @@ export function sanitizeSnakeEngine(raw: unknown): SnakeEngineState | null {
   const engine: SnakeEngineState = {
     optionType,
     sizeMult,
+    entryMode: sanitizeEntryMode(rec.entryMode),
+    manualStrikeOffset: sanitizeManualStrikeOffset(rec.manualStrikeOffset),
     armed: Boolean(rec.armed),
     awaitRestart: Boolean(rec.awaitRestart),
     awaitReload,

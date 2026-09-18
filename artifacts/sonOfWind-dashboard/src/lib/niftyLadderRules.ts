@@ -28,6 +28,9 @@ export const LOTS_EDIT_MAX = 100;
 export type OptionType = "CE" | "PE";
 export type SizeMult = (typeof SIZE_MULTS)[number];
 export type OpenDriveBias = "UP" | "DOWN" | "FLAT";
+export type EntryMode = "auto" | "manual";
+export const MANUAL_STRIKE_OFFSETS = [-3, -2, -1, 0, 1, 2, 3] as const;
+export type ManualStrikeOffset = (typeof MANUAL_STRIKE_OFFSETS)[number];
 
 export type LadderSlot = {
   index: number;
@@ -216,6 +219,47 @@ export function pickNear100(rows: ChainPremiumRow[], optionType: OptionType): Hu
   if (!candidates.length) return null;
   candidates.sort((a, b) => sortNearTarget(a, b, optionType));
   return candidates[0] ?? null;
+}
+
+export function formatAtmOffsetLabel(offset: ManualStrikeOffset): string {
+  if (offset === 0) return "ATM";
+  return offset > 0 ? `ATM + ${offset}` : `ATM − ${Math.abs(offset)}`;
+}
+
+export function atmOffsetTag(offset: ManualStrikeOffset): string {
+  if (offset === 0) return "ATM";
+  return offset > 0 ? `ATM+${offset}` : `ATM−${Math.abs(offset)}`;
+}
+
+export function resolveManualStrike(atm: number, offset: ManualStrikeOffset, step: number): number {
+  const s = typeof step === "number" && step > 0 ? step : 50;
+  return atm + offset * s;
+}
+
+/** Manual entry: fixed ATM±offset strike — any live print (no band filter). */
+export function pickManualStrike(
+  rows: ChainPremiumRow[],
+  optionType: OptionType,
+  atm: number,
+  offset: ManualStrikeOffset,
+  step: number,
+): HuntPick | null {
+  if (!(typeof atm === "number" && Number.isFinite(atm) && atm > 0)) return null;
+  const strike = resolveManualStrike(atm, offset, step);
+  const row = rows.find((r) => r.strike === strike);
+  if (!row) return null;
+  const ltp = sideLtp(row, optionType);
+  if (ltp == null) return null;
+  return { strike, ltp, optionType };
+}
+
+export function sanitizeEntryMode(raw: unknown): EntryMode {
+  return raw === "manual" ? "manual" : "auto";
+}
+
+export function sanitizeManualStrikeOffset(raw: unknown): ManualStrikeOffset {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  return MANUAL_STRIKE_OFFSETS.includes(n as ManualStrikeOffset) ? (n as ManualStrikeOffset) : 0;
 }
 
 /** UI “nearest” display only. Never used for T1 entry. */
@@ -408,6 +452,8 @@ export function reasonAwaitsRestart(reason: string): boolean {
 export type LadderEngineState = {
   optionType: OptionType;
   sizeMult: SizeMult;
+  entryMode: EntryMode;
+  manualStrikeOffset: ManualStrikeOffset;
   armed: boolean;
   awaitRestart: boolean;
   awaitReload: boolean;
@@ -419,10 +465,14 @@ export type LadderEngineState = {
 export function idleEngineState(
   optionType: OptionType = "CE",
   sizeMult: SizeMult = 1,
+  entryMode: EntryMode = "auto",
+  manualStrikeOffset: ManualStrikeOffset = 0,
 ): LadderEngineState {
   return {
     optionType,
     sizeMult,
+    entryMode: sanitizeEntryMode(entryMode),
+    manualStrikeOffset: sanitizeManualStrikeOffset(manualStrikeOffset),
     armed: false,
     awaitRestart: false,
     awaitReload: false,
@@ -527,7 +577,7 @@ export function reconcileBrokerShortLots(
   }
   if (trading && brokerLots <= 0) {
     return {
-      state: idleEngineState(state.optionType, state.sizeMult),
+      state: idleEngineState(state.optionType, state.sizeMult, state.entryMode, state.manualStrikeOffset),
       phantomClosed: [],
       brokerFlat: true,
     };
@@ -594,7 +644,7 @@ export function localNewDayReset(state: LadderEngineState): LadderEngineState {
 }
 
 export function uiReset(state: LadderEngineState): LadderEngineState {
-  return idleEngineState(state.optionType, state.sizeMult);
+  return idleEngineState(state.optionType, state.sizeMult, state.entryMode, state.manualStrikeOffset);
 }
 
 /** Persist while armed or still in trade (incl. T1 working / hard-SL reload). */
@@ -701,6 +751,8 @@ export function sanitizeLadderEngine(raw: unknown): LadderEngineState | null {
   const engine: LadderEngineState = {
     optionType,
     sizeMult,
+    entryMode: sanitizeEntryMode(rec.entryMode),
+    manualStrikeOffset: sanitizeManualStrikeOffset(rec.manualStrikeOffset),
     armed: Boolean(rec.armed),
     awaitRestart: Boolean(rec.awaitRestart),
     awaitReload,
