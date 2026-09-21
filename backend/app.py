@@ -42,7 +42,8 @@ def _load_backend_dotenv() -> None:
             key, _, val = s.partition("=")
             key = key.strip()
             val = val.strip().strip('"').strip("'")
-            if key and key not in os.environ:
+            # Fyers keys always come from this file so a new App ID wins over a stale shell env.
+            if key and (key.startswith("FYERS_") or key not in os.environ):
                 os.environ[key] = val
     except Exception:
         pass

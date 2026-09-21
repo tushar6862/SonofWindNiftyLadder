@@ -10,6 +10,63 @@ import { refreshQuotesFromRest } from "@/lib/atpSeed";
 import { seedChainSpotFromResolve } from "@/lib/seedChainSpot";
 import type { ChainExpiriesResponse, ChainResolved, ChainResolveResponse, ExpiryRow } from "@/types/market";
 
+function FyersMorningConnect() {
+  const [ready, setReady] = useState(false);
+  const [authed, setAuthed] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = (await apiFetch("/api/fyers/status")) as { ok?: boolean; authed?: boolean };
+        if (!cancelled && res?.ok) {
+          setAuthed(Boolean(res.authed));
+          setReady(true);
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    void poll();
+    const iv = window.setInterval(poll, 8000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(iv);
+    };
+  }, []);
+
+  if (!ready || authed) return null;
+
+  return (
+    <div className="mx-3 mt-2 flex items-center justify-between gap-3 rounded-md border border-amber-500/50 bg-amber-500/15 px-3 py-2 text-[13px]">
+      <span>Roz subah naya Fyers login chahiye. Connect karo, tab LIVE LTP XTS se match karega.</span>
+      <button
+        type="button"
+        disabled={busy}
+        className="shrink-0 rounded-md bg-amber-500 px-3 py-1.5 text-[12px] font-semibold text-black disabled:opacity-60"
+        onClick={async () => {
+          setBusy(true);
+          try {
+            const res = (await apiFetch("/api/fyers/login_url")) as { url?: string; error?: string };
+            if (res?.url) {
+              window.location.href = res.url;
+              return;
+            }
+            window.alert(res?.error || "Fyers login URL nahi mila");
+          } catch (e) {
+            window.alert(e instanceof Error ? e.message : String(e));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {busy ? "Opening…" : "Connect Fyers"}
+      </button>
+    </div>
+  );
+}
+
 export type IndexName = "SENSEX" | "NIFTY" | "BANKNIFTY";
 
 export const EXPIRY_BY_INDEX: Record<IndexName, string[]> = {
@@ -284,6 +341,8 @@ export default function DashboardPage() {
           subscribeError={subscribeError}
           expiryHint={expiryFetchError}
         />
+
+        <FyersMorningConnect />
 
         <div className="flex flex-1 overflow-hidden">
           <div className="w-[420px] min-w-[300px] flex flex-col overflow-hidden">

@@ -175,6 +175,7 @@ export default function TopBar({
   const hilo = useLiveHiLo();
   const spotDayRefByToken = useLiveSpotDayRef();
   const [fyersAuthed, setFyersAuthed] = useState(false);
+  const [fyersExpired, setFyersExpired] = useState(false);
   const [fyersBusy, setFyersBusy] = useState(false);
 
   useEffect(() => {
@@ -191,8 +192,13 @@ export default function TopBar({
           ok?: boolean;
           authed?: boolean;
           enabled?: boolean;
+          expired?: boolean;
+          lastError?: string;
         };
-        if (!cancelled && res?.ok) setFyersAuthed(Boolean(res.authed));
+        if (!cancelled && res?.ok) {
+          setFyersAuthed(Boolean(res.authed));
+          setFyersExpired(Boolean(res.expired));
+        }
       } catch {
         /* ignore */
       }
@@ -536,7 +542,9 @@ export default function TopBar({
               title={
                 fyersAuthed
                   ? "Spot / VIX / ATM / LIVE LTP = Fyers"
-                  : "Connect Fyers for TopBar + LIVE LTP (once per day)"
+                  : fyersExpired
+                    ? "Fyers token expired (daily login) — click to reconnect"
+                    : "Connect Fyers for TopBar + LIVE LTP (once per day)"
               }
               className={`sow-glass-topbar-pill text-[11px] font-semibold ${
                 fyersAuthed ? "text-emerald-600" : "text-amber-600"
@@ -562,7 +570,13 @@ export default function TopBar({
                 }
               }}
             >
-              {fyersAuthed ? "Fyers MD" : fyersBusy ? "Fyers…" : "Connect Fyers"}
+              {fyersAuthed
+                ? "Fyers MD"
+                : fyersBusy
+                  ? "Fyers…"
+                  : fyersExpired
+                    ? "Reconnect Fyers"
+                    : "Connect Fyers"}
             </button>
 
             {state.status === "authed" && (

@@ -5,6 +5,7 @@ XTS remains orders / positions / margin / chain resolve.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -21,6 +22,8 @@ _MASTER_GLOB = "instruments_master_*.txt"
 _QUOTES_URL = "https://api-t1.fyers.in/data/quotes"
 _AUTH_URL = "https://api-t1.fyers.in/api/v3/validate-authcode"
 _POLL_SEC = max(0.05, float(os.environ.get("FYERS_LTP_POLL_SEC", "0.08") or "0.08"))
+# Fyers access tokens are day-scoped; treat slightly early so UI prompts re-login.
+_TOKEN_SKEW_SEC = 60
 
 FYERS_INDEX_SYMBOL: dict[str, str] = {
     "NIFTY": "NSE:NIFTY50-INDEX",
@@ -114,13 +117,47 @@ def exchange_auth_code(auth_code: str) -> dict[str, Any]:
     return {"ok": True, "saved_at": out["saved_at"]}
 
 
+def _jwt_exp(token: str) -> float | None:
+    """Read JWT exp claim without verifying signature (local expiry gate only)."""
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1]
+        pad = "=" * ((4 - len(payload) % 4) % 4)
+        raw = base64.urlsafe_b64decode(payload + pad)
+        data = json.loads(raw.decode("utf-8"))
+        exp = data.get("exp")
+        return float(exp) if exp is not None else None
+    except Exception:
+        return None
+
+
+def access_token_raw() -> str:
+    return str(_load_tokens().get("access_token") or "").strip()
+
+
+def token_expired(token: str | None = None) -> bool:
+    tok = (token if token is not None else access_token_raw()).strip()
+    if not tok:
+        return True
+    exp = _jwt_exp(tok)
+    if exp is None:
+        # No exp claim — keep previous behaviour (presence = usable).
+        return False
+    return time.time() >= (exp - _TOKEN_SKEW_SEC)
+
+
 def has_access_token() -> bool:
-    return bool(str(_load_tokens().get("access_token") or "").strip())
+    tok = access_token_raw()
+    if not tok:
+        return False
+    return not token_expired(tok)
 
 
 def access_token_header() -> str:
-    tok = str(_load_tokens().get("access_token") or "").strip()
-    if not tok:
+    tok = access_token_raw()
+    if not tok or token_expired(tok):
         return ""
     return f"{_app_id()}:{tok}"
 
@@ -233,14 +270,27 @@ class FyersLtpFeed:
         self._on_ltp = fn
 
     def status(self) -> dict[str, Any]:
+        tok = access_token_raw()
+        expired = bool(tok) and token_expired(tok)
+        authed = bool(tok) and not expired
+        if expired and self._started:
+            # Stop feeding stale quotes under an expired session.
+            try:
+                self._stop_feeds()
+            except Exception:
+                pass
+            if not self._last_err:
+                self._last_err = "Fyers access token expired — reconnect Fyers"
         return {
             "enabled": fyers_enabled(),
-            "authed": has_access_token(),
-            "connected": bool(self._started),
-            "mode": self._mode,
-            "symbols": sorted(self._want.keys()),
+            "authed": authed,
+            "expired": expired,
+            "connected": bool(self._started) and authed,
+            "mode": self._mode if authed else "",
+            "symbols": sorted(self._want.keys()) if authed else [],
             "rx": int(self._rx),
-            "lastError": self._last_err,
+            "lastError": self._last_err
+            or ("Fyers access token expired — reconnect Fyers" if expired else ""),
             "appId": (_app_id()[:6] + "…") if _app_id() else "",
         }
 
@@ -510,7 +560,16 @@ class FyersLtpFeed:
         if not isinstance(data, dict):
             return
         if str(data.get("s") or "").lower() not in ("ok", "") and data.get("code") not in (200, None, 0):
-            self._last_err = str(data.get("message") or data)
+            msg = str(data.get("message") or data)
+            self._last_err = msg
+            # Token died mid-session — force UI back to Connect Fyers.
+            code = data.get("code")
+            low = msg.lower()
+            if code in (401, 403, -16, -17) or "token" in low or "auth" in low or "login" in low:
+                try:
+                    self._stop_feeds()
+                except Exception:
+                    pass
             return
         rows = data.get("d") or data.get("data") or []
         if not isinstance(rows, list):
