@@ -35,7 +35,7 @@ function flush(): void {
 }
 
 /** Pin LIVE/hunt tokens so the backend polls touchline ~200ms for those strikes only. */
-export function setHotFocus(source: "ladder" | "snake", instruments: HotInst[]): void {
+export function setHotFocus(source: "ladder" | "snake" | "bothside" | "snakebothside", instruments: HotInst[]): void {
   bySource.set(
     source,
     instruments.filter((i) => i.exchangeInstrumentID > 0 && i.exchangeSegment > 0),

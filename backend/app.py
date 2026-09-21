@@ -743,6 +743,58 @@ def md_nifty_snake_hedge_candidates():
     return jsonify({"ok": True, "candidates": rows, "count": len(rows)})
 
 
+@app.post("/api/md/nifty_bothside/hedge_candidates")
+def md_nifty_bothside_hedge_candidates():
+    """NIFTY Ladder Both Side: far-OTM same-side strikes for a ~3–4 Rs long hedge."""
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    expiry = str(data.get("expiry") or data.get("expiryApi") or "").strip()
+    option_type = str(data.get("optionType") or data.get("side") or "").strip().upper()
+    try:
+        spot = float(data.get("spot") or data.get("spotLtp") or 0)
+        step = float(data.get("step") or 50)
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid spot/step"}), 400
+    try:
+        from market.nifty_bothside import list_hedge_candidates
+
+        rows = list_hedge_candidates(expiry=expiry, option_type=option_type, spot=spot, step=step)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        app.logger.exception("md_nifty_bothside_hedge_candidates failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "candidates": rows, "count": len(rows)})
+
+
+@app.post("/api/md/nifty_snake_bothside/hedge_candidates")
+def md_nifty_snake_bothside_hedge_candidates():
+    """NIFTY Snake Both Side: far-OTM same-side strikes for a ~3–4 Rs long hedge."""
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    expiry = str(data.get("expiry") or data.get("expiryApi") or "").strip()
+    option_type = str(data.get("optionType") or data.get("side") or "").strip().upper()
+    try:
+        spot = float(data.get("spot") or data.get("spotLtp") or 0)
+        step = float(data.get("step") or 50)
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid spot/step"}), 400
+    try:
+        from market.nifty_snake_bothside import list_hedge_candidates
+
+        rows = list_hedge_candidates(expiry=expiry, option_type=option_type, spot=spot, step=step)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        app.logger.exception("md_nifty_snake_bothside_hedge_candidates failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "candidates": rows, "count": len(rows)})
+
+
 @app.post("/api/md/ema21/bootstrap")
 def md_ema21_bootstrap():
     """Priority OHLC seed for Ramsetu table legs — 1-min candle 5 EMA (Angel parity)."""
