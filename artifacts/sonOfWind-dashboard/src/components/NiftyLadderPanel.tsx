@@ -43,6 +43,7 @@ import {
   isGridLocked,
   isInTrade,
   isLiveLadder,
+  inPremiumBand,
   istCalendarDay,
   istMinuteOfDay,
   ladderSessionActive,
@@ -332,6 +333,7 @@ export default function NiftyLadderPanel({ chain }: { chain: ChainResolved; qty?
   const targetSideRef = useRef<"below" | "above">("below");
   const targetLoggedRef = useRef(false);
   const restoreNoteRef = useRef(Boolean(restored));
+  const bandWaitLogAtRef = useRef(0);
 
   engineRef.current = engine;
   iidRef.current = iid;
@@ -501,22 +503,24 @@ export default function NiftyLadderPanel({ chain }: { chain: ChainResolved; qty?
         : ch.spotLtp;
     const rows = chainPremiumRows(ch, ltpsRef.current);
     const step = typeof ch.step === "number" && ch.step > 0 ? ch.step : 50;
-    const pick =
-      st.entryMode === "manual"
-        ? pickManualStrike(
-            rows,
-            st.optionType,
-            liveAtmStrikeForChain(ch, typeof spot === "number" ? spot : undefined),
-            st.manualStrikeOffset,
-            step,
-          )
-        : pickNear100(rows, st.optionType);
+    const manual = st.entryMode === "manual";
+    const pick = manual
+      ? pickManualStrike(
+          rows,
+          st.optionType,
+          liveAtmStrikeForChain(ch, typeof spot === "number" ? spot : undefined),
+          st.manualStrikeOffset,
+          step,
+        )
+      : pickNear100(rows, st.optionType);
     if (!pick) return null;
     const instrumentId = resolveIid(ch, pick.strike, pick.optionType);
     if (!instrumentId) return null;
     const touch = peekTouchPx(instrumentId, ltpsRef.current);
-    if (touch && touch > 0) return { ...pick, ltp: touch };
-    return pick;
+    const livePick = touch && touch > 0 ? { ...pick, ltp: touch } : pick;
+    // Auto: live print must stay inside band. Manual: enter on any live print.
+    if (!manual && !inPremiumBand(livePick.ltp)) return null;
+    return livePick;
   }, []);
 
   const fetchFreshPositions = useCallback(async (): Promise<Record<string, unknown>[] | null> => {
@@ -808,8 +812,30 @@ export default function NiftyLadderPanel({ chain }: { chain: ChainResolved; qty?
           ltp,
           huntPick: huntFromLive(),
           brokerShortLots: brokerShortLotsRef.current,
+          entryMode: st.entryMode ?? "auto",
         });
-        if (!action) break;
+        if (!action) {
+          if (
+            st.armed &&
+            !st.awaitRestart &&
+            !isLiveLadder(st) &&
+            isEntryWindow(Date.now()) &&
+            (st.entryMode ?? "auto") === "auto"
+          ) {
+            const nearest = closestTo100(chainPremiumRows(chainRef.current, ltpsRef.current), st.optionType);
+            if (nearest && !inPremiumBand(nearest.ltp)) {
+              const now = Date.now();
+              if (now - (bandWaitLogAtRef.current || 0) > 8000) {
+                bandWaitLogAtRef.current = now;
+                pushLog(
+                  `AUTO wait — nearest ${nearest.strike} @ ${fmtPrice(nearest.ltp)} outside band ${BAND_LOW}–${BAND_HIGH}`,
+                  "warn",
+                );
+              }
+            }
+          }
+          break;
+        }
         if (!uiBusy) {
           uiBusy = true;
           setBusy(true);

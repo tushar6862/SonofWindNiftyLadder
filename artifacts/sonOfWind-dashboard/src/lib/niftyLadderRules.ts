@@ -61,6 +61,8 @@ export type PlanTickInput = {
   ltp: number | null;
   huntPick: HuntPick | null;
   brokerShortLots: number | null;
+  /** Manual skips premium-band gate; Auto keeps 98–105 filter on live print. */
+  entryMode?: EntryMode;
 };
 
 export type LadderAction =
@@ -361,8 +363,18 @@ export function isEodReason(reason: string): boolean {
  * Priority is strict: first match wins.
  */
 export function planTick(input: PlanTickInput): LadderAction | null {
-  const { nowMs, armed, awaitRestart, awaitReload, t1Fill, slots, ltp, huntPick, brokerShortLots } =
-    input;
+  const {
+    nowMs,
+    armed,
+    awaitRestart,
+    awaitReload,
+    t1Fill,
+    slots,
+    ltp,
+    huntPick,
+    brokerShortLots,
+    entryMode = "auto",
+  } = input;
   const gridLocked = t1Fill != null && t1Fill > 0;
   const anyOpen = slots.some((s) => s.open);
 
@@ -394,11 +406,13 @@ export function planTick(input: PlanTickInput): LadderAction | null {
     };
   }
 
-  // 4) HUNT T1 — not in trade, armed, after 09:16, in-band pick only.
+  // 4) HUNT T1 — not in trade, armed, after 09:16.
+  // Auto: live print must sit in premium band. Manual: any live print on fixed strike.
   if (!anyOpen && !gridLocked) {
     if (!armed || awaitRestart) return null;
     if (!isEntryWindow(nowMs)) return null;
     if (!huntPick) return null;
+    if (entryMode !== "manual" && !inPremiumBand(huntPick.ltp)) return null;
     return { kind: "enter_t1", pick: huntPick };
   }
 

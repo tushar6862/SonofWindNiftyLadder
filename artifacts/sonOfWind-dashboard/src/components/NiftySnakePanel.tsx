@@ -55,6 +55,7 @@ import {
   isGridLocked,
   isInTrade,
   isLiveSnake,
+  inPremiumBand,
   istCalendarDay,
   loadSnakeSession,
   localNewDayReset,
@@ -336,6 +337,7 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
   const hedgeRetryRef = useRef<Partial<Record<HedgeWindow, number>>>({});
   const hedgeBusyRef = useRef(false);
   const overlayIidRef = useRef<number | null>(null);
+  const bandWaitLogAtRef = useRef(0);
 
   engineRef.current = engine;
   iidRef.current = iid;
@@ -530,22 +532,24 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
         : ch.spotLtp;
     const rows = chainPremiumRows(ch, ltpsRef.current);
     const step = typeof ch.step === "number" && ch.step > 0 ? ch.step : 50;
-    const pick =
-      st.entryMode === "manual"
-        ? pickManualStrike(
-            rows,
-            st.optionType,
-            liveAtmStrikeForChain(ch, typeof spot === "number" ? spot : undefined),
-            st.manualStrikeOffset,
-            step,
-          )
-        : pickNear72(rows, st.optionType);
+    const manual = st.entryMode === "manual";
+    const pick = manual
+      ? pickManualStrike(
+          rows,
+          st.optionType,
+          liveAtmStrikeForChain(ch, typeof spot === "number" ? spot : undefined),
+          st.manualStrikeOffset,
+          step,
+        )
+      : pickNear72(rows, st.optionType);
     if (!pick) return null;
     const instrumentId = resolveIid(ch, pick.strike, pick.optionType);
     if (!instrumentId) return null;
     const touch = peekTouchPx(instrumentId, ltpsRef.current);
-    if (touch && touch > 0) return { ...pick, ltp: touch };
-    return pick;
+    const livePick = touch && touch > 0 ? { ...pick, ltp: touch } : pick;
+    // Auto: live print must stay inside band. Manual: enter on any live print.
+    if (!manual && !inPremiumBand(livePick.ltp)) return null;
+    return livePick;
   }, []);
 
   const fetchFreshPositions = useCallback(async (): Promise<Record<string, unknown>[] | null> => {
@@ -948,6 +952,7 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
         if (squareAllReqRef.current) break;
         const st = engineRef.current;
         const ltp = peekTouchPx(iidRef.current, ltpsRef.current);
+        const huntPick = huntFromLive();
         const action = planTick({
           nowMs: Date.now(),
           armed: st.armed,
@@ -958,11 +963,33 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
           slots: st.slots,
           hedges: st.hedges,
           ltp,
-          huntPick: huntFromLive(),
+          huntPick,
           brokerShortLots: brokerShortLotsRef.current,
           entryMode: st.entryMode ?? "auto",
         });
-        if (!action) break;
+        if (!action) {
+          if (
+            st.armed &&
+            !st.awaitRestart &&
+            !isLiveSnake(st) &&
+            !st.awaitReload &&
+            isEntryWindow(Date.now()) &&
+            (st.entryMode ?? "auto") === "auto"
+          ) {
+            const nearest = closestTo72(chainPremiumRows(chainRef.current, ltpsRef.current), st.optionType);
+            if (nearest && !inPremiumBand(nearest.ltp)) {
+              const now = Date.now();
+              if (now - (bandWaitLogAtRef.current || 0) > 8000) {
+                bandWaitLogAtRef.current = now;
+                pushLog(
+                  `AUTO wait — nearest ${nearest.strike} @ ${fmtPrice(nearest.ltp)} outside band ${BAND_LOW}–${BAND_HIGH}`,
+                  "warn",
+                );
+              }
+            }
+          }
+          break;
+        }
         if (!uiBusy) {
           uiBusy = true;
           setBusy(true);

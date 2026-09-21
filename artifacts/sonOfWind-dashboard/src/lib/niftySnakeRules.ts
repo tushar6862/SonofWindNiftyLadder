@@ -557,6 +557,8 @@ export function planTick(input: PlanTickInput): SnakeAction | null {
     }
   }
 
+  // 4) HUNT T1 — not in trade, armed, after 09:16.
+  // Auto: live print must sit in premium band. Manual: any live print on fixed strike.
   if (!anyOpen && !gridLocked && !awaitReload) {
     if (!armed || awaitRestart) return null;
     if (!isEntryWindow(nowMs)) return null;
