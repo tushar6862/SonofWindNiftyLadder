@@ -147,18 +147,42 @@ function num(v: unknown): number | null {
   return null;
 }
 
+function firstNonZeroQty(...vals: unknown[]): number | null {
+  for (const v of vals) {
+    const n = num(v);
+    if (n != null && n !== 0) return n;
+  }
+  return null;
+}
+
 function positionNetQty(row: Record<string, unknown>): number {
-  const qtyRaw =
-    num(row.NetPosition ?? row.netPosition ?? row.Quantity ?? row.quantity) ??
-    (num(row.LongPosition) ?? 0) - (num(row.ShortPosition) ?? 0);
+  const named = firstNonZeroQty(
+    row.NetPosition,
+    row.netPosition,
+    row.Quantity,
+    row.quantity,
+    row.NetQuantity,
+    row.netQuantity,
+  );
+  if (named != null) return named;
+  const longShort =
+    (num(row.LongPosition ?? row.longPosition) ?? 0) - (num(row.ShortPosition ?? row.shortPosition) ?? 0);
+  if (longShort !== 0) return longShort;
   const obq = num(row.OpenBuyQuantity ?? row.openBuyQuantity) ?? 0;
   const osq = num(row.OpenSellQuantity ?? row.openSellQuantity) ?? 0;
-  const q = qtyRaw != null && qtyRaw !== 0 ? qtyRaw : obq - osq;
-  return Number.isFinite(q) ? q : 0;
+  return obq - osq;
 }
 
 function positionIid(row: Record<string, unknown>): number | null {
   return num(row.ExchangeInstrumentID ?? row.ExchangeInstrumentId ?? row.exchangeInstrumentID);
+}
+
+function sumNetQtyForIid(list: Record<string, unknown>[], iid: number): number {
+  let net = 0;
+  for (const p of list) {
+    if (positionIid(p) === iid) net += positionNetQty(p);
+  }
+  return net;
 }
 
 function ltpFromMap(map: Record<string, number> | undefined, iid: number): number | null {
@@ -617,7 +641,7 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
         const hint = await placeOrder("SELL", instrumentId, lots);
         const fill = expectedLadderFill("SELL", hint.ltp, hint.bid, hint.ask) || action.pick.ltp;
         iidRef.current = instrumentId;
-        seenBrokerShortRef.current = true;
+        seenBrokerShortRef.current = false;
         sellGraceUntilRef.current = Date.now() + SELL_GRACE_MS;
         brokerCaughtUpRef.current = false;
         brokerFlatHitsRef.current = 0;
@@ -672,11 +696,12 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
           action.kind === "add"
             ? { kind: "add", index: pending[0]!, lots }
             : { kind: "resell", indices: pending, lots };
-        lastReconcileRef.current = Date.now();
-        sellGraceUntilRef.current = Date.now() + SELL_GRACE_MS;
-        seenBrokerShortRef.current = true;
-        brokerCaughtUpRef.current = false;
-        phantomHitsRef.current = 0;
+        if (action.kind === "add") {
+          lastReconcileRef.current = Date.now();
+          sellGraceUntilRef.current = Date.now() + SELL_GRACE_MS;
+          brokerCaughtUpRef.current = false;
+          phantomHitsRef.current = 0;
+        }
         const hint = await placeOrder("SELL", instrumentId, lots);
         const fill = expectedLadderFill("SELL", hint.ltp, hint.bid, hint.ask) || peekTouchPx(instrumentId, ltpsRef.current) || 0;
         if (!(fill > 0)) {
@@ -685,6 +710,15 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
         }
         const next = applyFilledAction(engineRef.current, liveAction, fill);
         engineRef.current = next;
+        if (action.kind === "resell") {
+          seenBrokerShortRef.current = false;
+          brokerCaughtUpRef.current = false;
+          brokerFlatHitsRef.current = 0;
+          lastReconcileRef.current = 0;
+          sellGraceUntilRef.current = Date.now() + SELL_GRACE_MS;
+          phantomHitsRef.current = 0;
+          brokerShortLotsRef.current = null;
+        }
         sync(next);
         const tabs = pending.map((i) => `T${i}`).join("+");
         pushLog(
@@ -709,8 +743,9 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
         if (iidRef.current != null) clearLocalPosition(iidRef.current);
         if (next.awaitReload) {
           lastReconcileRef.current = 0;
+          seenBrokerShortRef.current = false;
           brokerCaughtUpRef.current = false;
-          seenBrokerShortRef.current = true;
+          brokerFlatHitsRef.current = 0;
           brokerShortLotsRef.current = null;
         } else {
           iidRef.current = next.t1Fill != null ? iidRef.current : null;
@@ -793,19 +828,14 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
       const list = await fetchFreshPositions();
       if (!list) return;
       const locked = iidRef.current;
-      const row = locked ? list.find((p) => positionIid(p) === locked) : undefined;
-      const net = row ? positionNetQty(row) : 0;
-      const brokerShortLots = net < 0 ? Math.round(Math.abs(net) / LOT_SIZE) : 0;
-      brokerShortLotsRef.current = brokerShortLots;
-      const uiLots = openLots(engineRef.current.slots);
+      const bookEmpty = list.length === 0 || locked == null;
 
       const hedges = engineRef.current.hedges;
       if (list.length > 0 && hedges.some((h) => h.open && h.iid != null)) {
         let hedgeChanged = false;
         const nextHedges = hedges.map((h) => {
           if (!h.open || h.iid == null) return h;
-          const hedgeRow = list.find((p) => positionIid(p) === h.iid);
-          const hedgeNet = hedgeRow ? positionNetQty(hedgeRow) : 0;
+          const hedgeNet = sumNetQtyForIid(list, h.iid);
           if (hedgeNet > 0) return h;
           hedgeChanged = true;
           return { ...h, open: false, fill: null };
@@ -817,6 +847,23 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
           pushLog("Booked hedge removed — broker long is gone.", "warn");
         }
       }
+
+      // Empty positionList (or no locked iid) is unknown — never a square-off.
+      // While awaiting re-SELL after our cover, treat it as no short so the hunt can fire.
+      if (bookEmpty) {
+        if (engineRef.current.awaitReload) {
+          brokerFlatHitsRef.current = 0;
+          phantomHitsRef.current = 0;
+          brokerShortLotsRef.current = 0;
+          brokerCaughtUpRef.current = true;
+        }
+        return;
+      }
+
+      const net = sumNetQtyForIid(list, locked);
+      const brokerShortLots = net < 0 ? Math.round(Math.abs(net) / LOT_SIZE) : 0;
+      brokerShortLotsRef.current = brokerShortLots;
+      const uiLots = openLots(engineRef.current.slots);
 
       if (engineRef.current.awaitReload) {
         brokerFlatHitsRef.current = 0;
@@ -838,9 +885,8 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
         phantomHitsRef.current = 0;
         const waitingForFill = Date.now() < sellGraceUntilRef.current && !brokerCaughtUpRef.current;
         if (waitingForFill || !seenBrokerShortRef.current) return;
-        const need = list.length === 0 ? BROKER_CONFIRM_HITS : 1;
         brokerFlatHitsRef.current += 1;
-        if (brokerFlatHitsRef.current < need) return;
+        if (brokerFlatHitsRef.current < BROKER_CONFIRM_HITS) return;
         if (iidRef.current != null) clearLocalPosition(iidRef.current);
         iidRef.current = null;
         seenBrokerShortRef.current = false;
