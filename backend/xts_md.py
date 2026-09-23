@@ -2445,6 +2445,138 @@ def normalize_spot_probes(spec: dict[str, object]) -> list[tuple[int, int]]:
     return primary
 
 
+def _socketio_text_from_bytes(raw: bytes) -> str | None:
+    """Socket.IO text packet carried as bytes, or None for an XTS binary blob.
+
+    A real packet starts with ASCII ``0``–``6``. XTS binary starts with a gzip
+    flag ``0x00`` or ``0x01``, which ``int(b'\\x01')`` cannot parse.
+    """
+    if not raw:
+        return None
+    first = raw[0]
+    if 48 <= first <= 54:  # '0' .. '6'
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if first > 6:
+        return None
+    body = raw[1:]
+    if not body or body[0] in (0, 1):
+        return None
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if text[0] in "0123456789/[{":
+        # Packet type was a raw byte 0–6, not the ASCII digit.
+        return chr(48 + first) + text
+    return None
+
+
+def _install_xts_socketio_order_fix() -> None:
+    """Keep XTS binary frames on the ``xts-binary-packet`` handler.
+
+    python-socketio 4.6 runs each Engine.IO message on its own thread, so the
+    binary attachment often arrives before the placeholder is stored and is
+    decoded as a text packet (``ValueError: invalid literal ... b'\\\\x01'``).
+    Messages are applied on the websocket read thread, in order. The user
+    handler still runs on a side thread so a tick cannot stall the next read.
+    """
+    import engineio.client as eio_client
+    import engineio.packet as eio_packet
+    import socketio.client as sio_client
+    import socketio.packet as sio_packet
+
+    if getattr(sio_client.Client, "_sonofwind_bin_fix", False):
+        return
+
+    orig_recv = eio_client.Client._receive_packet
+
+    def _receive_packet(self, pkt):
+        if pkt.packet_type == eio_packet.MESSAGE:
+            handler = self.handlers.get("message")
+            if handler is not None:
+                try:
+                    handler(pkt.data)
+                except Exception:
+                    self.logger.exception("message handler error")
+            return
+        return orig_recv(self, pkt)
+
+    def _run_event(client, namespace, pkt_id, data) -> None:
+        try:
+            client._handle_event(namespace, pkt_id, data)
+        except Exception:
+            client.logger.exception("xts socketio event error")
+
+    def _take_socketio_events(client, data):
+        events: list[tuple[Any, Any, Any]] = []
+
+        def _consider(pkt) -> None:
+            if pkt.packet_type == sio_packet.CONNECT:
+                client._handle_connect(pkt.namespace)
+            elif pkt.packet_type == sio_packet.DISCONNECT:
+                client._handle_disconnect(pkt.namespace)
+            elif pkt.packet_type == sio_packet.EVENT:
+                events.append((pkt.namespace, pkt.id, pkt.data))
+            elif pkt.packet_type == sio_packet.ACK:
+                client._handle_ack(pkt.namespace, pkt.id, pkt.data)
+            elif pkt.packet_type in (sio_packet.BINARY_EVENT, sio_packet.BINARY_ACK):
+                client._binary_packet = pkt
+            elif pkt.packet_type == sio_packet.ERROR:
+                client._handle_error(pkt.namespace, pkt.data)
+            else:
+                raise ValueError("Unknown packet type.")
+
+        if isinstance(data, (bytes, bytearray)) and not client._binary_packet:
+            raw = bytes(data)
+            text = _socketio_text_from_bytes(raw)
+            if text is None:
+                events.append((None, None, ["xts-binary-packet", raw]))
+                return events
+            data = text
+
+        if client._binary_packet:
+            pkt = client._binary_packet
+            try:
+                ready = pkt.add_attachment(data)
+            except ValueError:
+                client._binary_packet = None
+                if isinstance(data, (bytes, bytearray)):
+                    events.append((None, None, ["xts-binary-packet", bytes(data)]))
+                return events
+            if ready:
+                client._binary_packet = None
+                if pkt.packet_type == sio_packet.BINARY_EVENT:
+                    events.append((pkt.namespace, pkt.id, pkt.data))
+                else:
+                    client._handle_ack(pkt.namespace, pkt.id, pkt.data)
+            return events
+
+        _consider(sio_packet.Packet(encoded_packet=data))
+        return events
+
+    def _handle_eio_message(self, data):
+        try:
+            events = _take_socketio_events(self, data)
+        except ValueError:
+            if isinstance(data, (bytes, bytearray)):
+                events = [(None, None, ["xts-binary-packet", bytes(data)])]
+            else:
+                raise
+        for namespace, pkt_id, payload in events:
+            threading.Thread(
+                target=_run_event,
+                args=(self, namespace, pkt_id, payload),
+                name="md-sio",
+            ).start()
+
+    eio_client.Client._receive_packet = _receive_packet
+    sio_client.Client._handle_eio_message = _handle_eio_message
+    sio_client.Client._sonofwind_bin_fix = True
+
+
 class MarketDataStreamer:
     """
     Singleton-ish helper:
@@ -2917,6 +3049,7 @@ class MarketDataStreamer:
 
         import socketio  # lazy import
 
+        _install_xts_socketio_order_fix()
         self._sid = socketio.Client(logger=False, engineio_logger=False, ssl_verify=False)
 
         @self._sid.on("xts-binary-packet")
