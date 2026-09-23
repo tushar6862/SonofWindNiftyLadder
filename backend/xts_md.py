@@ -2474,6 +2474,13 @@ def _socketio_text_from_bytes(raw: bytes) -> str | None:
     return None
 
 
+def _socket_transport_dropped(exc: BaseException) -> bool:
+    """True for a dead websocket. These must not escape the Engine.IO write thread."""
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    return "WebSocket" in type(exc).__name__
+
+
 def _install_xts_socketio_order_fix() -> None:
     """Keep XTS binary frames on the ``xts-binary-packet`` handler.
 
@@ -2492,6 +2499,7 @@ def _install_xts_socketio_order_fix() -> None:
         return
 
     orig_recv = eio_client.Client._receive_packet
+    orig_write_loop = eio_client.Client._write_loop
 
     def _receive_packet(self, pkt):
         if pkt.packet_type == eio_packet.MESSAGE:
@@ -2572,7 +2580,31 @@ def _install_xts_socketio_order_fix() -> None:
                 name="md-sio",
             ).start()
 
+    def _write_loop(self):
+        # engineio only catches WebSocketConnectionClosedException. Windows raises
+        # ConnectionAbortedError (WinError 10053) from ssl.send, which escapes the
+        # thread and dumps a traceback. Close the socket so the read loop emits
+        # disconnect, then let MarketDataStreamer reconnect.
+        try:
+            return orig_write_loop(self)
+        except Exception as exc:
+            if not _socket_transport_dropped(exc):
+                raise
+            ws = getattr(self, "ws", None)
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            cb = getattr(self, "_sonofwind_on_dead", None)
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
     eio_client.Client._receive_packet = _receive_packet
+    eio_client.Client._write_loop = _write_loop
     sio_client.Client._handle_eio_message = _handle_eio_message
     sio_client.Client._sonofwind_bin_fix = True
 
@@ -2615,6 +2647,8 @@ class MarketDataStreamer:
         self._ema21_bootstrapped: set[int] = set()
         self._last_socket_rx_mono = time.monotonic()
         self._reconnect_lock = threading.Lock()
+        self._reconnect_inflight = False
+        self._expect_socket_drop = False
         self._watchdog_stop: threading.Event | None = None
         self._watchdog_started = False
         self._ensure_alive_scheduled = False
@@ -2877,6 +2911,78 @@ class MarketDataStreamer:
         for q in self._listeners_snapshot:
             self._enqueue_listener(q, payload)
 
+    def _subscribed_instruments_locked(self) -> list[dict[str, int]]:
+        return [
+            {"exchangeSegment": int(s), "exchangeInstrumentID": int(t)}
+            for s, t in sorted(self._subs)
+            if int(s) > 0 and int(t) > 0
+        ]
+
+    def _mark_socket_dead(self, eio: Any = None) -> None:
+        """XTS websocket aborted. Reconnect without waiting for the stale timeout.
+
+        Ignore drops from a client we already replaced, so a late write-loop
+        error cannot tear down the new socket.
+        """
+        with self._lock:
+            if self._expect_socket_drop or not self._started:
+                return
+            current = getattr(self._sid, "eio", None) if self._sid is not None else None
+            if eio is not None and current is not None and eio is not current:
+                return
+            self._last_socket_rx_mono = 0.0
+        self._bump_rx("socket-abort")
+        self._request_auto_reconnect()
+
+    def _request_auto_reconnect(self) -> None:
+        with self._lock:
+            if self._expect_socket_drop or not self._started or self._reconnect_inflight:
+                return
+            self._reconnect_inflight = True
+        threading.Thread(
+            target=self._auto_reconnect_worker,
+            name="md-auto-reconnect",
+            daemon=True,
+        ).start()
+
+    def _auto_reconnect_worker(self) -> None:
+        delay = 0.4
+        try:
+            for _attempt in range(10):
+                time.sleep(delay)
+                if not self._reconnect_lock.acquire(blocking=False):
+                    delay = min(max(delay * 1.5, 0.8), 8.0)
+                    continue
+                try:
+                    with self._lock:
+                        if not self._started:
+                            return
+                        key = self._api_key
+                        secret = self._api_secret
+                        instruments = self._subscribed_instruments_locked()
+                        sid = self._sid
+                        connected = bool(sid is not None and getattr(sid, "connected", False))
+                        rx_age = time.monotonic() - float(self._last_socket_rx_mono or 0.0)
+                    if not key or not secret:
+                        return
+                    # connected can stay True for a moment after WinError 10053.
+                    # A fresh tick means the socket recovered; otherwise reconnect.
+                    if connected and rx_age < 2.0:
+                        return
+                    self._soft_reconnect_socket(key, secret, instruments, reuse_client=True)
+                    with self._lock:
+                        sid = self._sid
+                        connected = bool(sid is not None and getattr(sid, "connected", False))
+                    if connected:
+                        self._bump_rx("auto-reconnect")
+                        return
+                finally:
+                    self._reconnect_lock.release()
+                delay = min(max(delay * 2.0, 1.0), 15.0)
+        finally:
+            with self._lock:
+                self._reconnect_inflight = False
+
     def _soft_reconnect_socket(
         self,
         api_key: str,
@@ -2890,32 +2996,37 @@ class MarketDataStreamer:
         Reuse the existing MD session by default — a fresh login invalidates the
         REST token and causes ``Please Provide token to Authenticate`` on quotes/OHLC.
         """
-        with self._lock:
-            sid = self._sid
-            self._sid = None
-        if sid is not None:
-            try:
-                sid.disconnect()
-            except Exception:
-                pass
+        self._expect_socket_drop = True
+        self._last_soft_reconnect_mono = time.monotonic()
         try:
-            self._connect(api_key, api_secret, reuse_client=reuse_client)
-            if instruments:
-                self._resubscribe_after_restart(instruments)
-            self._ensure_coalesce_flush_thread()
-            self._ensure_atp_refresh_thread()
-            self._ensure_watchdog_thread()
-        except Exception:
-            if reuse_client:
+            with self._lock:
+                sid = self._sid
+                self._sid = None
+            if sid is not None:
                 try:
-                    self._connect(api_key, api_secret, reuse_client=False)
-                    if instruments:
-                        self._resubscribe_after_restart(instruments)
-                    self._ensure_coalesce_flush_thread()
-                    self._ensure_atp_refresh_thread()
-                    self._ensure_watchdog_thread()
+                    sid.disconnect()
                 except Exception:
                     pass
+            try:
+                self._connect(api_key, api_secret, reuse_client=reuse_client)
+                if instruments:
+                    self._resubscribe_after_restart(instruments)
+                self._ensure_coalesce_flush_thread()
+                self._ensure_atp_refresh_thread()
+                self._ensure_watchdog_thread()
+            except Exception:
+                if reuse_client:
+                    try:
+                        self._connect(api_key, api_secret, reuse_client=False)
+                        if instruments:
+                            self._resubscribe_after_restart(instruments)
+                        self._ensure_coalesce_flush_thread()
+                        self._ensure_atp_refresh_thread()
+                        self._ensure_watchdog_thread()
+                    except Exception:
+                        pass
+        finally:
+            self._expect_socket_drop = False
 
     def schedule_ensure_socket_alive(self) -> None:
         """Non-blocking debounced socket health check (safe from Flask request threads)."""
@@ -2960,8 +3071,10 @@ class MarketDataStreamer:
                 )
             if connected and not stale:
                 return
-            # Avoid reconnect storms when many /api/md/start calls arrive together.
-            if time.monotonic() - self._last_soft_reconnect_mono < 30.0:
+            # Down sockets retry quickly. A live-but-quiet socket waits longer so
+            # overlapping /api/md/start calls do not reconnect in a storm.
+            quiet_for = 30.0 if connected else 3.0
+            if time.monotonic() - self._last_soft_reconnect_mono < quiet_for:
                 return
             if key and secret:
                 self._last_soft_reconnect_mono = time.monotonic()
@@ -3025,8 +3138,10 @@ class MarketDataStreamer:
         )
         if traffic <= 0:
             return
-        cur = str(_ACTIVE_PUBLISH_FORMAT or "Binary").strip().lower()
-        nxt = "JSON" if cur == "binary" else "Binary"
+        cur = str(_ACTIVE_PUBLISH_FORMAT or "Binary").strip() or "Binary"
+        nxt = "JSON" if cur.lower() == "binary" else "Binary"
+        if not self._reconnect_lock.acquire(timeout=20):
+            return
         _ACTIVE_PUBLISH_FORMAT = nxt
         self._format_flipped = True
         self._bump_rx("format-flip:" + nxt)
@@ -3036,6 +3151,8 @@ class MarketDataStreamer:
             self._soft_reconnect_socket(key, secret, instruments, reuse_client=True)
         except Exception:
             pass
+        finally:
+            self._reconnect_lock.release()
 
     def _connect(self, api_key: str, api_secret: str, *, reuse_client: bool = False) -> None:
         client = self._client if (reuse_client and self._client is not None) else None
@@ -3050,7 +3167,16 @@ class MarketDataStreamer:
         import socketio  # lazy import
 
         _install_xts_socketio_order_fix()
-        self._sid = socketio.Client(logger=False, engineio_logger=False, ssl_verify=False)
+        # App owns reconnect + resubscribe. Library reconnect would come back with no instruments.
+        self._sid = socketio.Client(
+            reconnection=False,
+            logger=False,
+            engineio_logger=False,
+            ssl_verify=False,
+        )
+        eio = getattr(self._sid, "eio", None)
+        if eio is not None:
+            eio._sonofwind_on_dead = lambda bound=eio: self._mark_socket_dead(bound)
 
         @self._sid.on("xts-binary-packet")
         def _on_packet(data):
@@ -3062,8 +3188,8 @@ class MarketDataStreamer:
                 return
 
         @self._sid.on("disconnect")
-        def _on_disconnect():
-            self.schedule_ensure_socket_alive()
+        def _on_disconnect(bound=eio):
+            self._mark_socket_dead(bound)
 
         @self._sid.on("1501-json-full")
         def _on_1501_full(data):
