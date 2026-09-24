@@ -6,8 +6,6 @@ import { apiFetch } from "@/lib/backend";
 import { toast } from "@/hooks/use-toast";
 import NiftyLadderPanel from "@/components/NiftyLadderPanel";
 import NiftySnakePanel from "@/components/NiftySnakePanel";
-import NiftyBothSidePanel from "@/components/NiftyBothSidePanel";
-import NiftySnakeBothSidePanel from "@/components/NiftySnakeBothSidePanel";
 import { bumpPositionsRefresh } from "@/lib/ixPortfolio";
 
 export default function OptionsChain({
@@ -30,7 +28,7 @@ export default function OptionsChain({
 }) {
   const lotSize = lotSizeForIndex(index);
   const qty = Math.max(1, lotSize);
-  const [desk, setDesk] = useState<"ladder" | "snake" | "bothside" | "snakebothside">("ladder");
+  const [desk, setDesk] = useState<"ladder" | "snake">("ladder");
   const [exitBusy, setExitBusy] = useState(false);
   const [exitSelected, setExitSelected] = useState<25 | 50 | 75 | 100 | null>(null);
 
@@ -88,20 +86,6 @@ export default function OptionsChain({
         >
           Nifty Snake
         </button>
-        <button
-          type="button"
-          className={`sow-glass-tab${desk === "bothside" ? " sow-glass-tab--active" : ""}`}
-          onClick={() => setDesk("bothside")}
-        >
-          Nifty Ladder Both Side
-        </button>
-        <button
-          type="button"
-          className={`sow-glass-tab${desk === "snakebothside" ? " sow-glass-tab--active" : ""}`}
-          onClick={() => setDesk("snakebothside")}
-        >
-          Nifty Snake Both Side
-        </button>
       </div>
 
       {!resolved && (
@@ -148,12 +132,6 @@ export default function OptionsChain({
           </div>
           <div className={desk === "snake" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "snake"}>
             <NiftySnakePanel chain={resolved} qty={qty} />
-          </div>
-          <div className={desk === "bothside" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "bothside"}>
-            <NiftyBothSidePanel chain={resolved} qty={qty} />
-          </div>
-          <div className={desk === "snakebothside" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "snakebothside"}>
-            <NiftySnakeBothSidePanel chain={resolved} qty={qty} />
           </div>
         </>
       )}
