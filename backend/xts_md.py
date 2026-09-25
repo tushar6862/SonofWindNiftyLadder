@@ -81,6 +81,26 @@ class SseTickPipe:
             raise Empty
 
 
+def _fyers_ltp_on() -> bool:
+    """Spot / TopBar / LIVE LTP are Fyers. Do not REST-quote XTS for last price."""
+    try:
+        from market.fyers_ltp import fyers_enabled
+
+        return fyers_enabled()
+    except Exception:
+        return False
+
+
+def _fyers_owns_token(tid: int) -> bool:
+    """LIVE LTP for this token comes from Fyers. XTS must not paint over it."""
+    try:
+        from market.fyers_ltp import get_fyers_ltp_feed
+
+        return get_fyers_ltp_feed().owns_token(int(tid))
+    except Exception:
+        return False
+
+
 def _sse_payload_is_ltp_print(payload: dict[str, Any]) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -2833,7 +2853,9 @@ class MarketDataStreamer:
                 pass
 
     def _refresh_hot_focus_once(self) -> None:
-        """Seed LIVE LTP from touchline only while socket has been quiet (~250ms)."""
+        """XTS touchline seed only when Fyers LTP is off."""
+        if _fyers_ltp_on():
+            return
         with self._hot_lock:
             hot = dict(self._hot_tokens)
         if not hot:
@@ -2862,6 +2884,19 @@ class MarketDataStreamer:
         guard = max(0.5, float(XTS_MD_HOT_FOCUS_SOCKET_GUARD_SEC))
         for tid, seg in hot.items():
             ik = int(tid)
+            if _fyers_owns_token(ik):
+                atp_only = float(atp_map.get(ik) or 0.0)
+                if atp_only > 0:
+                    self._deliver_tick(
+                        {
+                            "exchangeInstrumentID": ik,
+                            "exchangeSegment": int(seg),
+                            "atp": atp_only,
+                            "_atp1501": atp_only,
+                            "_atpOnly": True,
+                        }
+                    )
+                continue
             ltp = float(ltp_map.get(ik) or 0.0)
             if ltp <= 0:
                 continue
@@ -3865,6 +3900,9 @@ class MarketDataStreamer:
             out["_hotLtp"] = True
         if tick.get("_fyersLtp"):
             out["_fyersLtp"] = True
+        # Same token is on Fyers — do not ship an XTS last-trade on this packet.
+        if paint_ltp and not tick.get("_fyersLtp") and tid > 0 and _fyers_owns_token(tid):
+            paint_ltp = False
         try:
             ltp = float(tick.get("ltp") or 0.0)
         except Exception:
@@ -4040,7 +4078,11 @@ class MarketDataStreamer:
             except Exception:
                 ltp_1501 = 0.0
             # Snap Quote last trade = 1501 / 1512. 1502 book often reprints bid as ltp.
-            if mc_i in (1501, 1512) and tick_ltp > 0:
+            # Fyers-owned tokens keep the stored Fyers print, not a later XTS touchline.
+            if row.get("_fyersLtp") and row_ltp > 0:
+                out["ltp"] = row_ltp
+                out["_fyersLtp"] = True
+            elif mc_i in (1501, 1512) and tick_ltp > 0:
                 out["ltp"] = tick_ltp
             elif ltp_1501 > 0:
                 out["ltp"] = ltp_1501

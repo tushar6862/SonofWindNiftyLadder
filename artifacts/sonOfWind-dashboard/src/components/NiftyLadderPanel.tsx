@@ -4,7 +4,6 @@ import type { ChainResolved } from "@/types/market";
 import { useLiveLtp, peekLiveTick } from "@/context/LiveLtpContext";
 import { FastLtp } from "@/components/FastLtp";
 import { useSubscribeTouchline } from "@/lib/mdRegistry";
-import { refreshQuotesFromRest } from "@/lib/atpSeed";
 import { setHotFocus } from "@/lib/hotFocus";
 import { peekTouchPx } from "@/lib/liveQuote";
 import { fmtPnl, fmtPrice } from "@/lib/formatNumber";
@@ -76,7 +75,6 @@ import {
 } from "@/lib/niftyLadderRules";
 
 const DRIVE_POLL_MS = 10000;
-const OPTION_QUOTE_POLL_MS = 8000;
 const RECONCILE_MS = 12000;
 const BROKER_CONFIRM_HITS = 2;
 
@@ -409,24 +407,6 @@ export default function NiftyLadderPanel({ chain }: { chain: ChainResolved; qty?
 
   useSubscribeTouchline(seg, watchIids);
   useSubscribeTouchline(spotSeg, [spotToken]);
-
-  useEffect(() => {
-    if (!seg || !watchIids.length) return;
-    let cancelled = false;
-    const instruments = watchIids.map((exchangeInstrumentID) => ({
-      exchangeSegment: seg,
-      exchangeInstrumentID,
-    }));
-    const poll = () => {
-      void refreshQuotesFromRest(instruments, () => cancelled);
-    };
-    poll();
-    const iv = window.setInterval(poll, OPTION_QUOTE_POLL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(iv);
-    };
-  }, [seg, watchIids]);
 
   const persistNow = useCallback((st: LadderEngineState) => {
     if (!ladderSessionActive(st)) {

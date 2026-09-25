@@ -545,6 +545,35 @@ def fyers_callback():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.post("/api/fyers/quotes")
+def fyers_quotes():
+    """LTP for a list of XTS tokens from Fyers. Not an XTS touchline call."""
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    raw_ids = data.get("instrumentIds") or data.get("instruments") or []
+    ids: list[int] = []
+    if isinstance(raw_ids, list):
+        for item in raw_ids:
+            try:
+                if isinstance(item, dict):
+                    ids.append(int(item.get("exchangeInstrumentID") or item.get("exchangeInstrumentId") or 0))
+                else:
+                    ids.append(int(item or 0))
+            except Exception:
+                continue
+    try:
+        from market.fyers_ltp import has_access_token, quote_iids
+
+        if not has_access_token():
+            return jsonify({"ok": False, "error": "Fyers not connected", "ltpMap": {}}), 200
+        ltp_map = quote_iids(ids)
+        return jsonify({"ok": True, "ltpMap": ltp_map})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "ltpMap": {}}), 200
+
+
 @app.post("/api/fyers/topbar_focus")
 def fyers_topbar_focus():
     """Pin Spot + VIX + ATM CE/PE so TopBar metrics paint from Fyers."""

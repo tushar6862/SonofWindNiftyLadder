@@ -131,34 +131,46 @@ class TickEngine:
             atp_1502 = new_atp
         use_atp = atp_1501 if atp_1501 > 0 else atp_1502
         raw_ltp = float(d.get("ltp") or 0.0)
+        prev_ltp = float(prev_row.get("ltp") or 0.0)
+        fyers_print = raw.get("_fyersLtp") is True
+        prev_fyers = prev_row.get("_fyersLtp") is True
         ltp_1501 = float(prev_row.get("_ltp1501") or 0.0)
         ltp_1502 = float(prev_row.get("_ltp1502") or 0.0)
         ltp_ts_1501 = float(prev_row.get("_ltp1501_ts") or 0.0)
         ltp_ts_1502 = float(prev_row.get("_ltp1502_ts") or 0.0)
-        if float(d.get("_ltp1501") or 0.0) > 0:
-            ltp_1501, ltp_ts_1501 = apply_feed_ltp(
-                ltp_1501,
-                ltp_ts_1501,
-                float(d["_ltp1501"]),
-                float(d.get("_ltp1501_ts") or ex_ts or print_ts),
-                wall_ok=True,
-            )
-        if float(d.get("_ltp1502") or 0.0) > 0:
-            ltp_1502, ltp_ts_1502 = apply_feed_ltp(
-                ltp_1502,
-                ltp_ts_1502,
-                float(d["_ltp1502"]),
-                float(d.get("_ltp1502_ts") or ex_ts),
-                wall_ok=False,
-            )
-        if mc in (1501, 1512) and raw_ltp > 0:
-            ltp_1501, ltp_ts_1501 = apply_feed_ltp(
-                ltp_1501, ltp_ts_1501, raw_ltp, ex_ts or print_ts, wall_ok=True
-            )
+        # Once Fyers has printed this token, later XTS packets must not move stored LTP.
+        if fyers_print or not prev_fyers:
+            if float(d.get("_ltp1501") or 0.0) > 0:
+                ltp_1501, ltp_ts_1501 = apply_feed_ltp(
+                    ltp_1501,
+                    ltp_ts_1501,
+                    float(d["_ltp1501"]),
+                    float(d.get("_ltp1501_ts") or ex_ts or print_ts),
+                    wall_ok=True,
+                )
+            if float(d.get("_ltp1502") or 0.0) > 0:
+                ltp_1502, ltp_ts_1502 = apply_feed_ltp(
+                    ltp_1502,
+                    ltp_ts_1502,
+                    float(d["_ltp1502"]),
+                    float(d.get("_ltp1502_ts") or ex_ts),
+                    wall_ok=False,
+                )
+            if mc in (1501, 1512) and raw_ltp > 0:
+                ltp_1501, ltp_ts_1501 = apply_feed_ltp(
+                    ltp_1501, ltp_ts_1501, raw_ltp, ex_ts or print_ts, wall_ok=True
+                )
         new_ltp = pick_ltp_for_display(ltp_1501, ltp_1502, ltp_ts_1501, ltp_ts_1502, ts_wall)
+        keep_fyers = False
+        if fyers_print and raw_ltp > 0:
+            new_ltp = raw_ltp
+            keep_fyers = True
+        elif prev_fyers and prev_ltp > 0:
+            # XTS touchline must not replace a Fyers last-trade already stored for this token.
+            new_ltp = prev_ltp
+            keep_fyers = True
         new_bid = float(d.get("bid") or d.get("bid_price") or 0.0)
         new_ask = float(d.get("ask") or d.get("ask_price") or 0.0)
-        prev_ltp = float(prev_row.get("ltp") or 0.0)
         prev_bid = float(prev_row.get("bid") or 0.0)
         prev_ask = float(prev_row.get("ask") or 0.0)
         if new_ltp <= 0 and prev_ltp > 0:
@@ -188,6 +200,8 @@ class TickEngine:
             "bid_qty": int(d.get("bid_qty") or 0),
             "ask_qty": int(d.get("ask_qty") or 0),
         }
+        if keep_fyers:
+            out["_fyersLtp"] = True
         try:
             pc = float(d.get("prevClose") or 0.0)
             if pc > 0:

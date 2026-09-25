@@ -52,18 +52,20 @@ const liveTickPeek = new Map<number, LiveTickPeek>();
 const ltpPaintListeners = new Map<number, Set<(ltp: number) => void>>();
 /** Socket / Fyers last-trade time. REST must not stamp this. */
 const socketPrintAt = new Map<number, number>();
-/** Tokens currently receiving Fyers LTP — XTS LTP must not overwrite while fresh. */
+/** Tokens Fyers has printed. XTS / REST must not change their LTP for the session. */
 const fyersPrintAt = new Map<number, number>();
 
 /** REST seeds only when socket/Fyers quiet. */
 export const SOCKET_LTP_BEATS_REST_MS = 2000;
-export const FYERS_LTP_BEATS_XTS_MS = 2000;
+
+/** True after the first Fyers last-trade on this token. Does not expire. */
+export function fyersOwnsLtp(id: number): boolean {
+  if (!Number.isFinite(id) || id <= 0) return false;
+  return fyersPrintAt.has(id);
+}
 
 export function fyersBeatsXts(id: number): boolean {
-  if (!Number.isFinite(id) || id <= 0) return false;
-  const t = fyersPrintAt.get(id);
-  if (t == null) return false;
-  return performance.now() - t < FYERS_LTP_BEATS_XTS_MS;
+  return fyersOwnsLtp(id);
 }
 
 /** True while EventSource `/api/md/stream` is OPEN. */
@@ -497,8 +499,8 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           const id = Number(k);
           if (!Number.isFinite(id) || id <= 0) continue;
           if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) continue;
-          // Fresh socket owns LIVE. Quiet socket → allow quote seed so price does not freeze.
-          if (socketBeatsRest(id)) continue;
+          // Fyers owns LIVE for this token. XTS quote seed must not replace it.
+          if (fyersOwnsLtp(id) || socketBeatsRest(id)) continue;
           rememberLiveTick(id, v, null, null, true);
           if (next[id] !== v) {
             next[id] = v;
@@ -526,6 +528,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
     setSpotDayRef({});
     liveTickPeek.clear();
     socketPrintAt.clear();
+    fyersPrintAt.clear();
     pendingRef.current.clear();
     cancelScheduledFlush(flushScheduledRef, flushRafRef);
     if (reconnectTimerRef.current != null) {
@@ -682,17 +685,12 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
               : null;
         const gapFill = t._gapFill === true || t._fromRestQuote === true || t._hotLtp === true;
         const fyersLtp = t._fyersLtp === true;
-        // Fyers LIVE / TopBar LTP — paint first; blocks XTS LTP for this token while fresh.
+        const xtsLtpBlocked = !fyersLtp && fyersOwnsLtp(id);
+        // Fyers LIVE / TopBar LTP — paint first. Later XTS packets cannot replace this price.
         if (fyersLtp && ltpFastRaw != null) {
-          const printTsRaw =
-            typeof t.exchange_ts === "number" && t.exchange_ts > 1e9
-              ? t.exchange_ts
-              : typeof t.LastTradedTime === "number" && t.LastTradedTime > 1e9
-                ? t.LastTradedTime > 1e12
-                  ? t.LastTradedTime / 1000
-                  : t.LastTradedTime
-                : null;
-          rememberLiveTick(id, ltpFastRaw, null, null, false, printTsRaw);
+          // Always paint the latest Fyers price. An older exchange timestamp must not
+          // freeze LIVE until a later print "catches up" (SS: stuck 73.10 while tape moved).
+          rememberLiveTick(id, ltpFastRaw, null, null, false, null);
           fyersPrintAt.set(id, performance.now());
           socketPrintAt.set(id, performance.now());
           streamLtpAtRef.current.set(id, performance.now());
@@ -737,7 +735,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
         }
         // Gap-fill / hot touchline only when socket/Fyers is quiet — never rewind a fresh print.
         if (gapFill) {
-          if (ltpFastRaw != null && !socketBeatsRest(id) && !fyersBeatsXts(id)) {
+          if (ltpFastRaw != null && !xtsLtpBlocked && !socketBeatsRest(id)) {
             rememberLiveTick(id, ltpFastRaw, null, null, true);
             const pending = pendingRef.current;
             let row = pending.get(id);
@@ -761,9 +759,8 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           return;
         }
         const restPrint = t._snapshot === true || t._atpOnly === true;
-        // While Fyers is painting this token, ignore XTS LTP (ATP/book still ok).
-        const ltpFast =
-          fyersBeatsXts(id) || mcFast === 1502 || restPrint ? null : ltpFastRaw;
+        // Fyers owns this token's LTP. XTS touchline must not replace it (ATP/book still ok).
+        const ltpFast = xtsLtpBlocked || mcFast === 1502 || restPrint ? null : ltpFastRaw;
         const bidFast = typeof t.bid === "number" && t.bid > 0 ? t.bid : null;
         const askFast = typeof t.ask === "number" && t.ask > 0 ? t.ask : null;
         const printTsRaw =
@@ -885,7 +882,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
               : null;
         if (emaNum != null) row.ema21 = emaNum;
 
-        let ltp = restPrint ? NaN : typeof ltpPicked === "number" ? ltpPicked : NaN;
+        let ltp = restPrint || xtsLtpBlocked ? NaN : typeof ltpPicked === "number" ? ltpPicked : NaN;
         if (!restPrint && !(Number.isFinite(ltp) && ltp > 0) && Number.isFinite(ltpFast as number) && (ltpFast as number) > 0) {
           ltp = ltpFast as number;
         }

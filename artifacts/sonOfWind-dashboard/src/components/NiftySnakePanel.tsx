@@ -4,7 +4,6 @@ import type { ChainResolved } from "@/types/market";
 import { useLiveLtp, peekLiveTick } from "@/context/LiveLtpContext";
 import { FastLtp } from "@/components/FastLtp";
 import { useSubscribeTouchline } from "@/lib/mdRegistry";
-import { refreshQuotesFromRest } from "@/lib/atpSeed";
 import { setHotFocus } from "@/lib/hotFocus";
 import { peekTouchPx } from "@/lib/liveQuote";
 import { fmtPnl, fmtPrice } from "@/lib/formatNumber";
@@ -92,7 +91,6 @@ import {
   type SnakeHedge,
 } from "@/lib/niftySnakeRules";
 
-const OPTION_QUOTE_POLL_MS = 8000;
 const BROKER_CONFIRM_HITS = 2;
 const SELL_GRACE_MS = 6000;
 const HEDGE_RETRY_MS = 20000;
@@ -426,24 +424,6 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
   useSubscribeTouchline(seg, watchIids);
   useSubscribeTouchline(spotSeg, [spotToken]);
 
-  useEffect(() => {
-    if (!seg || !watchIids.length) return;
-    let cancelled = false;
-    const instruments = watchIids.map((exchangeInstrumentID) => ({
-      exchangeSegment: seg,
-      exchangeInstrumentID,
-    }));
-    const poll = () => {
-      void refreshQuotesFromRest(instruments, () => cancelled);
-    };
-    poll();
-    const iv = window.setInterval(poll, OPTION_QUOTE_POLL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(iv);
-    };
-  }, [seg, watchIids]);
-
   const persistNow = useCallback((st: SnakeEngineState) => {
     if (!snakeSessionActive(st)) {
       clearSnakeSession();
@@ -602,14 +582,16 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
       exchangeSegment: ch.optionSegment,
       exchangeInstrumentID: c.exchangeInstrumentID,
     }));
-    const ltpMap: Record<string, number> = {};
-    for (let i = 0; i < instruments.length; i += 20) {
-      const quote = (await apiFetch("/api/md/quote_snapshot", {
-        method: "POST",
-        body: JSON.stringify({ xtsMessageCode: 1501, instruments: instruments.slice(i, i + 20) }),
-      })) as { ltpMap?: Record<string, number> };
-      Object.assign(ltpMap, quote.ltpMap || {});
+    const quote = (await apiFetch("/api/fyers/quotes", {
+      method: "POST",
+      body: JSON.stringify({
+        instrumentIds: instruments.map((row) => row.exchangeInstrumentID),
+      }),
+    })) as { ok?: boolean; error?: string; ltpMap?: Record<string, number> };
+    if (!quote?.ok && !quote?.ltpMap) {
+      throw new Error(quote?.error || "Fyers LTP not available for hedge scan");
     }
+    const ltpMap: Record<string, number> = quote.ltpMap || {};
     const priced = r.candidates
       .map((c) => ({ ...c, ltp: ltpFromMap(ltpMap, c.exchangeInstrumentID) }))
       .filter((c): c is HedgeCandidate & { ltp: number } => c.ltp != null);

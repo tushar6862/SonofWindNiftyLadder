@@ -6,7 +6,6 @@ import PositionsTable from "@/components/PositionsTable";
 import { LiveLtpProvider } from "@/context/LiveLtpContext";
 import { apiFetch, mdStartOnce } from "@/lib/backend";
 import { subscribeMdTouchline } from "@/lib/mdRegistry";
-import { refreshQuotesFromRest } from "@/lib/atpSeed";
 import { seedChainSpotFromResolve } from "@/lib/seedChainSpot";
 import type { ChainExpiriesResponse, ChainResolved, ChainResolveResponse, ExpiryRow } from "@/types/market";
 
@@ -40,7 +39,7 @@ function FyersMorningConnect() {
 
   return (
     <div className="mx-3 mt-2 flex items-center justify-between gap-3 rounded-md border border-amber-500/50 bg-amber-500/15 px-3 py-2 text-[13px]">
-      <span>Roz subah naya Fyers login chahiye. Connect karo, tab LIVE LTP XTS se match karega.</span>
+      <span>Roz subah naya Fyers login chahiye. Connect karo — LIVE LTP sirf Fyers se aayega.</span>
       <button
         type="button"
         disabled={busy}
@@ -295,26 +294,6 @@ export default function DashboardPage() {
     window.addEventListener("sonofwind_md_resubscribe", onResub);
     return () => window.removeEventListener("sonofwind_md_resubscribe", onResub);
   }, []);
-
-  /** REST touchline poll for spot/VIX. Ladder options are polled from NiftyLadderPanel. */
-  const spotInstruments = useMemo(
-    () => (chain ? spotInstrumentsFromChain(chain) : []),
-    [chain],
-  );
-
-  useEffect(() => {
-    if (!spotInstruments.length) return;
-    let cancelled = false;
-    const poll = () => {
-      void refreshQuotesFromRest(spotInstruments, () => cancelled);
-    };
-    poll();
-    const iv = window.setInterval(poll, 2000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(iv);
-    };
-  }, [spotInstruments]);
 
   const expiryOptions = useMemo(() => expiryRows.map((r) => r.label), [expiryRows]);
   const dashboardBgUrl = `${import.meta.env.BASE_URL}dashboard-bg.png`.replace(/\/{2,}/g, "/");

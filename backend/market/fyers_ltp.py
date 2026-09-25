@@ -216,6 +216,64 @@ def fyers_symbol_for_iid(exchange_instrument_id: int) -> str | None:
     return None
 
 
+def quote_iids(exchange_instrument_ids: list[int]) -> dict[str, float]:
+    """One Fyers quotes call. Keys are XTS instrument ids as strings."""
+    if not has_access_token():
+        raise RuntimeError("Fyers not connected")
+    sym_to_tid: dict[str, int] = {}
+    for raw in exchange_instrument_ids or []:
+        try:
+            tid = int(raw or 0)
+        except Exception:
+            continue
+        if tid <= 0 or tid in sym_to_tid.values():
+            continue
+        sym = fyers_symbol_for_iid(tid)
+        if sym:
+            sym_to_tid[sym] = tid
+    if not sym_to_tid:
+        return {}
+    hdr = access_token_header()
+    if not hdr:
+        raise RuntimeError("Fyers not connected")
+    out: dict[str, float] = {}
+    symbols = list(sym_to_tid.keys())
+    for i in range(0, len(symbols), 40):
+        chunk = symbols[i : i + 40]
+        r = requests.get(
+            _QUOTES_URL,
+            params={"symbols": ",".join(chunk)},
+            headers={"Authorization": hdr},
+            timeout=4,
+        )
+        data = r.json() if r.content else {}
+        if not isinstance(data, dict):
+            continue
+        rows = data.get("d") or data.get("data") or []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            v = row.get("v") if isinstance(row.get("v"), dict) else row
+            if not isinstance(v, dict):
+                continue
+            sym = str(row.get("n") or v.get("symbol") or v.get("n") or "").strip().upper()
+            if sym and ":" not in sym:
+                sym = f"NSE:{sym}"
+            ltp = _px(v.get("lp") or v.get("ltp"))
+            tid = sym_to_tid.get(sym)
+            if tid is None and sym:
+                bare = sym.replace("NSE:", "").replace("BSE:", "")
+                for k, t in sym_to_tid.items():
+                    if k.replace("NSE:", "").replace("BSE:", "") == bare:
+                        tid = t
+                        break
+            if tid and ltp > 0:
+                out[str(tid)] = ltp
+    return out
+
+
 def _px(v: Any) -> float:
     try:
         n = float(v or 0.0)
@@ -265,9 +323,21 @@ class FyersLtpFeed:
         self._last_err = ""
         self._rx = 0
         self._mode = ""
+        self._last_ws_rx = 0.0
 
     def set_ltp_handler(self, fn: LtpHandler | None) -> None:
         self._on_ltp = fn
+
+    def owns_token(self, exchange_instrument_id: int) -> bool:
+        """True when this XTS token is on the Fyers LTP subscription."""
+        tid = int(exchange_instrument_id or 0)
+        if tid <= 0 or not fyers_enabled() or not has_access_token():
+            return False
+        with self._lock:
+            for pair in self._want.values():
+                if int(pair[0]) == tid:
+                    return True
+        return False
 
     def status(self) -> dict[str, Any]:
         tok = access_token_raw()
@@ -405,8 +475,8 @@ class FyersLtpFeed:
             if self._started:
                 return
             self._started = True
-        if self._try_start_ws():
-            return
+        self._try_start_ws()
+        # Quotes poll covers a quiet socket so LIVE does not sit on the last print.
         self._start_poll_loop()
 
     def on_auth_success(self) -> None:
@@ -517,12 +587,16 @@ class FyersLtpFeed:
             return
         stop = threading.Event()
         self._poll_stop = stop
-        self._mode = "quotes"
+        if self._ws is None:
+            self._mode = "quotes"
         with self._lock:
             self._started = True
 
         def loop() -> None:
-            while not stop.wait(_POLL_SEC):
+            while not stop.wait(0.25):
+                # Socket is ticking — don't let a slower REST snapshot rewind it.
+                if self._ws is not None and (time.monotonic() - self._last_ws_rx) < 0.45:
+                    continue
                 try:
                     self._poll_quotes_once()
                 except Exception as e:
@@ -550,12 +624,16 @@ class FyersLtpFeed:
         hdr = access_token_header()
         if not hdr:
             return
+        started = time.monotonic()
         r = requests.get(
             _QUOTES_URL,
             params={"symbols": ",".join(want.keys())},
             headers={"Authorization": hdr},
-            timeout=4,
+            timeout=1.5,
         )
+        # A socket print landed while this snapshot was in flight — keep that print.
+        if self._ws is not None and self._last_ws_rx >= started:
+            return
         data = r.json() if r.content else {}
         if not isinstance(data, dict):
             return
@@ -598,7 +676,16 @@ class FyersLtpFeed:
             self._emit(tid, seg, ltp, _px(v.get("tt")), _quote_extras(v))
 
     def _on_ws_message(self, msg: Any) -> None:
+        if isinstance(msg, list):
+            for item in msg:
+                self._on_ws_message(item)
+            return
         if not isinstance(msg, dict):
+            return
+        nested = msg.get("d")
+        if isinstance(nested, list) and not (msg.get("symbol") or msg.get("ltp") or msg.get("lp")):
+            for item in nested:
+                self._on_ws_message(item)
             return
         sym = str(msg.get("symbol") or msg.get("n") or "").strip().upper()
         if not sym:
@@ -612,9 +699,12 @@ class FyersLtpFeed:
             ltt = float(msg.get("last_traded_time") or msg.get("ltt") or 0.0)
         except Exception:
             ltt = 0.0
+        if ltt > 1e12:
+            ltt = ltt / 1000.0
         pair = self._resolve_pair(sym)
         if pair is None:
             return
+        self._last_ws_rx = time.monotonic()
         tid, seg = pair
         extras = _quote_extras(msg)
         self._emit(tid, seg, ltp, ltt, extras)
