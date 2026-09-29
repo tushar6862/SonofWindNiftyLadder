@@ -599,6 +599,44 @@ def fyers_topbar_focus():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/rsi/data", methods=["GET", "POST"])
+def rsi_data():
+    """
+    Wilder RSI(14) indicator for NIFTY spot closes.
+    Supports 1, 2, 3, 5, 10, 15, and 30-minute timeframes.
+    Uses Fyers market data first, falling back to XTS.
+    """
+    username = (_current_user() or "").strip().upper()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        tf = data.get("timeframe", 5)
+        live_spot = data.get("liveSpot")
+    else:
+        tf = request.args.get("timeframe", 5)
+        live_spot = request.args.get("liveSpot")
+
+    try:
+        tf_i = int(tf)
+    except Exception:
+        tf_i = 5
+
+    live_f = None
+    if live_spot is not None:
+        try:
+            live_f = float(live_spot)
+        except Exception:
+            live_f = None
+
+    client = _XTS_IX.get(username) if username else None
+
+    try:
+        from market.rsi_band import get_rsi_analysis
+        payload = get_rsi_analysis(timeframe=tf_i, live_spot=live_f, xts_client=client)
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.post("/api/md/dada/range")
 def md_dada_range():
     """DADA strategy: first 15-min (09:15–09:30 IST) spot HIGH / LOW."""

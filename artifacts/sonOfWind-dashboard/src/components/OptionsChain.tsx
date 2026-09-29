@@ -4,8 +4,10 @@ import { lotSizeForIndex } from "@/lib/lot";
 import type { ChainResolved, ExpiryRow } from "@/types/market";
 import { apiFetch } from "@/lib/backend";
 import { toast } from "@/hooks/use-toast";
+import NiftyFlipPanel from "@/components/NiftyFlipPanel";
 import NiftyLadderPanel from "@/components/NiftyLadderPanel";
 import NiftySnakePanel from "@/components/NiftySnakePanel";
+import RsiBandPanel from "@/components/RsiBandPanel";
 import { bumpPositionsRefresh } from "@/lib/ixPortfolio";
 
 export default function OptionsChain({
@@ -28,7 +30,7 @@ export default function OptionsChain({
 }) {
   const lotSize = lotSizeForIndex(index);
   const qty = Math.max(1, lotSize);
-  const [desk, setDesk] = useState<"ladder" | "snake">("ladder");
+  const [desk, setDesk] = useState<"ladder" | "snake" | "rsi" | "flip">("ladder");
   const [exitBusy, setExitBusy] = useState(false);
   const [exitSelected, setExitSelected] = useState<25 | 50 | 75 | 100 | null>(null);
 
@@ -86,6 +88,20 @@ export default function OptionsChain({
         >
           Nifty Snake
         </button>
+        <button
+          type="button"
+          className={`sow-glass-tab${desk === "rsi" ? " sow-glass-tab--active" : ""}`}
+          onClick={() => setDesk("rsi")}
+        >
+          Nifty RSI
+        </button>
+        <button
+          type="button"
+          className={`sow-glass-tab${desk === "flip" ? " sow-glass-tab--active" : ""}`}
+          onClick={() => setDesk("flip")}
+        >
+          Nifty Flip
+        </button>
       </div>
 
       {!resolved && (
@@ -132,6 +148,12 @@ export default function OptionsChain({
           </div>
           <div className={desk === "snake" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "snake"}>
             <NiftySnakePanel chain={resolved} qty={qty} />
+          </div>
+          <div className={desk === "rsi" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "rsi"}>
+            <RsiBandPanel chain={resolved} active={desk === "rsi"} />
+          </div>
+          <div className={desk === "flip" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "flip"}>
+            <NiftyFlipPanel chain={resolved} active={desk === "flip"} />
           </div>
         </>
       )}
