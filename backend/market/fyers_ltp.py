@@ -32,6 +32,14 @@ FYERS_INDEX_SYMBOL: dict[str, str] = {
 }
 FYERS_VIX_SYMBOL = "NSE:INDIAVIX-INDEX"
 
+# Reject junk prints (0.05 option-tick) on index symbols. VIX stays in its own band.
+_INDEX_PX_BOUNDS: dict[str, tuple[float, float]] = {
+    "NSE:NIFTY50-INDEX": (12_000.0, 45_000.0),
+    "NSE:NIFTYBANK-INDEX": (30_000.0, 90_000.0),
+    "BSE:SENSEX-INDEX": (40_000.0, 150_000.0),
+    "NSE:INDIAVIX-INDEX": (5.0, 90.0),
+}
+
 # Handler: (tid, seg, ltp, ltt, extras)
 LtpHandler = Callable[[int, int, float, float, dict[str, float]], None]
 
@@ -169,51 +177,83 @@ def _master_paths() -> list[Path]:
     return sorted(cache.glob(_MASTER_GLOB), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+_SYM_INDEX: dict[int, str] = {}
+_SYM_INDEX_KEY = ""
+
+
+def _symbol_from_master_parts(parts: list[str]) -> str | None:
+    """Trading symbol from one instruments-master row. parts[1] is the XTS token."""
+    for c in (parts[4].strip() if len(parts) > 4 else "", parts[-1].strip() if parts else ""):
+        c = c.strip().upper().replace(" ", "")
+        if c.startswith("NIFTY") and (c.endswith("CE") or c.endswith("PE")) and any(ch.isdigit() for ch in c):
+            return f"NSE:{c}"
+    try:
+        name = parts[3].strip().upper()
+        exp = parts[16].strip() if len(parts) > 16 else ""
+        strike = parts[17].strip() if len(parts) > 17 else ""
+        ot_raw = parts[18].strip().upper() if len(parts) > 18 else ""
+    except Exception:
+        return None
+    if name != "NIFTY":
+        return None
+    ot = "CE" if ot_raw in ("3", "CE", "C", "CALL") else "PE" if ot_raw in ("4", "PE", "P", "PUT") else ""
+    if not ot:
+        return None
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", exp)
+    if not m:
+        return None
+    yy = m.group(1)[2:]
+    mon = int(m.group(2))
+    dd = m.group(3)
+    try:
+        strike_i = int(float(strike))
+    except Exception:
+        return None
+    return f"NSE:NIFTY{yy}{mon}{dd}{strike_i}{ot}"
+
+
+def _option_symbol_index() -> dict[int, str]:
+    """token → Fyers option symbol. Match column 1 only — strike 26000 is not token 26000."""
+    global _SYM_INDEX, _SYM_INDEX_KEY
+    paths = _master_paths()
+    path = paths[0] if paths else None
+    if path is None:
+        return {}
+    try:
+        key = f"{path}|{path.stat().st_mtime_ns}"
+    except Exception:
+        key = str(path)
+    if key == _SYM_INDEX_KEY and _SYM_INDEX:
+        return _SYM_INDEX
+    index: dict[int, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return _SYM_INDEX
+    for line in text.splitlines():
+        parts = line.split("|")
+        if len(parts) < 5:
+            continue
+        try:
+            tid = int(parts[1].strip())
+        except Exception:
+            continue
+        if tid <= 0 or tid in index:
+            continue
+        sym = _symbol_from_master_parts(parts)
+        if sym:
+            index[tid] = sym
+    _SYM_INDEX = index
+    _SYM_INDEX_KEY = key
+    return index
+
+
 def fyers_symbol_for_iid(exchange_instrument_id: int) -> str | None:
     """Map XTS option token → NSE:NIFTY26…CE using instruments master."""
     tid = int(exchange_instrument_id or 0)
     if tid <= 0:
         return None
-    needle = f"|{tid}|"
-    for path in _master_paths()[:6]:
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-        for line in text.splitlines():
-            if needle not in line:
-                continue
-            parts = line.split("|")
-            if len(parts) < 5:
-                continue
-            for c in (parts[4].strip() if len(parts) > 4 else "", parts[-1].strip() if parts else ""):
-                c = c.strip().upper().replace(" ", "")
-                if c.startswith("NIFTY") and (c.endswith("CE") or c.endswith("PE")) and any(ch.isdigit() for ch in c):
-                    return f"NSE:{c}"
-            try:
-                name = parts[3].strip().upper()
-                exp = parts[16].strip() if len(parts) > 16 else ""
-                strike = parts[17].strip() if len(parts) > 17 else ""
-                ot_raw = parts[18].strip().upper() if len(parts) > 18 else ""
-            except Exception:
-                continue
-            if name != "NIFTY":
-                continue
-            ot = "CE" if ot_raw in ("3", "CE", "C", "CALL") else "PE" if ot_raw in ("4", "PE", "P", "PUT") else ""
-            if not ot:
-                continue
-            m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", exp)
-            if not m:
-                continue
-            yy = m.group(1)[2:]
-            mon = int(m.group(2))
-            dd = m.group(3)
-            try:
-                strike_i = int(float(strike))
-            except Exception:
-                continue
-            return f"NSE:NIFTY{yy}{mon}{dd}{strike_i}{ot}"
-    return None
+    return _option_symbol_index().get(tid)
 
 
 def quote_iids(exchange_instrument_ids: list[int]) -> dict[str, float]:
@@ -282,6 +322,39 @@ def _px(v: Any) -> float:
     return n if n > 0 else 0.0
 
 
+def _index_bounds(sym: str) -> tuple[float, float] | None:
+    return _INDEX_PX_BOUNDS.get(str(sym or "").strip().upper())
+
+
+def _px_ok_for_symbol(sym: str, px: float) -> bool:
+    if px <= 0:
+        return False
+    bounds = _index_bounds(sym)
+    if bounds is None:
+        return True
+    lo, hi = bounds
+    return lo <= px <= hi
+
+
+def _sanitize_index_quote(sym: str, ltp: float, extras: dict[str, float]) -> tuple[float, dict[str, float]]:
+    """Drop index LTP/OHLC outside a sane band. Fall back to prev close before the open."""
+    clean: dict[str, float] = {}
+    for key, val in extras.items():
+        if key == "percentChange":
+            clean[key] = val
+            continue
+        if _px_ok_for_symbol(sym, val):
+            clean[key] = val
+    px = ltp if _px_ok_for_symbol(sym, ltp) else 0.0
+    if px <= 0 and _index_bounds(sym) is not None:
+        for key in ("prevClose", "dayOpen", "dayHigh", "dayLow"):
+            alt = float(clean.get(key) or 0.0)
+            if alt > 0:
+                px = alt
+                break
+    return px, clean
+
+
 def _quote_extras(v: dict[str, Any]) -> dict[str, float]:
     out: dict[str, float] = {}
     mapping = {
@@ -324,6 +397,8 @@ class FyersLtpFeed:
         self._rx = 0
         self._mode = ""
         self._last_ws_rx = 0.0
+        self._last_sym_rx: dict[str, float] = {}
+        self._last_top_poll = 0.0
 
     def set_ltp_handler(self, fn: LtpHandler | None) -> None:
         self._on_ltp = fn
@@ -367,7 +442,8 @@ class FyersLtpFeed:
     def _rebuild_want(self) -> tuple[set[str], set[str]]:
         with self._lock:
             prev = set(self._want.keys())
-            merged = {**self._want_topbar, **self._want_live}
+            # TopBar index/VIX symbols win if a live option row collides on the same Fyers symbol.
+            merged = {**self._want_live, **self._want_topbar}
             self._want = merged
             nxt = set(merged.keys())
         return nxt - prev, prev - nxt
@@ -378,6 +454,8 @@ class FyersLtpFeed:
             return {"ok": False, "error": "fyers disabled"}
         next_want: dict[str, tuple[int, int]] = {}
         missing: list[int] = []
+        with self._lock:
+            pinned = {int(pair[0]) for pair in self._want_topbar.values()}
         for inst in instruments or []:
             try:
                 tid = int(inst.get("exchangeInstrumentID") or 0)
@@ -385,6 +463,9 @@ class FyersLtpFeed:
             except Exception:
                 continue
             if tid <= 0:
+                continue
+            # Spot / VIX are already pinned as index symbols. Do not remap them as options.
+            if tid in pinned:
                 continue
             sym = fyers_symbol_for_iid(tid)
             if not sym:
@@ -504,19 +585,23 @@ class FyersLtpFeed:
             self._mode = ""
 
     def _apply_subscriptions(self, added: set[str], removed: set[str]) -> None:
+        """Subscribe only the delta. A full re-subscribe drops Spot ticks for a few seconds."""
         ws = self._ws
-        if ws is None:
+        if ws is None or (not added and not removed):
             return
+
+        def chunks(items: set[str], size: int = 40) -> list[list[str]]:
+            rows = list(items)
+            return [rows[i : i + size] for i in range(0, len(rows), size)]
+
         try:
-            if removed:
-                ws.unsubscribe(symbols=list(removed), data_type="SymbolUpdate")
+            for part in chunks(removed):
+                ws.unsubscribe(symbols=part, data_type="SymbolUpdate")
         except Exception:
             pass
         try:
-            if added:
-                ws.subscribe(symbols=list(added), data_type="SymbolUpdate")
-            elif self._want:
-                ws.subscribe(symbols=list(self._want.keys()), data_type="SymbolUpdate")
+            for part in chunks(added):
+                ws.subscribe(symbols=part, data_type="SymbolUpdate")
         except Exception as e:
             self._last_err = str(e)
 
@@ -593,10 +678,7 @@ class FyersLtpFeed:
             self._started = True
 
         def loop() -> None:
-            while not stop.wait(0.25):
-                # Socket is ticking — don't let a slower REST snapshot rewind it.
-                if self._ws is not None and (time.monotonic() - self._last_ws_rx) < 0.45:
-                    continue
+            while not stop.wait(0.4):
                 try:
                     self._poll_quotes_once()
                 except Exception as e:
@@ -617,8 +699,20 @@ class FyersLtpFeed:
         return None
 
     def _poll_quotes_once(self) -> None:
+        now = time.monotonic()
         with self._lock:
-            want = dict(self._want)
+            topbar = dict(self._want_topbar)
+            live = {k: v for k, v in self._want_live.items() if k not in self._want_topbar}
+        # Option prints must not hide a quiet index. Poll Spot/VIX only when they themselves go silent.
+        quiet = {sym: pair for sym, pair in topbar.items() if now - self._last_sym_rx.get(sym, 0.0) >= 1.0}
+        if quiet and now - self._last_top_poll >= 1.0:
+            self._last_top_poll = now
+            self._fetch_quote_rows(quiet)
+        # Option REST only when the socket itself is quiet, so a busy tape is not rate-limited.
+        if live and (self._ws is None or now - self._last_ws_rx >= 1.2):
+            self._fetch_quote_rows(live)
+
+    def _fetch_quote_rows(self, want: dict[str, tuple[int, int]]) -> None:
         if not want:
             return
         hdr = access_token_header()
@@ -631,9 +725,6 @@ class FyersLtpFeed:
             headers={"Authorization": hdr},
             timeout=1.5,
         )
-        # A socket print landed while this snapshot was in flight — keep that print.
-        if self._ws is not None and self._last_ws_rx >= started:
-            return
         data = r.json() if r.content else {}
         if not isinstance(data, dict):
             return
@@ -666,14 +757,17 @@ class FyersLtpFeed:
                     sym = f"BSE:{sym}"
                 else:
                     sym = f"NSE:{sym}"
-            ltp = _px(v.get("lp") or v.get("ltp"))
+            ltp, extras = _sanitize_index_quote(sym, _px(v.get("lp") or v.get("ltp")), _quote_extras(v))
             if ltp <= 0:
                 continue
             pair = self._resolve_pair(sym)
             if pair is None:
                 continue
+            # Keep a newer socket print for this symbol. Another symbol's tick must not drop Spot.
+            if self._last_sym_rx.get(sym, 0.0) >= started:
+                continue
             tid, seg = pair
-            self._emit(tid, seg, ltp, _px(v.get("tt")), _quote_extras(v))
+            self._emit(tid, seg, ltp, _px(v.get("tt")), extras)
 
     def _on_ws_message(self, msg: Any) -> None:
         if isinstance(msg, list):
@@ -692,11 +786,16 @@ class FyersLtpFeed:
             return
         if ":" not in sym:
             sym = f"NSE:{sym}"
-        ltp = _px(msg.get("ltp") or msg.get("lp"))
+        px = 0.0
+        for key in ("ltp", "lp", "index_val", "last_traded_price"):
+            px = _px(msg.get(key))
+            if px > 0:
+                break
+        ltp, extras = _sanitize_index_quote(sym, px, _quote_extras(msg))
         if ltp <= 0:
             return
         try:
-            ltt = float(msg.get("last_traded_time") or msg.get("ltt") or 0.0)
+            ltt = float(msg.get("last_traded_time") or msg.get("ltt") or msg.get("exch_feed_time") or 0.0)
         except Exception:
             ltt = 0.0
         if ltt > 1e12:
@@ -704,9 +803,10 @@ class FyersLtpFeed:
         pair = self._resolve_pair(sym)
         if pair is None:
             return
-        self._last_ws_rx = time.monotonic()
+        now_rx = time.monotonic()
+        self._last_ws_rx = now_rx
+        self._last_sym_rx[sym] = now_rx
         tid, seg = pair
-        extras = _quote_extras(msg)
         self._emit(tid, seg, ltp, ltt, extras)
 
     def _emit(self, tid: int, seg: int, ltp: float, ltt: float, extras: dict[str, float] | None = None) -> None:

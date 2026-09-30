@@ -6,7 +6,7 @@ import { useAuth } from "@/auth/AuthContext";
 import { useLiveHiLo, useLiveSpotDayRef, useTickLtp } from "@/context/LiveLtpContext";
 import { FastLtp } from "@/components/FastLtp";
 import type { ChainResolved } from "@/types/market";
-import { liveAtmStrikeForChain } from "@/lib/liveAtmStrike";
+import { liveAtmStrikeForChain, plausibleSpotPx, spotPxFloor } from "@/lib/liveAtmStrike";
 import { fmtPct, fmtPrice } from "@/lib/formatNumber";
 import { useLocation } from "wouter";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -222,16 +222,10 @@ export default function TopBar({
   const tickSpot = useTickLtp(typeof spotToken === "number" ? spotToken : null);
   const tickVix = useTickLtp(typeof vixId === "number" ? vixId : null);
 
-  const rawSpotTick = tickSpot != null && tickSpot > 0 ? tickSpot : undefined;
-  const stableSnap = typeof chain?.spotLtp === "number" ? chain!.spotLtp : undefined;
-  const liveSpot =
-    typeof rawSpotTick === "number" && rawSpotTick > 0
-      ? rawSpotTick
-      : typeof stableSnap === "number" && stableSnap > 0
-        ? stableSnap
-        : typeof rawSpotTick === "number"
-          ? rawSpotTick
-          : stableSnap;
+  const rawSpotTick = plausibleSpotPx(index, tickSpot);
+  const stableSnap = plausibleSpotPx(index, chain?.spotLtp);
+  const liveSpot = rawSpotTick ?? stableSnap;
+  const spotMin = spotPxFloor(index);
 
   const liveAtmStrike = useMemo(() => {
     if (!chain) return undefined;
@@ -241,14 +235,10 @@ export default function TopBar({
   }, [chain, liveSpot]);
 
   const dayRef = typeof spotToken === "number" ? spotDayRefByToken[spotToken] : undefined;
-  const streamPrev =
-    typeof dayRef?.prevClose === "number" && dayRef.prevClose > 0 ? dayRef.prevClose : undefined;
-  const chainPrev =
-    typeof chain?.spotPrevClose === "number" && chain.spotPrevClose > 0 ? chain.spotPrevClose : undefined;
-  const streamOpen =
-    typeof dayRef?.dayOpen === "number" && dayRef.dayOpen > 0 ? dayRef.dayOpen : undefined;
-  const chainOpen =
-    typeof chain?.spotDayOpen === "number" && chain.spotDayOpen > 0 ? chain.spotDayOpen : undefined;
+  const streamPrev = plausibleSpotPx(index, dayRef?.prevClose);
+  const chainPrev = plausibleSpotPx(index, chain?.spotPrevClose);
+  const streamOpen = plausibleSpotPx(index, dayRef?.dayOpen);
+  const chainOpen = plausibleSpotPx(index, chain?.spotDayOpen);
   /** Prefer prev. close (stream → chain resolve quote); else session open for a live move vs ref. */
   const refPx = streamPrev ?? chainPrev ?? streamOpen ?? chainOpen;
   const refIsPrevClose = streamPrev != null || chainPrev != null;
@@ -269,14 +259,10 @@ export default function TopBar({
     typeof liveSpot === "number" && Number.isFinite(liveSpot) && liveSpot > 0 && typeof deltaAbs === "number";
 
   /** Exchange day range from Touchline — not min/max since dashboard connected. */
-  const dhStream =
-    typeof dayRef?.dayHigh === "number" && dayRef.dayHigh > 0 ? dayRef.dayHigh : undefined;
-  const dlStream =
-    typeof dayRef?.dayLow === "number" && dayRef.dayLow > 0 ? dayRef.dayLow : undefined;
-  const dhChain =
-    typeof chain?.spotDayHigh === "number" && chain.spotDayHigh > 0 ? chain.spotDayHigh : undefined;
-  const dlChain =
-    typeof chain?.spotDayLow === "number" && chain.spotDayLow > 0 ? chain.spotDayLow : undefined;
+  const dhStream = plausibleSpotPx(index, dayRef?.dayHigh);
+  const dlStream = plausibleSpotPx(index, dayRef?.dayLow);
+  const dhChain = plausibleSpotPx(index, chain?.spotDayHigh);
+  const dlChain = plausibleSpotPx(index, chain?.spotDayLow);
   let exchangeHl: { h: number; l: number } | undefined;
   if (dhStream != null && dlStream != null && dhStream + 1e-9 >= dlStream) {
     exchangeHl = { h: dhStream, l: dlStream };
@@ -287,8 +273,11 @@ export default function TopBar({
       exchangeHl = { h: mh, l: ml };
     }
   }
+  const rollingRaw = typeof spotToken === "number" && hilo[spotToken] ? hilo[spotToken] : undefined;
   const rollingHl =
-    typeof spotToken === "number" && hilo[spotToken] ? hilo[spotToken] : undefined;
+    rollingRaw && plausibleSpotPx(index, rollingRaw.h) != null && plausibleSpotPx(index, rollingRaw.l) != null
+      ? { h: plausibleSpotPx(index, rollingRaw.h)!, l: plausibleSpotPx(index, rollingRaw.l)! }
+      : undefined;
   /** Chain resolve H/L is a snapshot; stream may omit updates. Always fold in rolling LTP min/max so H/L move with ticks. */
   const spotHL =
     exchangeHl && rollingHl
@@ -412,8 +401,12 @@ export default function TopBar({
                 <span className="sow-glass-topbar-stat__label">Spot:</span>
                 <ExternalLink className="w-3 h-3 text-muted-foreground" />
                 <span className="sow-glass-topbar-stat__value tabular-nums">
-                  {typeof spotToken === "number" && spotToken > 0 ? (
-                    <FastLtp iid={spotToken} className="sow-glass-topbar-stat__value tabular-nums" />
+                  {rawSpotTick != null && typeof spotToken === "number" && spotToken > 0 ? (
+                    <FastLtp
+                      iid={spotToken}
+                      min={spotMin}
+                      className="sow-glass-topbar-stat__value tabular-nums"
+                    />
                   ) : (
                     fmtPrice(liveSpot)
                   )}

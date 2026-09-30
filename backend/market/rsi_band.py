@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -31,7 +32,9 @@ SUPPORTED_TIMEFRAMES = [1, 2, 3, 5, 10, 15, 30]
 
 # Simple in-memory cache to avoid hammering APIs when polled every 5s
 _CACHE: dict[int, dict[str, Any]] = {}  # tf_minutes -> {ts, payload}
-_CACHE_TTL_SEC = 3.0
+_CACHE_TTL_SEC = 60.0
+_refresh_guard = threading.Lock()
+_refreshing: set[int] = set()
 
 
 def compute_wilder_rsi_series(closes: list[float], period: int = RSI_PERIOD) -> tuple[list[float | None], float | None, float | None]:
@@ -108,14 +111,26 @@ def project_forming_rsi(
     return round(proj_rsi, 2)
 
 
+_HIST_FAIL_UNTIL = 0.0
+_HIST_FAIL_LOG_AT = 0.0
+
+
+def _fyers_history_date(epoch: int) -> str:
+    """date_format 1 requires YYYY-MM-DD in IST, not epoch seconds."""
+    return datetime.fromtimestamp(int(epoch), IST).strftime("%Y-%m-%d")
+
+
 def _fetch_fyers_history(symbol: str, resolution: str, from_epoch: int, to_epoch: int) -> list[dict[str, Any]]:
     """
     Fetch historical candles from Fyers API v3.
     Returns list of dict: {time, open, high, low, close, volume}
     """
+    global _HIST_FAIL_UNTIL, _HIST_FAIL_LOG_AT
     from market.fyers_ltp import access_token_header, has_access_token
 
     if not has_access_token():
+        return []
+    if time.time() < _HIST_FAIL_UNTIL:
         return []
 
     hdr = access_token_header()
@@ -127,17 +142,23 @@ def _fetch_fyers_history(symbol: str, resolution: str, from_epoch: int, to_epoch
         "symbol": symbol,
         "resolution": str(resolution),
         "date_format": "1",
-        "range_from": str(from_epoch),
-        "range_to": str(to_epoch),
+        "range_from": _fyers_history_date(from_epoch),
+        "range_to": _fyers_history_date(to_epoch),
         "cont_flag": "1",
     }
     try:
         r = requests.get(url, params=params, headers={"Authorization": hdr}, timeout=6)
         if r.status_code != 200:
-            _log.warning("Fyers history API returned %s: %s", r.status_code, r.text[:200])
+            # 429 means the data API is exhausted — back off long enough for the limit to clear.
+            _HIST_FAIL_UNTIL = time.time() + (180.0 if r.status_code == 429 else 20.0)
+            if time.time() - _HIST_FAIL_LOG_AT > 30.0:
+                _HIST_FAIL_LOG_AT = time.time()
+                _log.warning("Fyers history API returned %s — backing off", r.status_code)
             return []
+        _HIST_FAIL_UNTIL = 0.0
         data = r.json()
         if not isinstance(data, dict) or data.get("s") != "ok":
+            _HIST_FAIL_UNTIL = time.time() + 20.0
             return []
         raw_candles = data.get("candles") or []
         bars: list[dict[str, Any]] = []
@@ -153,7 +174,10 @@ def _fetch_fyers_history(symbol: str, resolution: str, from_epoch: int, to_epoch
                 })
         return bars
     except Exception as e:
-        _log.warning("Fyers history API exception: %s", e)
+        _HIST_FAIL_UNTIL = time.time() + 20.0
+        if time.time() - _HIST_FAIL_LOG_AT > 30.0:
+            _HIST_FAIL_LOG_AT = time.time()
+            _log.warning("Fyers history API exception: %s", e)
         return []
 
 
@@ -161,7 +185,7 @@ def _fetch_xts_candles(client: Any, tf_minutes: int) -> list[dict[str, Any]]:
     """
     Fallback to XTS for NIFTY spot candles.
     """
-    if client is None:
+    if client is None or not callable(getattr(client, "get_ohlc", None)):
         return []
     try:
         from market.dada_range import fetch_session_1m_bars, aggregate_1m_to_tf
@@ -268,6 +292,42 @@ def detect_rsi_crossovers(
     return signals
 
 
+def _apply_live_spot(payload: dict[str, Any], live_spot: float | None) -> dict[str, Any]:
+    if live_spot is None or live_spot <= 0:
+        return payload
+    gain = payload.get("_lastAvgGain")
+    if gain is None:
+        gain = payload.get("lastAvgGain")
+    loss = payload.get("_lastAvgLoss")
+    if loss is None:
+        loss = payload.get("lastAvgLoss")
+    proj = project_forming_rsi(gain, loss, float(payload.get("lastConfirmedClose") or 0.0), live_spot)
+    if proj is not None:
+        payload["projectedRsi"] = proj
+        payload["liveRsi"] = proj
+        payload["liveSpot"] = live_spot
+    return payload
+
+
+def _schedule_rsi_refresh(tf: int, live_spot: float | None, xts_client: Any) -> None:
+    """History refresh stays off the request thread so a 429 cannot stall live ticks."""
+    if time.time() < _HIST_FAIL_UNTIL:
+        return
+    with _refresh_guard:
+        if tf in _refreshing:
+            return
+        _refreshing.add(tf)
+
+    def run() -> None:
+        try:
+            _compute_rsi_analysis(tf, live_spot, xts_client)
+        finally:
+            with _refresh_guard:
+                _refreshing.discard(tf)
+
+    threading.Thread(target=run, name=f"rsi-history-{tf}", daemon=True).start()
+
+
 def get_rsi_analysis(
     timeframe: int = 5,
     live_spot: float | None = None,
@@ -275,25 +335,25 @@ def get_rsi_analysis(
 ) -> dict[str, Any]:
     """
     Main entry point for RSI calculation and analysis.
-    Checks cache first, then Fyers history, then XTS, with fallback seed.
+    A cached chart is returned immediately. History refresh runs in the background.
     """
     tf = int(timeframe) if int(timeframe) in SUPPORTED_TIMEFRAMES else 5
-
     now_epoch = int(time.time())
     cached = _CACHE.get(tf)
-    if cached and (now_epoch - cached["ts"]) < _CACHE_TTL_SEC:
-        payload = dict(cached["payload"])
-        # Update live projection with current spot if available
-        if live_spot is not None and live_spot > 0:
-            last_gain = payload.get("_lastAvgGain")
-            last_loss = payload.get("_lastAvgLoss")
-            last_close = payload.get("lastConfirmedClose", 0.0)
-            proj = project_forming_rsi(last_gain, last_loss, last_close, live_spot)
-            if proj is not None:
-                payload["projectedRsi"] = proj
-                payload["liveRsi"] = proj
-                payload["liveSpot"] = live_spot
+    if isinstance(cached, dict) and isinstance(cached.get("payload"), dict):
+        payload = _apply_live_spot(dict(cached["payload"]), live_spot)
+        if (now_epoch - float(cached.get("ts") or 0)) >= _CACHE_TTL_SEC:
+            _schedule_rsi_refresh(tf, live_spot, xts_client)
         return payload
+    return _compute_rsi_analysis(tf, live_spot, xts_client)
+
+
+def _compute_rsi_analysis(
+    tf: int,
+    live_spot: float | None,
+    xts_client: Any,
+) -> dict[str, Any]:
+    now_epoch = int(time.time())
 
     # Time range: last 3 days to guarantee sufficient bars for 14-period RSI
     from_epoch = now_epoch - (3 * 86400)
@@ -302,10 +362,34 @@ def get_rsi_analysis(
     source = "fyers"
     candles = _fetch_fyers_history(symbol, str(tf), from_epoch, now_epoch)
 
-    # Fallback to XTS if Fyers returned empty
-    if not candles and xts_client is not None:
+    # Fallback to XTS market-data OHLC only. The interactive client has no get_ohlc.
+    if not candles and xts_client is not None and callable(getattr(xts_client, "get_ohlc", None)):
         source = "xts"
         candles = _fetch_xts_candles(xts_client, tf)
+
+    # Rate limit / empty fetch must not wipe the last real Fyers chart.
+    if not candles:
+        prev = _CACHE.get(tf)
+        prev_payload = prev.get("payload") if isinstance(prev, dict) else None
+        if (
+            isinstance(prev_payload, dict)
+            and prev_payload.get("source") == "fyers"
+            and int(prev_payload.get("candleCount") or 0) > RSI_PERIOD
+        ):
+            payload = dict(prev_payload)
+            if live_spot is not None and live_spot > 0:
+                proj = project_forming_rsi(
+                    payload.get("_lastAvgGain"),
+                    payload.get("_lastAvgLoss"),
+                    float(payload.get("lastConfirmedClose") or 0.0),
+                    live_spot,
+                )
+                if proj is not None:
+                    payload["projectedRsi"] = proj
+                    payload["liveRsi"] = proj
+                    payload["liveSpot"] = live_spot
+            _CACHE[tf] = {"ts": now_epoch, "payload": payload}
+            return payload
 
     # If still empty (e.g. after hours / mock / dev), provide synthetic seeds
     if not candles:
@@ -354,6 +438,8 @@ def get_rsi_analysis(
         "liveRsi": live_rsi,
         "liveSpot": effective_spot,
         "lastConfirmedClose": last_confirmed_close,
+        "lastAvgGain": last_gain,
+        "lastAvgLoss": last_loss,
         # Threshold constants for frontend transparency
         "thresholds": {
             "ceArm": CE_ARM_THRESHOLD,

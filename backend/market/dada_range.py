@@ -279,6 +279,8 @@ def fetch_session_1m_bars(
     exchange_instrument_id: int,
 ) -> list[OhlcBar]:
     """Fetch today's session 1-minute OHLC from 09:15 IST until now."""
+    if client is None or not callable(getattr(client, "get_ohlc", None)):
+        return []
     now = datetime.now(IST)
     day_start = _session_start_ist(now)
     if now < day_start:

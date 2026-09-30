@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChainResolved } from "@/types/market";
 import { peekLiveTick, useLiveLtp } from "@/context/LiveLtpContext";
 import { peekTouchPx } from "@/lib/liveQuote";
+import { plausibleSpotPx } from "@/lib/liveAtmStrike";
 import { setHotFocus } from "@/lib/hotFocus";
 import { fmtPnl, fmtPrice, fmtQty } from "@/lib/formatNumber";
 import { apiFetch } from "@/lib/backend";
@@ -11,30 +12,30 @@ import { toast } from "@/hooks/use-toast";
 import {
   DEFAULT_QTY,
   LOT_SIZE,
-  RSI_CE_ARM_THRESHOLD,
-  RSI_CE_AUTO_EXIT,
-  RSI_CE_CROSS_THRESHOLD,
-  RSI_PE_ARM_THRESHOLD,
-  RSI_PE_AUTO_EXIT,
-  RSI_PE_CROSS_THRESHOLD,
+  DEFAULT_RSI_LIMITS,
+  ceSlFromUpper,
+  limitsAreOrdered,
+  peSlFromLower,
+  rsiInsideLimits,
+  RSI_PERIOD,
   RSI_RATIOS,
   SIZE_MULTS,
   TIMEFRAMES,
   UNDERLYING,
-  canSellCe,
-  canSellPe,
   isRatioId,
   isSizeMult,
   isTimeframe,
   orderQuantity,
   parseQty,
-  pickClosestLtp,
   pickHighestLtp,
+  projectRsiWithSpot,
   ratioById,
   shouldAutoExitCe,
   shouldAutoExitPe,
   shortMtm,
   type RatioId,
+  type RsiChartLimits,
+  type RsiLimitLine,
   type RsiSide,
   type RsiTimeframe,
   type SizeMult,
@@ -58,7 +59,9 @@ import {
 } from "lucide-react";
 
 const SESSION_KEY = "sow_nifty_rsi_v1";
-const POLL_INTERVAL_MS = 5000;
+const POLL_INTERVAL_MS = 20000;
+/** Strikes each side of spot to scan so a 10–100 premium band can be found. */
+const BAND_SCAN_WINGS = 16;
 const WATCH_INTERVAL_MS = 200;
 
 export type RsiLog = {
@@ -105,6 +108,7 @@ type SessionBlob = {
   scaleZoom?: "zoomed" | "full";
   barZoom?: "30" | "50" | "all";
   chartHeight?: "normal" | "tall" | "max";
+  rsiLimits?: RsiChartLimits;
   cePosition: RsiPosition | null;
   pePosition: RsiPosition | null;
   logs: RsiLog[];
@@ -151,6 +155,28 @@ function readPosition(raw: unknown): RsiPosition | null {
   return { side, strike, qty, fill, iid, segment, openedAt };
 }
 
+function readLimitLine(raw: unknown, fallback: RsiLimitLine): RsiLimitLine {
+  if (!raw || typeof raw !== "object") return fallback;
+  const row = raw as Partial<RsiLimitLine>;
+  const value = Number(row.value);
+  const color = typeof row.color === "string" && /^#[0-9a-fA-F]{6}$/.test(row.color) ? row.color : fallback.color;
+  return {
+    enabled: row.enabled !== false,
+    color,
+    value: Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : fallback.value,
+  };
+}
+
+function readLimits(raw: unknown): RsiChartLimits {
+  const src = raw && typeof raw === "object" ? (raw as Partial<RsiChartLimits>) : {};
+  const next: RsiChartLimits = {
+    upper: readLimitLine(src.upper, DEFAULT_RSI_LIMITS.upper),
+    middle: readLimitLine(src.middle, DEFAULT_RSI_LIMITS.middle),
+    lower: readLimitLine(src.lower, DEFAULT_RSI_LIMITS.lower),
+  };
+  return limitsAreOrdered(next) ? next : DEFAULT_RSI_LIMITS;
+}
+
 function loadSession(): SessionBlob | null {
   try {
     const raw = sessionStorage.getItem(SESSION_KEY);
@@ -163,11 +189,12 @@ function loadSession(): SessionBlob | null {
     const scaleZoom = parsed.scaleZoom === "zoomed" || parsed.scaleZoom === "full" ? parsed.scaleZoom : "full";
     const barZoom = parsed.barZoom === "30" || parsed.barZoom === "50" || parsed.barZoom === "all" ? parsed.barZoom : "all";
     const chartHeight = parsed.chartHeight === "normal" || parsed.chartHeight === "tall" || parsed.chartHeight === "max" ? parsed.chartHeight : "normal";
+    const rsiLimits = readLimits(parsed.rsiLimits);
     const cePosition = readPosition(parsed.cePosition);
     const pePosition = readPosition(parsed.pePosition);
     const logs = Array.isArray(parsed.logs) ? (parsed.logs as RsiLog[]).slice(0, 100) : [];
     const logId = logs.reduce((max, row) => Math.max(max, row.id), 0) + 1;
-    return { qtyText, ratio, size, timeframe, scaleZoom, barZoom, chartHeight, cePosition, pePosition, logs, logId };
+    return { qtyText, ratio, size, timeframe, scaleZoom, barZoom, chartHeight, rsiLimits, cePosition, pePosition, logs, logId };
   } catch {
     return null;
   }
@@ -200,13 +227,12 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
   const [pePosition, setPePosition] = useState<RsiPosition | null>(boot?.pePosition ?? null);
   const [logs, setLogs] = useState<RsiLog[]>(boot?.logs ?? []);
   const [busy, setBusy] = useState(false);
-  const [pulse, setPulse] = useState(0);
 
   // Backend RSI states
   const [confirmedRsi, setConfirmedRsi] = useState<number | null>(null);
   const [projectedRsi, setProjectedRsi] = useState<number | null>(null);
+  const [rsiSeed, setRsiSeed] = useState<{ avgGain: number; avgLoss: number; lastClose: number } | null>(null);
   const [candles, setCandles] = useState<RsiCandle[]>([]);
-  const [signals, setSignals] = useState<RsiSignal[]>([]);
   const [backendSource, setBackendSource] = useState<string>("fyers");
   const [lastFetchTs, setLastFetchTs] = useState<number>(0);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -218,6 +244,10 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
   const [scaleZoom, setScaleZoom] = useState<"zoomed" | "full">(boot?.scaleZoom ?? "full");
   const [barZoom, setBarZoom] = useState<"30" | "50" | "all">(boot?.barZoom ?? "all");
   const [chartHeight, setChartHeight] = useState<"normal" | "tall" | "max">(boot?.chartHeight ?? "normal");
+  const [rsiLimits, setRsiLimits] = useState<RsiChartLimits>(boot?.rsiLimits ?? DEFAULT_RSI_LIMITS);
+  const [limitsOpen, setLimitsOpen] = useState(false);
+  const limitsPopRef = useRef<HTMLDivElement | null>(null);
+  const lastValidLimitsRef = useRef<RsiChartLimits>(boot?.rsiLimits ?? DEFAULT_RSI_LIMITS);
 
   const ltps = useLiveLtp();
   const logIdRef = useRef(boot?.logId ?? 1);
@@ -242,45 +272,79 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
     const spotToken = chain.spotToken;
     if (typeof spotToken === "number" && spotToken > 0) {
       const p = peekTouchPx(spotToken, ltps);
-      if (p != null && p > 0) return p;
-      if (ltps[spotToken] != null && ltps[spotToken] > 0) return ltps[spotToken];
+      const live = plausibleSpotPx(chain.index, p ?? ltps[spotToken]);
+      if (live != null) return live;
     }
-    return null;
-  }, [chain.spotToken, ltps, pulse]);
+    return plausibleSpotPx(chain.index, chain.spotLtp) ?? null;
+  }, [chain.index, chain.spotLtp, chain.spotToken, ltps]);
 
-  // Projected Live RSI
+  // Forming-candle RSI from the last closed bar plus the live spot tick. No history refetch.
   const liveRsi = useMemo(() => {
+    if (rsiSeed && liveSpotLtp != null) {
+      const proj = projectRsiWithSpot(rsiSeed.avgGain, rsiSeed.avgLoss, rsiSeed.lastClose, liveSpotLtp);
+      if (proj != null && Number.isFinite(proj)) return proj;
+    }
     if (projectedRsi != null && Number.isFinite(projectedRsi)) return projectedRsi;
     if (confirmedRsi != null && Number.isFinite(confirmedRsi)) return confirmedRsi;
     return null;
-  }, [projectedRsi, confirmedRsi]);
+  }, [rsiSeed, liveSpotLtp, projectedRsi, confirmedRsi]);
+
+  if (limitsAreOrdered(rsiLimits)) lastValidLimitsRef.current = rsiLimits;
+  const activeLimits = limitsAreOrdered(rsiLimits) ? rsiLimits : lastValidLimitsRef.current;
+  const upperLimit = activeLimits.upper.value;
+  const middleLimit = activeLimits.middle.value;
+  const lowerLimit = activeLimits.lower.value;
+  const rsiInBand = rsiInsideLimits(liveRsi, lowerLimit, upperLimit);
+  const ceSl = ceSlFromUpper(upperLimit);
+  const peSl = peSlFromLower(lowerLimit);
 
   // All available quotes for CE and PE
   const ceAllQuotes = useMemo(() => {
     if (!nifty) return [];
     return sideQuotes(chain, "CE", ltps);
-  }, [nifty, chain, ltps, pulse]);
+  }, [nifty, chain, ltps]);
 
   const peAllQuotes = useMemo(() => {
     if (!nifty) return [];
     return sideQuotes(chain, "PE", ltps);
-  }, [nifty, chain, ltps, pulse]);
+  }, [nifty, chain, ltps]);
 
-  // Candidate option picks: first inside band, otherwise fallback to closest
+  const scanAtm = useMemo(() => {
+    const step = chain.step > 0 ? chain.step : 50;
+    const spot = liveSpotLtp ?? chain.spotLtp;
+    if (typeof spot !== "number" || !(spot > 0)) return chain.atmStrike;
+    return Math.round(spot / step) * step;
+  }, [liveSpotLtp, chain.spotLtp, chain.atmStrike, chain.step]);
+
+  const bandScanKey = useMemo(() => {
+    const step = chain.step > 0 ? chain.step : 50;
+    const ids: number[] = [];
+    for (let i = -BAND_SCAN_WINGS; i <= BAND_SCAN_WINGS; i++) {
+      const row = chain.instrumentMap[String(scanAtm + i * step)];
+      if (!row) continue;
+      if (row.ce > 0) ids.push(row.ce);
+      if (row.pe > 0) ids.push(row.pe);
+    }
+    return Array.from(new Set(ids))
+      .sort((a, b) => a - b)
+      .join(",");
+  }, [chain.instrumentMap, chain.step, scanAtm]);
+
+  // Same strikes must keep the same array. A new chain object must not resubscribe the socket.
+  const bandScanIds = useMemo(
+    () => (bandScanKey ? bandScanKey.split(",").map((s) => Number(s)) : []),
+    [bandScanKey],
+  );
+
+  // Candidate option picks: only a premium inside the selected band.
   const cePick = useMemo(() => {
-    if (!ceAllQuotes.length) return null;
     const inside = pickHighestLtp(ceAllQuotes, band.low, band.high);
-    if (inside) return { pick: inside, inBand: true };
-    const closest = pickClosestLtp(ceAllQuotes, band.low, band.high);
-    return closest ? { pick: closest, inBand: false } : null;
+    return inside ? { pick: inside, inBand: true } : null;
   }, [ceAllQuotes, band.low, band.high]);
 
   const pePick = useMemo(() => {
-    if (!peAllQuotes.length) return null;
     const inside = pickHighestLtp(peAllQuotes, band.low, band.high);
-    if (inside) return { pick: inside, inBand: true };
-    const closest = pickClosestLtp(peAllQuotes, band.low, band.high);
-    return closest ? { pick: closest, inBand: false } : null;
+    return inside ? { pick: inside, inBand: true } : null;
   }, [peAllQuotes, band.low, band.high]);
 
   const ceCandidate = cePick?.pick ?? null;
@@ -309,6 +373,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
       scaleZoom,
       barZoom,
       chartHeight,
+      rsiLimits,
       cePosition,
       pePosition,
       logs,
@@ -319,20 +384,22 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
     } catch {
       /* ignore */
     }
-  }, [qtyText, ratio, size, timeframe, scaleZoom, barZoom, chartHeight, cePosition, pePosition, logs]);
+  }, [qtyText, ratio, size, timeframe, scaleZoom, barZoom, chartHeight, rsiLimits, cePosition, pePosition, logs]);
+
+  useEffect(() => {
+    if (!limitsOpen) return;
+    const onPointer = (event: MouseEvent) => {
+      if (!limitsPopRef.current?.contains(event.target as Node)) setLimitsOpen(false);
+    };
+    window.addEventListener("mousedown", onPointer);
+    return () => window.removeEventListener("mousedown", onPointer);
+  }, [limitsOpen]);
 
   // Sync open short positions to local store for LeftPanel MTM & PositionsTable
   useEffect(() => {
     if (cePosition) rememberShort(chainRef.current, cePosition);
     if (pePosition) rememberShort(chainRef.current, pePosition);
   }, [cePosition, pePosition]);
-
-  // Fast pulse for preview and LTP refresh
-  useEffect(() => {
-    if (!active) return;
-    const id = window.setInterval(() => setPulse((n) => n + 1), 250);
-    return () => window.clearInterval(id);
-  }, [active]);
 
   // Hot focus: register candidate and open position tokens with backend for live Fyers stream
   useEffect(() => {
@@ -349,21 +416,52 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
       }
     };
 
-    if (chain.spotToken > 0 && chain.spotSegment > 0) add(chain.spotSegment, chain.spotToken);
+    // Spot/VIX stay on TopBar's index subscription. Passing the spot token here
+    // used to remap token 26000 onto the 26000-strike option and freeze every quote.
+    // The scan window is pinned once. Candidate flips must not resubscribe the socket.
     if (cePosition) add(cePosition.segment, cePosition.iid);
     if (pePosition) add(pePosition.segment, pePosition.iid);
-    if (ceCandidate) add(chain.optionSegment, ceCandidate.iid);
-    if (peCandidate) add(chain.optionSegment, peCandidate.iid);
+    for (const iid of bandScanIds) add(chain.optionSegment, iid);
 
     setHotFocus("rsi", instruments);
     return () => setHotFocus("rsi", []);
-  }, [active, nifty, chain.spotToken, chain.spotSegment, chain.optionSegment, cePosition, pePosition, ceCandidate, peCandidate]);
+  }, [active, nifty, chain.optionSegment, cePosition, pePosition, bandScanIds]);
 
-  // Fetch RSI data from backend every 5 seconds while active
+  // One quote seed when the strike window changes. Live prints come from the socket after that.
+  useEffect(() => {
+    if (!active || !nifty || bandScanIds.length === 0) return;
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const quote = (await apiFetch("/api/fyers/quotes", {
+          method: "POST",
+          body: JSON.stringify({ instrumentIds: bandScanIds }),
+        })) as { ok?: boolean; ltpMap?: Record<string, number> };
+        if (cancelled || !quote?.ltpMap) return;
+        window.dispatchEvent(
+          new CustomEvent("sonofwind_ltp_snapshot", { detail: { map: quote.ltpMap, source: "fyers" } }),
+        );
+      } catch {
+        /* socket prints cover the next update */
+      }
+    };
+    void run();
+    const id = window.setInterval(() => void run(), 45000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [active, nifty, bandScanIds]);
+
+  const liveSpotRef = useRef(liveSpotLtp);
+  liveSpotRef.current = liveSpotLtp;
+
+  // Candles are slow. Spot ticks must not restart this fetch — that was the 429 storm
+  // that blanked the chart and froze quotes.
   const fetchRsiData = useCallback(async () => {
     if (!active) return;
     try {
-      const spot = liveSpotLtp ?? undefined;
+      const spot = liveSpotRef.current ?? undefined;
       const res = (await apiFetch("/api/rsi/data", {
         method: "POST",
         body: JSON.stringify({ timeframe, liveSpot: spot }),
@@ -376,24 +474,42 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
         confirmedRsi?: number | null;
         projectedRsi?: number | null;
         liveRsi?: number | null;
+        lastConfirmedClose?: number | null;
+        lastAvgGain?: number | null;
+        lastAvgLoss?: number | null;
+        _lastAvgGain?: number | null;
+        _lastAvgLoss?: number | null;
         error?: string;
       };
 
-      if (res?.ok) {
+      const nextCandles = res?.candles || [];
+      if (res?.ok && res.source !== "synthetic" && nextCandles.length > RSI_PERIOD) {
+        const avgGain = typeof res.lastAvgGain === "number" ? res.lastAvgGain : res._lastAvgGain;
+        const avgLoss = typeof res.lastAvgLoss === "number" ? res.lastAvgLoss : res._lastAvgLoss;
+        const lastClose = res.lastConfirmedClose;
+        if (
+          typeof avgGain === "number" &&
+          Number.isFinite(avgGain) &&
+          typeof avgLoss === "number" &&
+          Number.isFinite(avgLoss) &&
+          typeof lastClose === "number" &&
+          lastClose > 0
+        ) {
+          setRsiSeed({ avgGain, avgLoss, lastClose });
+        }
         setConfirmedRsi(res.confirmedRsi ?? null);
         setProjectedRsi(res.projectedRsi ?? null);
-        setCandles(res.candles || []);
-        setSignals(res.signals || []);
+        setCandles(nextCandles);
         setBackendSource(res.source || "fyers");
         setLastFetchTs(Date.now());
         setFetchError(null);
-      } else {
+      } else if (!res?.ok) {
         setFetchError(res?.error || "Failed to load RSI data");
       }
     } catch (e: unknown) {
       setFetchError(e instanceof Error ? e.message : String(e));
     }
-  }, [active, timeframe, liveSpotLtp]);
+  }, [active, timeframe]);
 
   useEffect(() => {
     if (!active) return;
@@ -449,13 +565,10 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
         return;
       }
 
-      // Check entry threshold (60.5 for CE, 39.5 for PE)
-      const armOk = isCe ? canSellCe(liveRsi, false) : canSellPe(liveRsi, false);
-      if (!armOk) {
-        const cond = isCe ? `≤ ${RSI_CE_ARM_THRESHOLD}` : `≥ ${RSI_PE_ARM_THRESHOLD}`;
+      if (!rsiInsideLimits(liveRsi, lowerLimit, upperLimit)) {
         toast({
           title: `RSI Entry Condition Not Met`,
-          description: `START ${side} requires live RSI ${cond}. Current live RSI is ${liveRsi?.toFixed(1) ?? "──"}.`,
+          description: `START ${side} needs live RSI between ${lowerLimit} and ${upperLimit}. Current live RSI is ${liveRsi?.toFixed(1) ?? "──"}.`,
           variant: "destructive",
         });
         return;
@@ -500,7 +613,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
         busyRef.current = false;
       }
     },
-    [parsedQty, ceCandidate, peCandidate, liveRsi, size, placeOrder, pushLog],
+    [parsedQty, ceCandidate, peCandidate, liveRsi, lowerLimit, upperLimit, size, placeOrder, pushLog],
   );
 
   // EXIT CE / EXIT PE (Manual or Auto-exit)
@@ -574,7 +687,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
     }
   }, [exitPosition, pushLog]);
 
-  // Continuous Auto-Exit Watcher: monitors live RSI against 63.0 (CE) and 37.0 (PE)
+  // Stop is 3 points outside the chart lines: upper+3 for CE, lower-3 for PE.
   useEffect(() => {
     if (!active) return;
     const checkAutoExits = () => {
@@ -582,49 +695,47 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
       const currentRsi = liveRsi;
       if (currentRsi == null) return;
 
-      // CE Auto-exit: live RSI > 63
-      if (cePosRef.current && shouldAutoExitCe(currentRsi, true)) {
+      if (cePosRef.current && shouldAutoExitCe(currentRsi, true, ceSl)) {
         if (!autoExitInFlightRef.current.CE) {
-          void exitPosition("CE", `AUTO EXIT: RSI ${currentRsi.toFixed(1)} > ${RSI_CE_AUTO_EXIT}`, true);
+          void exitPosition("CE", `AUTO EXIT: RSI ${currentRsi.toFixed(1)} > ${ceSl}`, true);
         }
       }
 
-      // PE Auto-exit: live RSI < 37
-      if (pePosRef.current && shouldAutoExitPe(currentRsi, true)) {
+      if (pePosRef.current && shouldAutoExitPe(currentRsi, true, peSl)) {
         if (!autoExitInFlightRef.current.PE) {
-          void exitPosition("PE", `AUTO EXIT: RSI ${currentRsi.toFixed(1)} < ${RSI_PE_AUTO_EXIT}`, true);
+          void exitPosition("PE", `AUTO EXIT: RSI ${currentRsi.toFixed(1)} < ${peSl}`, true);
         }
       }
     };
 
     const id = window.setInterval(checkAutoExits, WATCH_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [active, liveRsi, exitPosition]);
+  }, [active, liveRsi, ceSl, peSl, exitPosition]);
 
   // Button enabled flags
   const ceStartEnabled = useMemo(() => {
     if (busy || cePosition != null || !parsedQty.ok || !ceCandidate) return false;
-    return canSellCe(liveRsi, false);
-  }, [busy, cePosition, parsedQty.ok, ceCandidate, liveRsi]);
+    return rsiInBand;
+  }, [busy, cePosition, parsedQty.ok, ceCandidate, rsiInBand]);
 
   const peStartEnabled = useMemo(() => {
     if (busy || pePosition != null || !parsedQty.ok || !peCandidate) return false;
-    return canSellPe(liveRsi, false);
-  }, [busy, pePosition, parsedQty.ok, peCandidate, liveRsi]);
+    return rsiInBand;
+  }, [busy, pePosition, parsedQty.ok, peCandidate, rsiInBand]);
 
   const rsiToneClass = useMemo(() => {
     if (liveRsi == null) return "text-muted-foreground";
-    if (liveRsi > 60) return "text-red-500 dark:text-red-400";
-    if (liveRsi < 40) return "text-emerald-500 dark:text-emerald-400";
+    if (liveRsi > upperLimit) return "text-red-500 dark:text-red-400";
+    if (liveRsi < lowerLimit) return "text-emerald-500 dark:text-emerald-400";
     return "text-cyan-500 dark:text-cyan-400";
-  }, [liveRsi]);
+  }, [liveRsi, upperLimit, lowerLimit]);
 
   const rsiZoneLabel = useMemo(() => {
     if (liveRsi == null) return "CONNECTING";
-    if (liveRsi > 60) return "OVERBOUGHT (SELL CE ZONE)";
-    if (liveRsi < 40) return "OVERSOLD (SELL PE ZONE)";
+    if (liveRsi > upperLimit) return "OVERBOUGHT (SELL CE ZONE)";
+    if (liveRsi < lowerLimit) return "OVERSOLD (SELL PE ZONE)";
     return "NEUTRAL ZONE (ARMED)";
-  }, [liveRsi]);
+  }, [liveRsi, upperLimit, lowerLimit]);
 
   // RSI Trend delta (rising vs falling points from previous confirmed candle)
   const rsiDelta = useMemo(() => {
@@ -656,11 +767,12 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
   // Vertical scale range
   const { scaleMin, scaleMax } = useMemo(() => {
     if (scaleZoom === "full") return { scaleMin: 0, scaleMax: 100 };
-    // Zoomed: Active strategy band 20 to 80 (or dynamically expanded if day range exceeds)
-    const dayMin = rsiExtremes.min != null ? Math.min(20, Math.floor(rsiExtremes.min - 3)) : 20;
-    const dayMax = rsiExtremes.max != null ? Math.max(80, Math.ceil(rsiExtremes.max + 3)) : 80;
+    const baseMin = Math.max(0, Math.floor(lowerLimit - 10));
+    const baseMax = Math.min(100, Math.ceil(upperLimit + 10));
+    const dayMin = rsiExtremes.min != null ? Math.min(baseMin, Math.floor(rsiExtremes.min - 3)) : baseMin;
+    const dayMax = rsiExtremes.max != null ? Math.max(baseMax, Math.ceil(rsiExtremes.max + 3)) : baseMax;
     return { scaleMin: Math.max(0, dayMin), scaleMax: Math.min(100, dayMax) };
-  }, [scaleZoom, rsiExtremes]);
+  }, [scaleZoom, rsiExtremes, lowerLimit, upperLimit]);
 
   // Convert RSI to CSS percentage top (0% at top, 100% at bottom)
   const rsiToPct = useCallback(
@@ -687,9 +799,37 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
 
   // Visible signals matching displayed candles
   const displayStartSec = displayCandles.length ? displayCandles[0].time : 0;
+  const levelSignals = useMemo(() => {
+    const out: RsiSignal[] = [];
+    for (let i = 1; i < candles.length; i++) {
+      const prev = candles[i - 1]?.rsi;
+      const curr = candles[i]?.rsi;
+      if (prev == null || curr == null) continue;
+      if (prev >= upperLimit && curr < upperLimit) {
+        out.push({
+          time: candles[i].time,
+          type: "CE_SELL",
+          rsi: curr,
+          spot: candles[i].close,
+          label: `CE SELL (RSI < ${upperLimit})`,
+        });
+      }
+      if (prev <= lowerLimit && curr > lowerLimit) {
+        out.push({
+          time: candles[i].time,
+          type: "PE_SELL",
+          rsi: curr,
+          spot: candles[i].close,
+          label: `PE SELL (RSI > ${lowerLimit})`,
+        });
+      }
+    }
+    return out.slice(-20);
+  }, [candles, upperLimit, lowerLimit]);
+
   const visibleSignals = useMemo(() => {
-    return signals.filter((s) => s.time >= displayStartSec - timeframe * 60);
-  }, [signals, displayStartSec, timeframe]);
+    return levelSignals.filter((s) => s.time >= displayStartSec - timeframe * 60);
+  }, [levelSignals, displayStartSec, timeframe]);
 
   // Active inspected candle for crosshair hover
   const activeInspectCandle = useMemo(() => {
@@ -849,7 +989,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                     <h3 className="text-[13px] font-black text-red-700 dark:text-red-400 tracking-wide uppercase">
                       CALL DESK (CE)
                     </h3>
-                    <span className="text-[10px] text-muted-foreground block font-medium">Bearish short entry when RSI ≤ 60.5</span>
+                    <span className="text-[10px] text-muted-foreground block font-medium">Active when RSI is {lowerLimit} to {upperLimit}</span>
                   </div>
                 </div>
 
@@ -861,11 +1001,11 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                     </span>
                   ) : ceStartEnabled ? (
                     <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/50">
-                      ✓ ARMED (RSI ≤ 60.5)
+                      ✓ ARMED ({lowerLimit}–{upperLimit})
                     </span>
                   ) : (
                     <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-secondary text-muted-foreground border border-border/60">
-                      ⏳ WAITING (RSI &gt; 60.5)
+                      ⏳ WAITING (outside {lowerLimit}–{upperLimit})
                     </span>
                   )}
                 </div>
@@ -884,14 +1024,9 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                         <span className="text-[16px] font-mono font-black text-red-600 dark:text-red-400">
                           ₹{fmtPrice(ceCandidate.ltp)}
                         </span>
-                        {!cePick?.inBand && (
-                          <span className="text-[9px] font-bold text-amber-600 dark:text-amber-400 bg-amber-500/15 px-1.5 py-0.2 rounded border border-amber-500/30">
-                            Closest
-                          </span>
-                        )}
                       </div>
                     ) : (
-                      <span className="text-muted-foreground font-semibold">Scanning strikes…</span>
+                      <span className="text-muted-foreground font-semibold">Scanning {band.label}…</span>
                     )}
                   </div>
                 </div>
@@ -919,9 +1054,9 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
 
                 <div className="flex items-center justify-between text-[10px] font-bold text-muted-foreground pt-0.5">
                   <span className="text-amber-600 dark:text-amber-400 flex items-center gap-1 font-mono">
-                    <ShieldAlert className="w-3.5 h-3.5" /> Auto-Exit: RSI &gt; {RSI_CE_AUTO_EXIT}
+                    <ShieldAlert className="w-3.5 h-3.5" /> Auto-Exit: RSI &gt; {ceSl}
                   </span>
-                  <span>Arm Rule: RSI ≤ {RSI_CE_ARM_THRESHOLD}</span>
+                  <span>Arm Rule: RSI {lowerLimit} to {upperLimit}</span>
                 </div>
               </div>
             </div>
@@ -971,7 +1106,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                     <h3 className="text-[13px] font-black text-emerald-700 dark:text-emerald-400 tracking-wide uppercase">
                       PUT DESK (PE)
                     </h3>
-                    <span className="text-[10px] text-muted-foreground block font-medium">Bullish short entry when RSI ≥ 39.5</span>
+                    <span className="text-[10px] text-muted-foreground block font-medium">Active when RSI is {lowerLimit} to {upperLimit}</span>
                   </div>
                 </div>
 
@@ -983,11 +1118,11 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                     </span>
                   ) : peStartEnabled ? (
                     <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/50">
-                      ✓ ARMED (RSI ≥ 39.5)
+                      ✓ ARMED ({lowerLimit}–{upperLimit})
                     </span>
                   ) : (
                     <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-secondary text-muted-foreground border border-border/60">
-                      ⏳ WAITING (RSI &lt; 39.5)
+                      ⏳ WAITING (outside {lowerLimit}–{upperLimit})
                     </span>
                   )}
                 </div>
@@ -1006,14 +1141,9 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                         <span className="text-[16px] font-mono font-black text-emerald-600 dark:text-emerald-400">
                           ₹{fmtPrice(peCandidate.ltp)}
                         </span>
-                        {!pePick?.inBand && (
-                          <span className="text-[9px] font-bold text-amber-600 dark:text-amber-400 bg-amber-500/15 px-1.5 py-0.2 rounded border border-amber-500/30">
-                            Closest
-                          </span>
-                        )}
                       </div>
                     ) : (
-                      <span className="text-muted-foreground font-semibold">Scanning strikes…</span>
+                      <span className="text-muted-foreground font-semibold">Scanning {band.label}…</span>
                     )}
                   </div>
                 </div>
@@ -1041,9 +1171,9 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
 
                 <div className="flex items-center justify-between text-[10px] font-bold text-muted-foreground pt-0.5">
                   <span className="text-amber-600 dark:text-amber-400 flex items-center gap-1 font-mono">
-                    <ShieldAlert className="w-3.5 h-3.5" /> Auto-Exit: RSI &lt; {RSI_PE_AUTO_EXIT}
+                    <ShieldAlert className="w-3.5 h-3.5" /> Auto-Exit: RSI &lt; {peSl}
                   </span>
-                  <span>Arm Rule: RSI ≥ {RSI_PE_ARM_THRESHOLD}</span>
+                  <span>Arm Rule: RSI {lowerLimit} to {upperLimit}</span>
                 </div>
               </div>
             </div>
@@ -1125,20 +1255,90 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
 
             {/* Chart Zoom & View Scaling Controls */}
             <div className="flex flex-wrap items-center gap-2">
-              {/* Vertical Scale Zoom (20-80 Zoom vs 0-100 Full) */}
+              <div className="relative" ref={limitsPopRef}>
+                <button
+                  type="button"
+                  onClick={() => setLimitsOpen((open) => !open)}
+                  className={`px-2 py-1 rounded-lg border text-[10px] font-black cursor-pointer flex items-center gap-1 ${
+                    limitsOpen
+                      ? "bg-cyan-600 text-white border-cyan-500"
+                      : "bg-secondary/60 text-foreground border-border/70 hover:bg-secondary"
+                  }`}
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  Limits
+                </button>
+                {limitsOpen && (
+                  <div className="absolute right-0 top-full z-40 mt-1 w-[280px] rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-xl">
+                    <div className="mb-2 text-[11px] font-black uppercase tracking-wide">RSI chart limits</div>
+                    {(
+                      [
+                        ["upper", "UpperLimit"],
+                        ["middle", "MiddleLimit"],
+                        ["lower", "LowerLimit"],
+                      ] as const
+                    ).map(([key, label]) => {
+                      const row = rsiLimits[key];
+                      return (
+                        <div key={key} className="mb-2 flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={row.enabled}
+                            onChange={(e) =>
+                              setRsiLimits((prev) => ({ ...prev, [key]: { ...prev[key], enabled: e.target.checked } }))
+                            }
+                            className="h-3.5 w-3.5 accent-cyan-600"
+                          />
+                          <span className="w-[78px] text-[11px] font-semibold">{label}</span>
+                          <input
+                            type="color"
+                            value={row.color}
+                            onChange={(e) =>
+                              setRsiLimits((prev) => ({ ...prev, [key]: { ...prev[key], color: e.target.value } }))
+                            }
+                            className="h-6 w-8 cursor-pointer rounded border border-border bg-transparent p-0"
+                            aria-label={`${label} color`}
+                          />
+                          <span className="w-7 border-t-2 border-dashed" style={{ borderColor: row.color }} />
+                          <input
+                            type="number"
+                            min={0}
+                            max={100}
+                            step={1}
+                            value={row.value}
+                            onChange={(e) => {
+                              const next = Number(e.target.value);
+                              if (!Number.isFinite(next)) return;
+                              const value = Math.max(0, Math.min(100, next));
+                              setRsiLimits((prev) => ({ ...prev, [key]: { ...prev[key], value } }));
+                            }}
+                            className="w-14 rounded border border-border bg-background px-1.5 py-0.5 text-right font-mono text-[12px]"
+                          />
+                        </div>
+                      );
+                    })}
+                    <div className="mt-1 text-[10px] text-muted-foreground">
+                      {limitsAreOrdered(rsiLimits)
+                        ? `CE SL ${ceSl} (upper + 3) · PE SL ${peSl} (lower − 3)`
+                        : "Upper must stay above Middle, and Middle above Lower."}
+                    </div>
+                  </div>
+                )}
+              </div>
+              {/* Vertical Scale Zoom */}
               <div className="flex items-center gap-0.5 bg-secondary/60 p-0.5 rounded-lg border border-border/70 text-[10px]">
                 <span className="text-muted-foreground px-1 font-bold">Scale:</span>
                 <button
                   type="button"
                   onClick={() => setScaleZoom("zoomed")}
-                  title="Zoom into 20-80 active trading range"
+                  title="Zoom around the selected RSI limits"
                   className={`px-1.5 py-0.5 rounded font-black cursor-pointer transition-all ${
                     scaleZoom === "zoomed"
                       ? "bg-cyan-600 text-white shadow-xs font-black"
                       : "text-muted-foreground hover:text-foreground hover:bg-secondary"
                   }`}
                 >
-                  20-80 Zoom
+                  Band Zoom
                 </button>
                 <button
                   type="button"
@@ -1222,9 +1422,9 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                     RSI:{" "}
                     <span
                       className={`font-black ${
-                        activeInspectCandle.rsi != null && activeInspectCandle.rsi > 60
+                        activeInspectCandle.rsi != null && activeInspectCandle.rsi > upperLimit
                           ? "text-red-500"
-                          : activeInspectCandle.rsi != null && activeInspectCandle.rsi < 40
+                          : activeInspectCandle.rsi != null && activeInspectCandle.rsi < lowerLimit
                             ? "text-emerald-500"
                             : "text-cyan-500"
                       }`}
@@ -1243,9 +1443,9 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
             <div className="flex items-center gap-2">
               <span
                 className={`px-2 py-0.5 rounded font-black flex items-center gap-1 ${
-                  liveRsi != null && liveRsi > 60
+                  liveRsi != null && liveRsi > upperLimit
                     ? "bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/40"
-                    : liveRsi != null && liveRsi < 40
+                    : liveRsi != null && liveRsi < lowerLimit
                       ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/40"
                       : "bg-cyan-500/15 text-cyan-600 dark:text-cyan-400 border border-cyan-500/30"
                 }`}
@@ -1267,16 +1467,16 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
             {/* Center: Distance to Action Triggers */}
             <div className="flex items-center gap-3 text-muted-foreground font-semibold">
               <span>
-                To 60 CE Sell:{" "}
+                To {upperLimit} CE Sell:{" "}
                 <span className="font-bold text-foreground font-mono">
-                  {liveRsi != null ? (liveRsi >= 60 ? "TRIGGER ACTIVE" : `${(60 - liveRsi).toFixed(1)} pts away`) : "──"}
+                  {liveRsi != null ? (liveRsi >= upperLimit ? "TRIGGER ACTIVE" : `${(upperLimit - liveRsi).toFixed(1)} pts away`) : "──"}
                 </span>
               </span>
               <span>•</span>
               <span>
-                To 40 PE Sell:{" "}
+                To {lowerLimit} PE Sell:{" "}
                 <span className="font-bold text-foreground font-mono">
-                  {liveRsi != null ? (liveRsi <= 40 ? "TRIGGER ACTIVE" : `${(liveRsi - 40).toFixed(1)} pts away`) : "──"}
+                  {liveRsi != null ? (liveRsi <= lowerLimit ? "TRIGGER ACTIVE" : `${(liveRsi - lowerLimit).toFixed(1)} pts away`) : "──"}
                 </span>
               </span>
             </div>
@@ -1309,30 +1509,27 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                 onMouseLeave={() => setHoverIdx(null)}
               >
                 {/* Horizontal Background Zones with Subtle Watermarks */}
-                {/* Overbought Zone (60 - 100) */}
                 <div
                   className="absolute inset-x-0 top-0 bg-red-500/[0.04] border-b border-red-500/25 pointer-events-none"
-                  style={{ height: `${rsiToPct(60)}%` }}
+                  style={{ height: `${rsiToPct(upperLimit)}%` }}
                 >
                   <span className="absolute top-2 left-3 text-[9px] font-black text-red-500/35 uppercase tracking-widest select-none">
                     Bearish Reversal Zone (Sell CE Area)
                   </span>
                 </div>
 
-                {/* Neutral Channel (40 - 60) */}
                 <div
                   className="absolute inset-x-0 bg-cyan-500/[0.02] border-b border-emerald-500/25 pointer-events-none"
-                  style={{ top: `${rsiToPct(60)}%`, height: `${rsiToPct(40) - rsiToPct(60)}%` }}
+                  style={{ top: `${rsiToPct(upperLimit)}%`, height: `${rsiToPct(lowerLimit) - rsiToPct(upperLimit)}%` }}
                 >
                   <span className="absolute top-1/2 -translate-y-1/2 left-3 text-[9px] font-black text-muted-foreground/25 uppercase tracking-widest select-none">
-                    Neutral Consolidation Channel (40 - 60)
+                    Neutral Consolidation Channel ({lowerLimit} - {upperLimit})
                   </span>
                 </div>
 
-                {/* Oversold Zone (0 - 40) */}
                 <div
                   className="absolute inset-x-0 bottom-0 bg-emerald-500/[0.04] pointer-events-none"
-                  style={{ top: `${rsiToPct(40)}%`, height: `${100 - rsiToPct(40)}%` }}
+                  style={{ top: `${rsiToPct(lowerLimit)}%`, height: `${100 - rsiToPct(lowerLimit)}%` }}
                 >
                   <span className="absolute bottom-2 left-3 text-[9px] font-black text-emerald-500/35 uppercase tracking-widest select-none">
                     Bullish Reversal Zone (Sell PE Area)
@@ -1340,40 +1537,37 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                 </div>
 
                 {/* Reference Guideline Lines (Clean, Crisp, Non-Overlapping) */}
-                {/* 63 CE Auto-Exit Line */}
                 <div
                   className="absolute inset-x-0 border-t border-dotted border-amber-500/70 pointer-events-none"
-                  style={{ top: `${rsiToPct(63)}%` }}
+                  style={{ top: `${rsiToPct(ceSl)}%` }}
                 />
-
-                {/* 60 CE Sell Line */}
-                <div
-                  className="absolute inset-x-0 border-t border-dashed border-red-500/80 pointer-events-none"
-                  style={{ top: `${rsiToPct(60)}%` }}
-                />
-
-                {/* 50 Center Guideline */}
-                <div
-                  className="absolute inset-x-0 border-t border-dotted border-border/80 pointer-events-none"
-                  style={{ top: `${rsiToPct(50)}%` }}
-                />
-
-                {/* 40 PE Sell Line */}
-                <div
-                  className="absolute inset-x-0 border-t border-dashed border-emerald-500/80 pointer-events-none"
-                  style={{ top: `${rsiToPct(40)}%` }}
-                />
-
-                {/* 37 PE Auto-Exit Line */}
+                {activeLimits.upper.enabled && (
+                  <div
+                    className="absolute inset-x-0 border-t border-dashed pointer-events-none"
+                    style={{ top: `${rsiToPct(upperLimit)}%`, borderColor: activeLimits.upper.color }}
+                  />
+                )}
+                {activeLimits.middle.enabled && (
+                  <div
+                    className="absolute inset-x-0 border-t border-dotted pointer-events-none"
+                    style={{ top: `${rsiToPct(middleLimit)}%`, borderColor: activeLimits.middle.color }}
+                  />
+                )}
+                {activeLimits.lower.enabled && (
+                  <div
+                    className="absolute inset-x-0 border-t border-dashed pointer-events-none"
+                    style={{ top: `${rsiToPct(lowerLimit)}%`, borderColor: activeLimits.lower.color }}
+                  />
+                )}
                 <div
                   className="absolute inset-x-0 border-t border-dotted border-amber-500/70 pointer-events-none"
-                  style={{ top: `${rsiToPct(37)}%` }}
+                  style={{ top: `${rsiToPct(peSl)}%` }}
                 />
 
                 {/* Real-time Live RSI Tracking Line */}
                 {liveRsi != null && (
                   <div
-                    className="absolute inset-x-0 border-t border-dashed border-cyan-400/80 pointer-events-none transition-all duration-300 z-10"
+                    className="absolute inset-x-0 border-t border-dashed border-cyan-400/80 pointer-events-none z-10"
                     style={{ top: `${rsiToPct(liveRsi)}%` }}
                   />
                 )}
@@ -1474,53 +1668,60 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                   {scaleMax} {scaleMax >= 80 ? "OB" : ""}
                 </div>
 
-                {/* 63 Exit CE Tag (Anchored to the RIGHT) */}
                 <div
                   className="absolute right-3 -translate-y-1/2 flex items-center z-10"
-                  style={{ top: `${rsiToPct(63)}%` }}
+                  style={{ top: `${rsiToPct(ceSl)}%` }}
                 >
                   <span className="px-1.5 py-0.5 rounded text-[9px] font-black bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/50 shadow-2xs whitespace-nowrap">
-                    63.0 EXIT
+                    {ceSl.toFixed(1)} EXIT
                   </span>
                 </div>
 
-                {/* 60 Sell CE Tag (Anchored with 16px Left Spacing from Divider) */}
-                <div
-                  className="absolute left-4 -translate-y-1/2 flex items-center z-10"
-                  style={{ top: `${rsiToPct(60)}%` }}
-                >
-                  <span className="px-1.5 py-0.5 rounded text-[9px] font-black bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/50 shadow-2xs whitespace-nowrap">
-                    60.0 SELL
-                  </span>
-                </div>
+                {activeLimits.upper.enabled && (
+                  <div
+                    className="absolute left-4 -translate-y-1/2 flex items-center z-10"
+                    style={{ top: `${rsiToPct(upperLimit)}%` }}
+                  >
+                    <span
+                      className="px-1.5 py-0.5 rounded text-[9px] font-black border shadow-2xs whitespace-nowrap"
+                      style={{ color: activeLimits.upper.color, borderColor: activeLimits.upper.color }}
+                    >
+                      {upperLimit.toFixed(1)} SELL
+                    </span>
+                  </div>
+                )}
 
-                {/* 50 Center Reference */}
-                <div
-                  className="absolute left-4 -translate-y-1/2 flex items-center"
-                  style={{ top: `${rsiToPct(50)}%` }}
-                >
-                  <span className="text-[9px] font-bold text-muted-foreground">
-                    50.0 MID
-                  </span>
-                </div>
+                {activeLimits.middle.enabled && (
+                  <div
+                    className="absolute left-4 -translate-y-1/2 flex items-center"
+                    style={{ top: `${rsiToPct(middleLimit)}%` }}
+                  >
+                    <span className="text-[9px] font-bold" style={{ color: activeLimits.middle.color }}>
+                      {middleLimit.toFixed(1)} MID
+                    </span>
+                  </div>
+                )}
 
-                {/* 40 Sell PE Tag (Anchored with 16px Left Spacing from Divider) */}
-                <div
-                  className="absolute left-4 -translate-y-1/2 flex items-center z-10"
-                  style={{ top: `${rsiToPct(40)}%` }}
-                >
-                  <span className="px-1.5 py-0.5 rounded text-[9px] font-black bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/50 shadow-2xs whitespace-nowrap">
-                    40.0 SELL
-                  </span>
-                </div>
+                {activeLimits.lower.enabled && (
+                  <div
+                    className="absolute left-4 -translate-y-1/2 flex items-center z-10"
+                    style={{ top: `${rsiToPct(lowerLimit)}%` }}
+                  >
+                    <span
+                      className="px-1.5 py-0.5 rounded text-[9px] font-black border shadow-2xs whitespace-nowrap"
+                      style={{ color: activeLimits.lower.color, borderColor: activeLimits.lower.color }}
+                    >
+                      {lowerLimit.toFixed(1)} SELL
+                    </span>
+                  </div>
+                )}
 
-                {/* 37 Exit PE Tag (Anchored to the RIGHT) */}
                 <div
                   className="absolute right-3 -translate-y-1/2 flex items-center z-10"
-                  style={{ top: `${rsiToPct(37)}%` }}
+                  style={{ top: `${rsiToPct(peSl)}%` }}
                 >
                   <span className="px-1.5 py-0.5 rounded text-[9px] font-black bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/50 shadow-2xs whitespace-nowrap">
-                    37.0 EXIT
+                    {peSl.toFixed(1)} EXIT
                   </span>
                 </div>
 
@@ -1532,7 +1733,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                 {/* Dynamic Real-time Live RSI Badge with comfortable 12px Left Clearance */}
                 {liveRsi != null && (
                   <div
-                    className="absolute left-3 right-3 -translate-y-1/2 z-30 flex items-center justify-center transition-all duration-300"
+                    className="absolute left-3 right-3 -translate-y-1/2 z-30 flex items-center justify-center"
                     style={{ top: `${rsiToPct(liveRsi)}%` }}
                   >
                     <span className="w-full text-center px-1.5 py-0.5 rounded text-[11px] font-black bg-cyan-600 text-white shadow-xl border border-cyan-300 ring-2 ring-cyan-500/40">
@@ -1561,7 +1762,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                 )}
               </div>
               <span className="w-[140px] text-right font-bold text-foreground">
-                {scaleZoom === "zoomed" ? "ZOOM 20-80" : "FULL 0-100"}
+                {scaleZoom === "zoomed" ? `ZOOM ${Math.round(scaleMin)}-${Math.round(scaleMax)}` : "FULL 0-100"}
               </span>
             </div>
           </div>
@@ -1611,11 +1812,11 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
             )}
           </div>
 
-          {signals.length > 0 && (
+          {levelSignals.length > 0 && (
             <div className="mt-2.5 pt-1.5 border-t border-border/60 text-[10px] text-muted-foreground flex items-center justify-between font-mono">
               <span className="font-semibold">Last Closed Signal:</span>
               <span className="font-black text-foreground">
-                {signals[signals.length - 1].type} @ RSI {signals[signals.length - 1].rsi.toFixed(1)}
+                {levelSignals[levelSignals.length - 1].type} @ RSI {levelSignals[levelSignals.length - 1].rsi.toFixed(1)}
               </span>
             </div>
           )}

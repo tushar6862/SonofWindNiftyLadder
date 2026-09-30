@@ -6,25 +6,34 @@ export const FastLtp = memo(function FastLtp({
   iid,
   className,
   as: Tag = "span",
+  min = 0,
 }: {
   iid: number | null | undefined;
   className?: string;
   as?: "span" | "div";
+  /** Ignore prints below this (index spot must not paint an option tick). */
+  min?: number;
 }) {
   const ref = useRef<HTMLElement | null>(null);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
+    const paint = (px: number | null) => {
+      const node = ref.current;
+      if (!node) return;
+      if (px == null || !Number.isFinite(px) || px < min) {
+        const cur = Number(node.textContent);
+        if (!(cur >= min)) node.textContent = "—";
+        return;
+      }
+      node.textContent = px.toFixed(2);
+    };
     if (iid == null || !Number.isFinite(iid) || iid <= 0) {
       el.textContent = "—";
       return;
     }
-    const cur = peekLiveLtp(iid);
-    el.textContent = cur != null ? cur.toFixed(2) : "—";
-    return subscribeLiveLtp(iid, (px) => {
-      const node = ref.current;
-      if (node) node.textContent = px.toFixed(2);
-    });
-  }, [iid]);
+    paint(peekLiveLtp(iid));
+    return subscribeLiveLtp(iid, paint);
+  }, [iid, min]);
   return <Tag ref={ref as never} className={className} />;
 });

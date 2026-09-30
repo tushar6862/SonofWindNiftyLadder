@@ -9,17 +9,55 @@ export const LOT_SIZE = 65;
 export const DEFAULT_QTY = 780;
 export const RSI_PERIOD = 14;
 
-// Manual entry button arming thresholds
-export const RSI_CE_ARM_THRESHOLD = 60.5; // Manual Sell CE enabled when live RSI <= 60.5
-export const RSI_PE_ARM_THRESHOLD = 39.5; // Manual Sell PE enabled when live RSI >= 39.5
+/** Chart guide lines. Stop sits 3 points outside the outer lines. */
+export const RSI_SL_GAP = 3;
+export const RSI_ARM_GAP = 0.5;
 
-// Confirmed candle signal crossover thresholds
-export const RSI_CE_CROSS_THRESHOLD = 60.0; // Confirmed cross below 60 -> CE_SELL event
-export const RSI_PE_CROSS_THRESHOLD = 40.0; // Confirmed cross above 40 -> PE_SELL event
+export type RsiLimitLine = {
+  enabled: boolean;
+  color: string;
+  value: number;
+};
 
-// Automatic RSI-triggered exit thresholds
-export const RSI_CE_AUTO_EXIT = 63.0; // Open CE bought back when live RSI > 63
-export const RSI_PE_AUTO_EXIT = 37.0; // Open PE bought back when live RSI < 37
+export type RsiChartLimits = {
+  upper: RsiLimitLine;
+  middle: RsiLimitLine;
+  lower: RsiLimitLine;
+};
+
+export const DEFAULT_RSI_LIMITS: RsiChartLimits = {
+  upper: { enabled: true, color: "#ef4444", value: 70 },
+  middle: { enabled: true, color: "#94a3b8", value: 50 },
+  lower: { enabled: true, color: "#22c55e", value: 30 },
+};
+
+export function limitsAreOrdered(limits: RsiChartLimits): boolean {
+  return limits.lower.value < limits.middle.value && limits.middle.value < limits.upper.value;
+}
+
+export function ceArmFromUpper(upper: number): number {
+  return Math.round((upper + RSI_ARM_GAP) * 10) / 10;
+}
+
+export function peArmFromLower(lower: number): number {
+  return Math.round((lower - RSI_ARM_GAP) * 10) / 10;
+}
+
+export function ceSlFromUpper(upper: number): number {
+  return Math.round((upper + RSI_SL_GAP) * 10) / 10;
+}
+
+export function peSlFromLower(lower: number): number {
+  return Math.round((lower - RSI_SL_GAP) * 10) / 10;
+}
+
+// Defaults match a 30 / 50 / 70 chart. Live values come from the limit popup.
+export const RSI_CE_ARM_THRESHOLD = ceArmFromUpper(DEFAULT_RSI_LIMITS.upper.value);
+export const RSI_PE_ARM_THRESHOLD = peArmFromLower(DEFAULT_RSI_LIMITS.lower.value);
+export const RSI_CE_CROSS_THRESHOLD = DEFAULT_RSI_LIMITS.upper.value;
+export const RSI_PE_CROSS_THRESHOLD = DEFAULT_RSI_LIMITS.lower.value;
+export const RSI_CE_AUTO_EXIT = ceSlFromUpper(DEFAULT_RSI_LIMITS.upper.value);
+export const RSI_PE_AUTO_EXIT = peSlFromLower(DEFAULT_RSI_LIMITS.lower.value);
 
 export const TIMEFRAMES = [1, 2, 3, 5, 10, 15, 30] as const;
 export type RsiTimeframe = (typeof TIMEFRAMES)[number];
@@ -138,27 +176,34 @@ export function shortMtm(fill: number, liveLtp: number, qty: number): number {
 }
 
 /** Entry enable checks based on live RSI and position status */
-export function canSellCe(liveRsi: number | null, hasCePosition: boolean): boolean {
-  if (hasCePosition) return false;
+/** Both START CE and START PE arm while live RSI is inside the selected chart limits. */
+export function rsiInsideLimits(liveRsi: number | null, lower: number, upper: number): boolean {
   if (liveRsi == null || !Number.isFinite(liveRsi)) return false;
-  return liveRsi <= RSI_CE_ARM_THRESHOLD;
+  if (!Number.isFinite(lower) || !Number.isFinite(upper) || lower > upper) return false;
+  return liveRsi >= lower && liveRsi <= upper;
 }
 
-export function canSellPe(liveRsi: number | null, hasPePosition: boolean): boolean {
+export function canSellCe(liveRsi: number | null, hasCePosition: boolean, arm = RSI_CE_ARM_THRESHOLD): boolean {
+  if (hasCePosition) return false;
+  if (liveRsi == null || !Number.isFinite(liveRsi)) return false;
+  return liveRsi <= arm;
+}
+
+export function canSellPe(liveRsi: number | null, hasPePosition: boolean, arm = RSI_PE_ARM_THRESHOLD): boolean {
   if (hasPePosition) return false;
   if (liveRsi == null || !Number.isFinite(liveRsi)) return false;
-  return liveRsi >= RSI_PE_ARM_THRESHOLD;
+  return liveRsi >= arm;
 }
 
 /** Auto-exit checks on live/projected RSI */
-export function shouldAutoExitCe(liveRsi: number | null, hasCePosition: boolean): boolean {
+export function shouldAutoExitCe(liveRsi: number | null, hasCePosition: boolean, stop = RSI_CE_AUTO_EXIT): boolean {
   if (!hasCePosition || liveRsi == null || !Number.isFinite(liveRsi)) return false;
-  return liveRsi > RSI_CE_AUTO_EXIT;
+  return liveRsi > stop;
 }
 
-export function shouldAutoExitPe(liveRsi: number | null, hasPePosition: boolean): boolean {
+export function shouldAutoExitPe(liveRsi: number | null, hasPePosition: boolean, stop = RSI_PE_AUTO_EXIT): boolean {
   if (!hasPePosition || liveRsi == null || !Number.isFinite(liveRsi)) return false;
-  return liveRsi < RSI_PE_AUTO_EXIT;
+  return liveRsi < stop;
 }
 
 /** Client-side Wilder RSI calculation helper for projection */
