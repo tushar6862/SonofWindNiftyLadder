@@ -102,9 +102,69 @@ const SEG_NAME: Record<number, string> = {
 };
 
 const localShorts = new Map<number, Record<string, unknown>>();
+/** Closed here, but the broker snapshot can still show the old qty while positions are rate-limited. */
+const SQUARED_KEY = "sow_squared_mtm_v1";
+const squaredBook = new Map<number, number | null>();
+
+function loadSquaredBook(): void {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    const raw = JSON.parse(sessionStorage.getItem(SQUARED_KEY) || "[]") as Array<{ iid?: number; pnl?: number | null }>;
+    if (!Array.isArray(raw)) return;
+    for (const row of raw) {
+      const iid = Math.floor(Number(row?.iid) || 0);
+      if (!(iid > 0)) continue;
+      const pnl = row?.pnl;
+      squaredBook.set(iid, typeof pnl === "number" && Number.isFinite(pnl) ? pnl : null);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function saveSquaredBook(): void {
+  if (typeof sessionStorage === "undefined") return;
+  const rows = Array.from(squaredBook.entries()).map(([iid, pnl]) => ({ iid, pnl }));
+  try {
+    sessionStorage.setItem(SQUARED_KEY, JSON.stringify(rows));
+  } catch {
+    /* ignore */
+  }
+}
+
+loadSquaredBook();
+
+function forceBookFlat(row: Record<string, unknown>, pnl: number | null): Record<string, unknown> {
+  const next: Record<string, unknown> = {
+    ...row,
+    NetPosition: 0,
+    netPosition: 0,
+    Quantity: 0,
+    quantity: 0,
+    NetQuantity: 0,
+    netQuantity: 0,
+    OpenSellQuantity: 0,
+    openSellQuantity: 0,
+    OpenBuyQuantity: 0,
+    openBuyQuantity: 0,
+    ShortPosition: 0,
+    LongPosition: 0,
+  };
+  if (pnl != null && Number.isFinite(pnl)) {
+    next.ActualMarkToMarket = pnl;
+    next.actualMarkToMarket = pnl;
+    next.MarkToMarket = pnl;
+    next.markToMarket = pnl;
+    next.MTM = pnl;
+    next.mtm = pnl;
+    next.NetAmount = pnl;
+    next.netAmount = pnl;
+  }
+  return next;
+}
 
 function overlayIid(row: Record<string, unknown>): number | null {
-  const v = row.ExchangeInstrumentID ?? row.ExchangeInstrumentId ?? row.exchangeInstrumentID;
+  const v = row.ExchangeInstrumentID ?? row.ExchangeInstrumentId ?? row.exchangeInstrumentID ?? row.exchangeInstrumentId;
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
 }
@@ -159,7 +219,7 @@ function readPositionList(data: unknown): Record<string, unknown>[] {
 }
 
 function applyLocalPositionOverlay(data: unknown): unknown {
-  if (localShorts.size === 0) return data;
+  if (localShorts.size === 0 && squaredBook.size === 0) return data;
   const cloned = clonePositionsPayload(data);
   const broker = readPositionList(cloned);
   const keepBroker: Record<string, unknown>[] = [];
@@ -167,6 +227,14 @@ function applyLocalPositionOverlay(data: unknown): unknown {
   for (const row of broker) {
     const iid = overlayIid(row);
     const net = overlayNet(row);
+    if (iid != null && squaredBook.has(iid)) {
+      // Keep the freeze until a new short is taken. A later stale snapshot
+      // often brings the old qty back after one flat read.
+      if (net === 0) keepBroker.push(row);
+      else keepBroker.push(forceBookFlat(row, squaredBook.get(iid) ?? null));
+      seen.add(iid);
+      continue;
+    }
     if (iid != null && net < 0) {
       localShorts.delete(iid);
       seen.add(iid);
@@ -178,7 +246,8 @@ function applyLocalPositionOverlay(data: unknown): unknown {
     if (seen.has(iid)) continue;
     extra.push(row);
   }
-  if (!extra.length) return cloned;
+  const flattened = keepBroker.some((row, i) => row !== broker[i]);
+  if (!extra.length && !flattened) return cloned;
   return patchPositionList(cloned, [...keepBroker, ...extra]);
 }
 
@@ -219,14 +288,31 @@ export function setLocalShortPosition(opts: {
     OpenBuyQuantity: 0,
     SellAveragePrice: opts.fillPx,
     AveragePrice: opts.fillPx,
+    _sowLocal: true,
   };
   const same = prev && JSON.stringify(prev) === JSON.stringify(row);
+  squaredBook.delete(iid);
+  saveSquaredBook();
   localShorts.set(iid, row);
   if (!same) emitPosRefresh();
 }
 
-export function clearLocalPosition(exchangeInstrumentID: number): void {
+/** Booked close for this instrument. Null pnl means flatten qty and keep the broker number. */
+export function squaredMark(exchangeInstrumentID: number): { pnl: number | null } | null {
   const iid = Math.floor(exchangeInstrumentID);
-  if (!localShorts.delete(iid)) return;
+  if (!(iid > 0) || !squaredBook.has(iid)) return null;
+  const pnl = squaredBook.get(iid);
+  return { pnl: typeof pnl === "number" && Number.isFinite(pnl) ? pnl : null };
+}
+
+export function clearLocalPosition(exchangeInstrumentID: number, bookedPnl?: number): void {
+  const iid = Math.floor(exchangeInstrumentID);
+  if (!(iid > 0)) return;
+  localShorts.delete(iid);
+  const prev = squaredBook.get(iid);
+  const base = typeof prev === "number" && Number.isFinite(prev) ? prev : 0;
+  if (typeof bookedPnl === "number" && Number.isFinite(bookedPnl)) squaredBook.set(iid, base + bookedPnl);
+  else if (!squaredBook.has(iid)) squaredBook.set(iid, null);
+  saveSquaredBook();
   emitPosRefresh();
 }

@@ -78,6 +78,20 @@ export function ixOrderPricing(side: "BUY" | "SELL", ltp: number | null | undefi
   };
 }
 
+/** RSI entry and exit: DAY limit at the price on screen, a couple of ticks through so it fills. */
+export function rsiDayOrderPricing(side: "BUY" | "SELL", ltp: number | null | undefined) {
+  const live = typeof ltp === "number" && Number.isFinite(ltp) && ltp > 0 ? ltp : 0;
+  const through = OPTION_TICK * 2;
+  const raw = live > 0 ? (side === "BUY" ? live + through : live - through) : 0;
+  return {
+    orderType: "LIMIT" as const,
+    timeInForce: "DAY" as const,
+    limitPrice: raw > 0 ? roundLimitToTick(raw, side) : 0,
+    liveReprice: false as const,
+    ...(live > 0 ? { ltp: live } : {}),
+  };
+}
+
 export function ladderOrderPricing(
   side: "BUY" | "SELL",
   ltp: number | null | undefined,

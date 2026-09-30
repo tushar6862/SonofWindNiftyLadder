@@ -277,7 +277,7 @@ export default function NiftyFlipPanel({ chain, active }: { chain: ChainResolved
         positivePx(peekTouchPx(pos.iid)) ??
         pos.fill;
       const bookedMtm = shortMtm(pos.fill, bookPx, pos.qty);
-      clearLocalPosition(pos.iid);
+      clearLocalPosition(pos.iid, bookedMtm);
       const strike = Math.round(pos.strike).toLocaleString("en-IN");
       pushLog(
         `BUY ${strike} ${pos.side} × ${fmtQty(pos.qty)} @ ${fmtPrice(bookPx)} · MTM ${fmtPnl(bookedMtm)}`,

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RefreshCw, ChevronDown, ChevronUp, Eye, EyeOff } from "lucide-react";
 import { apiFetch } from "@/lib/backend";
-import { bumpPositionsRefresh, fetchIxPositions, POSITIONS_REFRESH_EVENT } from "@/lib/ixPortfolio";
+import { bumpPositionsRefresh, fetchIxPositions, POSITIONS_REFRESH_EVENT, squaredMark } from "@/lib/ixPortfolio";
 import { subscribeMdTouchline } from "@/lib/mdRegistry";
 import { useLiveLtp, peekLiveLtp } from "@/context/LiveLtpContext";
 import { toast } from "@/hooks/use-toast";
@@ -63,12 +63,14 @@ function brokerDayMtm(p: Record<string, unknown>): number | null {
 }
 
 function positionLiveMtm(p: Record<string, unknown>, ltpMap: Record<number, number>): number {
+  // XTS Net Position MTM: open qty only. Closed trades and local fills that
+  // never reached the broker stay at 0, same as the XTS status-bar MTM.
+  if (p._sowLocal === true) return 0;
   const qty = positionNetQty(p);
   const broker = brokerDayMtm(p);
-  // Squared books (NetQty 0) still carry day MTM in XTS — that is the 7,042.75 total.
-  if (!qty) return broker ?? 0;
-
   const iid = positionIid(p);
+  if (iid != null && squaredMark(iid)) return 0;
+  if (!qty) return 0;
   const peeked = iid != null ? peekLiveLtp(iid) : null;
   const mapped = iid != null ? ltpMap[iid] : undefined;
   const ltp =

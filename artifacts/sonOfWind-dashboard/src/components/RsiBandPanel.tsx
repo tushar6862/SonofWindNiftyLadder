@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChainResolved } from "@/types/market";
-import { peekLiveTick, useLiveLtp } from "@/context/LiveLtpContext";
+import { useLiveLtp } from "@/context/LiveLtpContext";
 import { peekTouchPx } from "@/lib/liveQuote";
 import { plausibleSpotPx } from "@/lib/liveAtmStrike";
 import { setHotFocus } from "@/lib/hotFocus";
 import { fmtPnl, fmtPrice, fmtQty } from "@/lib/formatNumber";
 import { apiFetch } from "@/lib/backend";
 import { bumpPositionsRefresh, clearLocalPosition, setLocalShortPosition } from "@/lib/ixPortfolio";
-import { expectedLadderFill, ixOrderRejectedMessage, ladderOrderPricing, XTS_IX_ORDER_BASE } from "@/lib/xtsOrder";
+import { expectedLadderFill, ixOrderRejectedMessage, rsiDayOrderPricing, XTS_IX_ORDER_BASE } from "@/lib/xtsOrder";
 import { toast } from "@/hooks/use-toast";
 import {
   DEFAULT_QTY,
@@ -521,13 +521,12 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
   // Execute order via XTS API
   const placeOrder = useCallback(
     async (side: "BUY" | "SELL", instrumentId: number, qty: number, segment: number) => {
-      const tick = peekLiveTick(instrumentId);
       const ltp = peekTouchPx(instrumentId, ltps);
       const response = (await apiFetch("/api/ix/place_order", {
         method: "POST",
         body: JSON.stringify({
           ...XTS_IX_ORDER_BASE,
-          ...ladderOrderPricing(side, ltp, tick?.bid, tick?.ask),
+          ...rsiDayOrderPricing(side, ltp),
           exchangeSegment: segment,
           exchangeInstrumentID: instrumentId,
           orderSide: side,
@@ -538,8 +537,8 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
       if (rejected) throw new Error(rejected);
       bumpPositionsRefresh();
       const hintLtp = positivePx(response?.fillHint?.ltp) ?? ltp;
-      const hintBid = positivePx(response?.fillHint?.bid) ?? positivePx(tick?.bid);
-      const hintAsk = positivePx(response?.fillHint?.ask) ?? positivePx(tick?.ask);
+      const hintBid = positivePx(response?.fillHint?.bid);
+      const hintAsk = positivePx(response?.fillHint?.ask);
       return { ltp: hintLtp, bid: hintBid, ask: hintAsk };
     },
     [ltps],
@@ -637,7 +636,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
           positivePx(peekTouchPx(pos.iid, ltps)) ??
           pos.fill;
         const pnl = shortMtm(pos.fill, exitPx, pos.qty);
-        clearLocalPosition(pos.iid);
+        clearLocalPosition(pos.iid, pnl);
 
         if (side === "CE") setCePosition(null);
         else setPePosition(null);
