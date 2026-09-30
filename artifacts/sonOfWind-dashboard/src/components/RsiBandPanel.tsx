@@ -687,7 +687,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
     }
   }, [exitPosition, pushLog]);
 
-  // Stop is 3 points outside the chart lines: upper+3 for CE, lower-3 for PE.
+  // Stop is 5 points outside the chart lines: upper+5 for CE, lower-5 for PE.
   useEffect(() => {
     if (!active) return;
     const checkAutoExits = () => {
@@ -1319,7 +1319,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                     })}
                     <div className="mt-1 text-[10px] text-muted-foreground">
                       {limitsAreOrdered(rsiLimits)
-                        ? `CE SL ${ceSl} (upper + 3) · PE SL ${peSl} (lower − 3)`
+                        ? `CE SL ${ceSl} (upper + 5) · PE SL ${peSl} (lower − 5)`
                         : "Upper must stay above Middle, and Middle above Lower."}
                     </div>
                   </div>

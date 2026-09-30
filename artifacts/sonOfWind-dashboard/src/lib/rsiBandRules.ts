@@ -9,8 +9,8 @@ export const LOT_SIZE = 65;
 export const DEFAULT_QTY = 780;
 export const RSI_PERIOD = 14;
 
-/** Chart guide lines. Stop sits 3 points outside the outer lines. */
-export const RSI_SL_GAP = 3;
+/** Chart guide lines. Stop sits 5 points outside the outer lines. */
+export const RSI_SL_GAP = 5;
 export const RSI_ARM_GAP = 0.5;
 
 export type RsiLimitLine = {
