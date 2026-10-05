@@ -290,3 +290,33 @@ class XtsInteractiveClient:
             payload["clientID"] = client_id
         return self._post("/interactive/orders", payload=payload)
 
+    def cancel_order(
+        self,
+        *,
+        app_order_id: str,
+        order_unique_identifier: str = "",
+        client_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Cancel Order
+        Route (SDK): DELETE /interactive/orders?appOrderID=
+        """
+        if not self._xts or not str(getattr(self._xts, "token", "") or "").strip():
+            raise RuntimeError("XTS interactive session has no token — login required")
+        params: dict[str, Any] = {"appOrderID": str(app_order_id)}
+        if order_unique_identifier:
+            params["orderUniqueIdentifier"] = str(order_unique_identifier)
+        if client_id:
+            params["clientID"] = client_id
+        url = f"{XTS_ROOT}/interactive/orders"
+        r = self.session.delete(
+            url, params=params, json=params, headers=self._headers(), timeout=self.timeout_s
+        )
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        if not r.ok or _xts_payload_is_error(data if isinstance(data, dict) else None):
+            raise RuntimeError(_xts_error_message(data if isinstance(data, dict) else None, r))
+        return data if isinstance(data, dict) else {"result": data}
+

@@ -637,6 +637,17 @@ def rsi_data():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/vwap/data", methods=["GET"])
+def vwap_data():
+    """Nifty session VWAP from Fyers spot candles and front-month futures volume."""
+    try:
+        from market.nifty_vwap import get_nifty_vwap
+
+        return jsonify(get_nifty_vwap())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.post("/api/md/dada/range")
 def md_dada_range():
     """DADA strategy: first 15-min (09:15–09:30 IST) spot HIGH / LOW."""
@@ -4141,6 +4152,325 @@ def api_ix_positions():
         return _json_no_store({"ok": False, "error": str(e)}, status=500)
 
 
+_XTS_FILLED_STATES = {"FILLED", "COMPLETE", "COMPLETED", "TRADED"}
+_XTS_DEAD_STATES = {"CANCELLED", "CANCELED", "REJECTED"}
+_XTS_OPEN_STATES = {
+    "PENDING",
+    "NEW",
+    "OPEN",
+    "REPLACED",
+    "PENDINGNEW",
+    "PENDINGREPLACE",
+    "PARTIALLYFILLED",
+    "PARTIALFILLED",
+    "TRIGGERPENDING",
+}
+
+
+def _xts_order_status(row: dict[str, Any] | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    raw = str(row.get("OrderStatus") or row.get("orderStatus") or "").upper()
+    return "".join(raw.split())
+
+
+def _xts_app_order_id(row: dict[str, Any] | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    for key in ("AppOrderID", "appOrderID", "appOrderId"):
+        val = row.get(key)
+        text = str(val).strip() if val is not None else ""
+        if text and text not in ("0", "None"):
+            return text
+    return ""
+
+
+def _xts_order_unique(row: dict[str, Any] | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("OrderUniqueIdentifier") or row.get("orderUniqueIdentifier") or "").strip()
+
+
+def _xts_cum_qty(row: dict[str, Any] | None) -> int | None:
+    if not isinstance(row, dict):
+        return None
+    for key in (
+        "CumulativeQuantity",
+        "cumulativeQuantity",
+        "FilledQuantity",
+        "OrderQuantityTraded",
+        "TradedQuantity",
+    ):
+        if key not in row or row.get(key) is None or str(row.get(key)).strip() == "":
+            continue
+        return max(0, _num_int(row.get(key)))
+    return None
+
+
+def _xts_leaves_qty(row: dict[str, Any], sent_qty: int) -> int:
+    status = _xts_order_status(row)
+    if status in _XTS_FILLED_STATES:
+        return 0
+    for key in ("LeavesQuantity", "leavesQuantity", "PendingQuantity"):
+        if key not in row or row.get(key) is None or str(row.get(key)).strip() == "":
+            continue
+        return max(0, _num_int(row.get(key)))
+    cum = _xts_cum_qty(row)
+    if cum is not None:
+        return max(0, sent_qty - cum)
+    if status in _XTS_DEAD_STATES:
+        return 0
+    return max(0, sent_qty)
+
+
+def _xts_filled_qty(row: dict[str, Any] | None, sent_qty: int) -> int:
+    if not isinstance(row, dict) or sent_qty <= 0:
+        return 0
+    cum = _xts_cum_qty(row)
+    if cum is not None:
+        return min(sent_qty, cum)
+    if _xts_order_status(row) in _XTS_FILLED_STATES:
+        return sent_qty
+    return max(0, sent_qty - _xts_leaves_qty(row, sent_qty))
+
+
+def _xts_row_reason(row: dict[str, Any] | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return str(
+        row.get("CancelRejectReason")
+        or row.get("cancelRejectReason")
+        or row.get("OrderRejectReason")
+        or row.get("RejectReason")
+        or row.get("Reason")
+        or row.get("description")
+        or ""
+    ).strip()
+
+
+def _xts_place_app_ids(res: Any) -> tuple[str, str]:
+    if not isinstance(res, dict):
+        return "", ""
+    inner = res.get("result") or res.get("Result") or res
+    if isinstance(inner, list):
+        inner = inner[0] if inner and isinstance(inner[0], dict) else None
+    if not isinstance(inner, dict):
+        return "", ""
+    return _xts_app_order_id(inner), _xts_order_unique(inner)
+
+
+def _xts_order_rows(book: Any) -> list[dict[str, Any]]:
+    if not isinstance(book, dict):
+        return []
+    inner = book.get("result")
+    if inner is None:
+        inner = book.get("Result")
+    if isinstance(inner, list):
+        return [row for row in inner if isinstance(row, dict)]
+    if isinstance(inner, dict):
+        listed = inner.get("orderList") or inner.get("OrderList") or inner.get("list")
+        if isinstance(listed, list):
+            return [row for row in listed if isinstance(row, dict)]
+        if _xts_app_order_id(inner) or _xts_order_status(inner):
+            return [inner]
+    return []
+
+
+def _xts_find_order(ix: XtsInteractiveClient, client_id: str | None, app_id: str, uniq: str) -> dict[str, Any] | None:
+    book = ix.get_order_book(client_id=client_id)
+    want_id = str(app_id or "").strip()
+    want_uniq = str(uniq or "").strip()
+    for row in _xts_order_rows(book):
+        if want_id and _xts_app_order_id(row) == want_id:
+            return row
+        if want_uniq and _xts_order_unique(row) == want_uniq:
+            return row
+    return None
+
+
+def _ix_drop_orderbook_cache(username: str) -> None:
+    key = f"{(username or '').strip().upper()}:orderbook"
+    with _IX_PORTFOLIO_LOCK:
+        _IX_PORTFOLIO_CACHE.pop(key, None)
+
+
+def _watch_working_order(
+    ix: XtsInteractiveClient,
+    client_id: str | None,
+    app_id: str,
+    uniq: str,
+    sent_qty: int,
+    *,
+    polls: int = 4,
+    gap: float = 0.3,
+) -> tuple[str, dict[str, Any] | None]:
+    """filled, dead, pending, or unknown. A working order is watched briefly so a fast fill is not cancelled."""
+    last: dict[str, Any] | None = None
+    for i in range(polls):
+        time.sleep(gap)
+        try:
+            row = _xts_find_order(ix, client_id, app_id, uniq)
+        except Exception as exc:
+            app.logger.warning("order book lookup failed: %s", exc)
+            continue
+        if row is None:
+            continue
+        last = row
+        status = _xts_order_status(row)
+        leaves = _xts_leaves_qty(row, sent_qty)
+        if status in _XTS_FILLED_STATES or (leaves <= 0 and status not in _XTS_DEAD_STATES and status not in _XTS_OPEN_STATES):
+            return "filled", row
+        if status in _XTS_DEAD_STATES or "REJECT" in status:
+            return "dead", row
+        if status in _XTS_OPEN_STATES or leaves > 0:
+            if i < polls - 1:
+                continue
+            return "pending", row
+    if last is None:
+        return "unknown", None
+    status = _xts_order_status(last)
+    if status in _XTS_FILLED_STATES:
+        return "filled", last
+    if status in _XTS_DEAD_STATES or "REJECT" in status:
+        return "dead", last
+    if status in _XTS_OPEN_STATES:
+        return "pending", last
+    return "unknown", last
+
+
+def _cancel_working_order(
+    ix: XtsInteractiveClient,
+    client_id: str | None,
+    app_id: str,
+    uniq: str,
+) -> str | None:
+    if not str(app_id or "").strip():
+        return "No AppOrderID to cancel"
+    try:
+        ix.cancel_order(
+            app_order_id=str(app_id),
+            order_unique_identifier=str(uniq or ""),
+            client_id=client_id,
+        )
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
+def _chase_pending_xts_order(
+    ix: XtsInteractiveClient,
+    client_id: str | None,
+    payload: dict[str, Any],
+    res: Any,
+    fill_hint: Any,
+    *,
+    body: dict[str, Any],
+    side: str,
+    iid: int,
+    seg: int,
+    username: str,
+) -> tuple[Any, dict[str, Any], Any, str | None]:
+    """If the new order is still pending, cancel it and send the same side once more.
+
+    A second order that is still pending is cancelled. XTS must not keep a resting order.
+    Success is only a full fill. A reject stops the chase.
+    """
+    app_id, res_uniq = _xts_place_app_ids(res)
+    uniq = str(payload.get("orderUniqueIdentifier") or res_uniq or "").strip()
+    sent = int(payload.get("orderQuantity") or 0)
+    side = str(payload.get("orderSide") or side or "").strip().upper()
+    if sent <= 0 or (not app_id and not uniq):
+        return res, payload, fill_hint, None
+
+    state, row = _watch_working_order(ix, client_id, app_id, uniq, sent)
+    if state == "filled":
+        return res, payload, fill_hint, None
+    if state == "dead":
+        return res, payload, fill_hint, _xts_row_reason(row) or f"Order {_xts_order_status(row) or 'rejected'}"
+    if state != "pending" or row is None:
+        app.logger.warning("order %s was not seen in the book; leaving the place result", app_id or uniq)
+        return res, payload, fill_hint, None
+
+    if not app_id:
+        app_id = _xts_app_order_id(row)
+    filled = _xts_filled_qty(row, sent)
+    remain = max(0, sent - filled)
+    if remain <= 0:
+        return res, payload, fill_hint, None
+
+    app.logger.info("pending %s %s leaves %s — cancel, then the same side again", side, app_id, remain)
+    cancel_err = _cancel_working_order(ix, client_id, app_id, uniq or _xts_order_unique(row))
+    time.sleep(0.25)
+    _ix_drop_orderbook_cache(username)
+    try:
+        again = _xts_find_order(ix, client_id, app_id, uniq)
+    except Exception:
+        again = None
+    if again is not None:
+        filled = _xts_filled_qty(again, sent)
+        remain = max(0, sent - filled)
+        still_open = _xts_order_status(again) in _XTS_OPEN_STATES and _xts_leaves_qty(again, sent) > 0
+        if still_open:
+            detail = cancel_err or "cancel was not accepted"
+            return res, payload, fill_hint, f"Pending order could not be cancelled: {detail}"
+        if remain <= 0:
+            return res, payload, fill_hint, None
+    elif cancel_err:
+        return res, payload, fill_hint, f"Pending order could not be cancelled: {cancel_err}"
+
+    retry = dict(payload)
+    retry["orderSide"] = side
+    retry["orderQuantity"] = remain
+    retry["orderUniqueIdentifier"] = _v33_style_order_unique_identifier(iid, side)
+    try:
+        retry = _coerce_algo_limit_order(
+            retry,
+            body={**body, "liveReprice": True, "orderSide": side},
+            side=side,
+            iid=iid,
+            seg=seg,
+            username=username,
+        )
+    except ValueError as ve:
+        return res, payload, fill_hint, str(ve)
+    retry["orderSide"] = side
+    hint2 = retry.pop("_fillHint", None) or fill_hint
+    app.logger.info("replacing pending order with %s qty %s @ %s", side, remain, retry.get("limitPrice"))
+    try:
+        res2 = ix.place_order(client_id=client_id, order=retry)
+    except Exception as exc:
+        return res, retry, hint2, str(exc)
+    reject = _xts_place_reject_reason(res2)
+    if reject:
+        if filled > 0:
+            reject = f"{reject}. Filled {filled} of {sent}; the rest was not left pending."
+        return res2, retry, hint2, reject
+
+    app2, uniq2_res = _xts_place_app_ids(res2)
+    uniq2 = str(retry.get("orderUniqueIdentifier") or uniq2_res or "").strip()
+    state2, row2 = _watch_working_order(ix, client_id, app2, uniq2, remain)
+    _ix_drop_orderbook_cache(username)
+    if state2 == "filled":
+        return res2, retry, hint2, None
+    if state2 == "dead":
+        reason = _xts_row_reason(row2) or f"Order {_xts_order_status(row2) or 'rejected'}"
+        filled2 = filled + _xts_filled_qty(row2, remain)
+        if filled2 > 0 and filled2 < sent:
+            reason = f"{reason}. Filled {filled2} of {sent}; the rest is not pending."
+        return res2, retry, hint2, reason
+    if state2 == "pending" and row2 is not None:
+        cancel_id = app2 or _xts_app_order_id(row2)
+        app.logger.info("replacement %s still pending — cancelling so XTS has no resting order", cancel_id)
+        _cancel_working_order(ix, client_id, cancel_id, uniq2 or _xts_order_unique(row2))
+        _ix_drop_orderbook_cache(username)
+        filled2 = filled + _xts_filled_qty(row2, remain)
+        if filled2 > 0 and filled2 < sent:
+            return res2, retry, hint2, f"Filled {filled2} of {sent}. The pending remainder was cancelled."
+        return res2, retry, hint2, "Pending order was cancelled so it does not stay in XTS."
+    app.logger.warning("replacement %s was not seen in the book", app2 or uniq2)
+    return res2, retry, hint2, None
+
+
 @app.post("/api/ix/place_order")
 def api_ix_place_order():
     username = (_current_user() or "").strip().upper()
@@ -4224,11 +4554,30 @@ def api_ix_place_order():
             ix2, cid2 = _ensure_ix_client(username)
             if not ix2:
                 raise RuntimeError("Interactive re-login failed after token error") from e1
-            res = ix2.place_order(client_id=_ix_order_client_for(ix2, cid2), order=payload)
+            ix = ix2
+            oc = _ix_order_client_for(ix2, cid2)
+            res = ix.place_order(client_id=oc, order=payload)
         reject = _xts_place_reject_reason(res)
         if reject:
             return _json_no_store(
                 {"ok": False, "error": reject, "request": payload, "raw": res, "fillHint": fill_hint},
+                status=400,
+            )
+        res, payload, fill_hint, pending_err = _chase_pending_xts_order(
+            ix,
+            oc,
+            payload,
+            res,
+            fill_hint,
+            body=body,
+            side=side,
+            iid=iid,
+            seg=seg,
+            username=username,
+        )
+        if pending_err:
+            return _json_no_store(
+                {"ok": False, "error": pending_err, "request": payload, "raw": res, "fillHint": fill_hint},
                 status=400,
             )
         return _json_no_store({"ok": True, "request": payload, "raw": res, "fillHint": fill_hint})

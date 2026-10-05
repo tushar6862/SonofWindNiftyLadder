@@ -17,7 +17,6 @@ import {
   limitsAreOrdered,
   peSlFromLower,
   rsiInsideLimits,
-  RSI_PERIOD,
   RSI_RATIOS,
   SIZE_MULTS,
   TIMEFRAMES,
@@ -483,7 +482,8 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
       };
 
       const nextCandles = res?.candles || [];
-      if (res?.ok && res.source !== "synthetic" && nextCandles.length > RSI_PERIOD) {
+      const rsiReady = nextCandles.filter((c) => typeof c.rsi === "number" && Number.isFinite(c.rsi)).length >= 2;
+      if (res?.ok && res.source !== "synthetic" && rsiReady) {
         const avgGain = typeof res.lastAvgGain === "number" ? res.lastAvgGain : res._lastAvgGain;
         const avgLoss = typeof res.lastAvgLoss === "number" ? res.lastAvgLoss : res._lastAvgLoss;
         const lastClose = res.lastConfirmedClose;
@@ -503,6 +503,10 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
         setBackendSource(res.source || "fyers");
         setLastFetchTs(Date.now());
         setFetchError(null);
+      } else if (res?.ok && res.source === "synthetic") {
+        setFetchError("Live spot history nahi mili");
+      } else if (res?.ok) {
+        setFetchError("RSI(14) ke liye pichle session ki candles chahiye");
       } else if (!res?.ok) {
         setFetchError(res?.error || "Failed to load RSI data");
       }
@@ -1569,6 +1573,14 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
                     className="absolute inset-x-0 border-t border-dashed border-cyan-400/80 pointer-events-none z-10"
                     style={{ top: `${rsiToPct(liveRsi)}%` }}
                   />
+                )}
+
+                {displayCandles.length === 0 && (
+                  <div className="absolute inset-0 z-20 flex items-center justify-center pointer-events-none">
+                    <span className="px-3 py-1.5 rounded-lg bg-background/85 border border-border text-[11px] font-bold text-muted-foreground shadow-sm">
+                      {fetchError || "Spot candles load ho rahe hain…"}
+                    </span>
+                  </div>
                 )}
 
                 {/* SVG Curves & Vectors with 6% Right Padding to prevent touching axis border */}

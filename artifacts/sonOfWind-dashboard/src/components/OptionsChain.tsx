@@ -8,6 +8,7 @@ import NiftyFlipPanel from "@/components/NiftyFlipPanel";
 import NiftyLadderPanel from "@/components/NiftyLadderPanel";
 import NiftySnakePanel from "@/components/NiftySnakePanel";
 import RsiBandPanel from "@/components/RsiBandPanel";
+import NiftyVwapPanel from "@/components/NiftyVwapPanel";
 import { bumpPositionsRefresh } from "@/lib/ixPortfolio";
 
 export default function OptionsChain({
@@ -30,7 +31,7 @@ export default function OptionsChain({
 }) {
   const lotSize = lotSizeForIndex(index);
   const qty = Math.max(1, lotSize);
-  const [desk, setDesk] = useState<"ladder" | "snake" | "rsi" | "flip">("ladder");
+  const [desk, setDesk] = useState<"ladder" | "snake" | "rsi" | "flip" | "vwap">("ladder");
   const [exitBusy, setExitBusy] = useState(false);
   const [exitSelected, setExitSelected] = useState<25 | 50 | 75 | 100 | null>(null);
 
@@ -102,6 +103,13 @@ export default function OptionsChain({
         >
           Nifty Flip
         </button>
+        <button
+          type="button"
+          className={`sow-glass-tab${desk === "vwap" ? " sow-glass-tab--active" : ""}`}
+          onClick={() => setDesk("vwap")}
+        >
+          Nifty VWAP
+        </button>
       </div>
 
       {!resolved && (
@@ -154,6 +162,9 @@ export default function OptionsChain({
           </div>
           <div className={desk === "flip" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "flip"}>
             <NiftyFlipPanel chain={resolved} active={desk === "flip"} />
+          </div>
+          <div className={desk === "vwap" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "vwap"}>
+            <NiftyVwapPanel chain={resolved} active={desk === "vwap"} />
           </div>
         </>
       )}

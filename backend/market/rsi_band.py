@@ -147,7 +147,7 @@ def _fetch_fyers_history(symbol: str, resolution: str, from_epoch: int, to_epoch
         "cont_flag": "1",
     }
     try:
-        r = requests.get(url, params=params, headers={"Authorization": hdr}, timeout=6)
+        r = requests.get(url, params=params, headers={"Authorization": hdr}, timeout=12)
         if r.status_code != 200:
             # 429 means the data API is exhausted — back off long enough for the limit to clear.
             _HIST_FAIL_UNTIL = time.time() + (180.0 if r.status_code == 429 else 20.0)
@@ -309,6 +309,33 @@ def _apply_live_spot(payload: dict[str, Any], live_spot: float | None) -> dict[s
     return payload
 
 
+def _history_span_days(tf_minutes: int) -> int:
+    """
+    Calendar days of spot history so RSI(14) still has a prior session
+    after a weekend or a market holiday.
+
+    A 3-day window on the Monday after Gandhi Jayanti (2 Oct) contained
+    only the opening bars of the new session, so the chart stayed blank.
+    """
+    tf = max(1, int(tf_minutes))
+    if tf >= 30:
+        return 30
+    if tf >= 15:
+        return 21
+    return 15
+
+
+def _load_spot_candles(symbol: str, tf: int, now_epoch: int) -> list[dict[str, Any]]:
+    span = _history_span_days(tf)
+    candles = _fetch_fyers_history(symbol, str(tf), now_epoch - span * 86400, now_epoch)
+    # A holiday cluster can still leave fewer than 15 closes. Widen once.
+    if len(candles) <= RSI_PERIOD and time.time() >= _HIST_FAIL_UNTIL:
+        wider = _fetch_fyers_history(symbol, str(tf), now_epoch - span * 2 * 86400, now_epoch)
+        if len(wider) > len(candles):
+            candles = wider
+    return candles
+
+
 def _schedule_rsi_refresh(tf: int, live_spot: float | None, xts_client: Any) -> None:
     """History refresh stays off the request thread so a 429 cannot stall live ticks."""
     if time.time() < _HIST_FAIL_UNTIL:
@@ -354,13 +381,10 @@ def _compute_rsi_analysis(
     xts_client: Any,
 ) -> dict[str, Any]:
     now_epoch = int(time.time())
-
-    # Time range: last 3 days to guarantee sufficient bars for 14-period RSI
-    from_epoch = now_epoch - (3 * 86400)
     symbol = "NSE:NIFTY50-INDEX"
 
     source = "fyers"
-    candles = _fetch_fyers_history(symbol, str(tf), from_epoch, now_epoch)
+    candles = _load_spot_candles(symbol, tf, now_epoch)
 
     # Fallback to XTS market-data OHLC only. The interactive client has no get_ohlc.
     if not candles and xts_client is not None and callable(getattr(xts_client, "get_ohlc", None)):

@@ -3359,3 +3359,132 @@ body.sow-has-dashboard-bg {
 .nf-flip:hover:not(:disabled) {
   filter: brightness(1.08);
 }
+
+.nv-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.nv-stat {
+  min-width: 0;
+  padding: 10px 12px 8px;
+  border-radius: 10px;
+  border: 1px solid hsl(var(--foreground) / 0.14);
+  background: hsl(var(--card) / 0.72);
+}
+
+.light-theme .nv-stat {
+  background: hsl(0 0% 100% / 0.96);
+  border-color: hsl(213 32% 78%);
+}
+
+.nv-stat--ce {
+  background: hsl(0 72% 46% / 0.1);
+  border-color: hsl(0 72% 42% / 0.45);
+}
+
+.nv-stat--pe {
+  background: hsl(104 55% 36% / 0.12);
+  border-color: hsl(104 50% 32% / 0.45);
+}
+
+.nv-kicker {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: hsl(var(--foreground) / 0.62);
+}
+
+.nv-value {
+  margin-top: 2px;
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--foreground));
+}
+
+.nv-value--signal {
+  font-size: 22px;
+  letter-spacing: 0;
+}
+
+.nv-sub {
+  margin-top: 4px;
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--foreground) / 0.78);
+}
+
+.nv-check {
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--foreground) / 0.8);
+}
+
+.nv-minutes {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.nv-minutes th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 4px 8px 6px;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: hsl(var(--foreground) / 0.58);
+  background: hsl(var(--card) / 0.96);
+  border-bottom: 1px solid hsl(var(--foreground) / 0.14);
+}
+
+.light-theme .nv-minutes th {
+  background: hsl(0 0% 100% / 0.98);
+}
+
+.nv-minutes th:first-child,
+.nv-minutes td:first-child {
+  text-align: left;
+}
+
+.nv-minutes td {
+  padding: 6px 8px;
+  text-align: right;
+  font-weight: 700;
+  color: hsl(var(--foreground));
+  border-bottom: 1px solid hsl(var(--foreground) / 0.06);
+}
+
+.nv-minutes tbody tr:first-child td {
+  background: hsl(38 70% 50% / 0.1);
+}
+
+.nv-flat {
+  font-size: 15px;
+  font-weight: 800;
+  color: hsl(var(--foreground) / 0.72);
+}
+
+.nv-stop {
+  padding: 8px 18px;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+
+.nv-stop:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
