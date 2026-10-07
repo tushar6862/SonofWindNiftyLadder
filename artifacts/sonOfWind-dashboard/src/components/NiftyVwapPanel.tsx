@@ -27,6 +27,9 @@ const SESSION_KEY = "sow_nifty_vwap_v1";
 const POLL_MS = 10000;
 const DEFAULT_TARGET = "10";
 const GUARD_MS = 200;
+/** 0 = both sides ATM. 1 = CE one strike up, PE one strike down. Up to 5. */
+const STRIKE_WINGS = [0, 1, 2, 3, 4, 5] as const;
+type StrikeWing = (typeof STRIKE_WINGS)[number];
 
 type VwapSignal = "SELL_PE" | "SELL_CE" | "NONE";
 
@@ -83,6 +86,7 @@ type VwapPosition = {
 type SessionBlob = {
   qtyText: string;
   size: SizeMult;
+  wing: StrikeWing;
   targetText: string;
   slText: string;
   position: VwapPosition | null;
@@ -100,6 +104,26 @@ function positivePx(value: number | null | undefined): number | null {
 
 function px2(value: number): number {
   return Math.round((value + 1e-9) * 100) / 100;
+}
+
+function isStrikeWing(value: number): value is StrikeWing {
+  return (STRIKE_WINGS as readonly number[]).includes(value);
+}
+
+function readWing(raw: unknown): StrikeWing {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  return isStrikeWing(n) ? n : 0;
+}
+
+/** ATM keeps both sides on the ATM strike. Wing N sells CE N strikes above and PE N strikes below. */
+function wingStrike(atm: number, side: FlipSide, wing: StrikeWing, step: number): number {
+  const s = step > 0 ? step : 50;
+  if (!(wing > 0)) return atm;
+  return side === "CE" ? atm + wing * s : atm - wing * s;
+}
+
+function fmtStrike(strike: number | null): string {
+  return strike != null && Number.isFinite(strike) ? Math.round(strike).toLocaleString("en-IN") : "—";
 }
 
 /** Premium points. Blank or zero turns that exit off. */
@@ -135,6 +159,7 @@ function loadSession(): SessionBlob | null {
     const parsed = JSON.parse(raw) as Partial<SessionBlob>;
     const qtyText = typeof parsed.qtyText === "string" ? parsed.qtyText : String(DEFAULT_QTY);
     const size = typeof parsed.size === "number" && isSizeMult(parsed.size) ? parsed.size : 1;
+    const wing = readWing(parsed.wing);
     const targetText = typeof parsed.targetText === "string" ? parsed.targetText : DEFAULT_TARGET;
     const slText = typeof parsed.slText === "string" ? parsed.slText : "";
     const logs = Array.isArray(parsed.logs)
@@ -150,6 +175,7 @@ function loadSession(): SessionBlob | null {
     return {
       qtyText,
       size,
+      wing,
       targetText,
       slText,
       position: readPosition(parsed.position),
@@ -176,6 +202,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   const boot = useMemo(() => loadSession(), []);
   const [qtyText, setQtyText] = useState(boot?.qtyText ?? String(DEFAULT_QTY));
   const [size, setSize] = useState<SizeMult>(boot?.size ?? 1);
+  const [wing, setWing] = useState<StrikeWing>(boot?.wing ?? 0);
   const [targetText, setTargetText] = useState(boot?.targetText ?? DEFAULT_TARGET);
   const [armedTargetText, setArmedTargetText] = useState(boot?.targetText ?? DEFAULT_TARGET);
   const [targetLocked, setTargetLocked] = useState(true);
@@ -194,6 +221,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   const chainRef = useRef(chain);
   const qtyRef = useRef(qtyText);
   const sizeRef = useRef(size);
+  const wingRef = useRef(wing);
   const targetRef = useRef(armedTargetText);
   const slRef = useRef(armedSlText);
   const slFloorKeyRef = useRef("");
@@ -211,6 +239,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   chainRef.current = chain;
   qtyRef.current = qtyText;
   sizeRef.current = size;
+  wingRef.current = wing;
   positionRef.current = position;
   quoteRef.current = quote;
 
@@ -233,7 +262,6 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   const vwapPx = sessionVwap != null ? px2(sessionVwap) : null;
   const signal: VwapSignal =
     spotPx == null || vwapPx == null ? "NONE" : spotPx > vwapPx ? "SELL_PE" : spotPx < vwapPx ? "SELL_CE" : "NONE";
-  const signalLabel = signal === "SELL_PE" ? "Sell ATM PE" : signal === "SELL_CE" ? "Sell ATM CE" : "No trade";
   const side: FlipSide | null = signal === "SELL_PE" ? "PE" : signal === "SELL_CE" ? "CE" : null;
 
   const atm = useMemo(() => {
@@ -241,9 +269,21 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
     return liveAtmStrikeForChain(chain, basis);
   }, [chain, liveSpot, quote?.lastClose]);
 
-  const atmRow = chain.instrumentMap?.[String(atm)];
-  const atmIid = side === "CE" ? atmRow?.ce : side === "PE" ? atmRow?.pe : 0;
-  const atmLtp = atmIid > 0 ? peekTouchPx(atmIid, ltps) : null;
+  const step = typeof chain.step === "number" && chain.step > 0 ? chain.step : 50;
+  const ceStrike = Number.isFinite(atm) ? wingStrike(atm, "CE", wing, step) : null;
+  const peStrike = Number.isFinite(atm) ? wingStrike(atm, "PE", wing, step) : null;
+  const tradeStrike = side === "CE" ? ceStrike : side === "PE" ? peStrike : null;
+  const tradeRow = tradeStrike != null ? chain.instrumentMap?.[String(tradeStrike)] : undefined;
+  const tradeIid = side === "CE" ? tradeRow?.ce ?? 0 : side === "PE" ? tradeRow?.pe ?? 0 : 0;
+  const tradeLtp = tradeIid > 0 ? peekTouchPx(tradeIid, ltps) : null;
+  const signalLabel =
+    side == null
+      ? "No trade"
+      : wing > 0 && tradeStrike != null
+        ? `Sell ${side} ${fmtStrike(tradeStrike)}`
+        : side === "PE"
+          ? "Sell ATM PE"
+          : "Sell ATM CE";
 
   const liveLtp = position ? peekTouchPx(position.iid, ltps) : null;
   const mtm = position && liveLtp != null ? shortMtm(position.fill, liveLtp, position.qty) : null;
@@ -294,6 +334,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
     const blob: SessionBlob = {
       qtyText,
       size,
+      wing,
       targetText: armedTargetText,
       slText: armedSlText,
       position,
@@ -305,7 +346,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
     } catch {
       /* ignore quota */
     }
-  }, [qtyText, size, armedTargetText, armedSlText, position, logs]);
+  }, [qtyText, size, wing, armedTargetText, armedSlText, position, logs]);
 
   useEffect(() => {
     const instruments: { exchangeSegment: number; exchangeInstrumentID: number }[] = [];
@@ -316,10 +357,10 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
       instruments.push({ exchangeSegment: segment, exchangeInstrumentID: iid });
     };
     if (position) add(position.segment, position.iid);
-    if (active && nifty && side) add(chain.optionSegment, atmIid);
+    if (active && nifty && side) add(chain.optionSegment, tradeIid);
     setHotFocus("vwap", instruments);
     return () => setHotFocus("vwap", []);
-  }, [active, nifty, chain.optionSegment, position, side, atmIid]);
+  }, [active, nifty, chain.optionSegment, position, side, tradeIid]);
 
   const placeOrder = useCallback(async (orderSide: "BUY" | "SELL", instrumentId: number, qty: number, segment: number) => {
     const tick = peekLiveTick(instrumentId);
@@ -368,14 +409,17 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
         return false;
       }
       const snap = quoteRef.current;
-      const strike = liveAtmStrikeForChain(
+      const wingNow = wingRef.current;
+      const stepNow = typeof chainRef.current.step === "number" && chainRef.current.step > 0 ? chainRef.current.step : 50;
+      const atmNow = liveAtmStrikeForChain(
         chainRef.current,
         liveSpotRef.current ?? snap?.lastClose ?? undefined,
       );
+      const strike = wingStrike(atmNow, snapSide, wingNow, stepNow);
       const row = chainRef.current.instrumentMap?.[String(strike)];
       const iid = snapSide === "CE" ? row?.ce : row?.pe;
       if (typeof iid !== "number" || !(iid > 0)) {
-        fail(`ATM ${Math.round(strike)} ${snapSide} is not in the chain. Order not sent.`);
+        fail(`${Math.round(strike)} ${snapSide} is not in the chain. Order not sent.`);
         return false;
       }
       const seen = peekTouchPx(iid);
@@ -391,8 +435,9 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
         rememberShort(chainRef.current, next);
         const strikeText = Math.round(strike).toLocaleString("en-IN");
         const armedTarget = parsePoints(targetRef.current);
+        const strikeTag = wingNow > 0 ? `${snapSide} ${strikeText}` : `ATM ${snapSide} ${strikeText}`;
         pushLog(
-          `${note}: SELL ATM ${snapSide} ${strikeText} × ${fmtQty(sellQty)} @ ${fmtPrice(fill)} · target ${armedTarget ?? "off"}`,
+          `${note}: SELL ${strikeTag} × ${fmtQty(sellQty)} @ ${fmtPrice(fill)} · target ${armedTarget ?? "off"}`,
           "entry",
         );
         toast({
@@ -722,15 +767,15 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   }, [bookOpen, pushLog]);
 
   const crossed = position != null && side != null && position.side !== side;
+  const sellStrikeText = tradeStrike != null ? ` ${fmtStrike(tradeStrike)}` : "";
+  const sellPxText = tradeLtp != null ? ` @ ${tradeLtp.toFixed(2)}` : "";
   const sellText = crossed
-    ? `BOOK ${position.side} · SELL ${side}`
+    ? `BOOK ${position.side} · SELL ${side}${sellStrikeText}`
     : side == null
       ? "NO TRADE"
       : position
         ? `${position.side} OPEN`
-        : `SELL ATM ${side}${Number.isFinite(atm) ? ` ${Math.round(atm).toLocaleString("en-IN")}` : ""}${
-            atmLtp != null ? ` @ ${atmLtp.toFixed(2)}` : ""
-          }`;
+        : `SELL ${wing > 0 ? "" : "ATM "}${side}${sellStrikeText}${sellPxText}`;
 
   const futureName = (quote?.futureSymbol || "").replace(/^NSE:/, "") || "front month";
 
@@ -884,6 +929,34 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
           </div>
         </div>
 
+        <div className="nv-strike">
+          <div className="nv-strike__pick">
+            <span className="ramsetu-glass-toolbar__label">Strike</span>
+            <div className="nv-strike__wings">
+              {STRIKE_WINGS.map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => setWing(n)}
+                  className={`nv-strike__btn${wing === n ? " nv-strike__btn--on" : ""}`}
+                >
+                  {n === 0 ? "ATM" : n}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="nv-strike__legs">
+            <div className={`nv-leg nv-leg--ce${side === "CE" ? " nv-leg--live" : ""}`}>
+              <span className="nv-leg__k">CE</span>
+              <span className="nv-leg__px">{fmtStrike(ceStrike)}</span>
+            </div>
+            <div className={`nv-leg nv-leg--pe${side === "PE" ? " nv-leg--live" : ""}`}>
+              <span className="nv-leg__k">PE</span>
+              <span className="nv-leg__px">{fmtStrike(peStrike)}</span>
+            </div>
+          </div>
+        </div>
+
         {!parsed.ok && <p className="mt-2 text-[12px] font-semibold text-amber-500">{parsed.error}</p>}
         <p className="mt-2 text-[13px] font-semibold tabular-nums text-cd-green">
           Target {targetPts == null ? "off" : `${targetPts} pts`}
@@ -909,7 +982,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
           ) : null}
         </p>
 
-        <div className="mt-3 flex flex-wrap items-end gap-3">
+        <div className="nv-trade">
           <label className="flex flex-col gap-1">
             <span className="ramsetu-glass-toolbar__label">Add qty</span>
             <div className="flex items-center gap-1">
@@ -966,9 +1039,6 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
               </button>
             </div>
           </label>
-        </div>
-
-        <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
             type="button"
             disabled={busy || side == null || (position != null && !crossed)}
@@ -979,7 +1049,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
               }
               void sellSignal();
             }}
-            className={`nf-btn ${side === "PE" ? "nf-bull" : side === "CE" ? "nf-bear" : "nf-flip"}`}
+            className={`nf-btn nv-trade__sell ${side === "PE" ? "nf-bull" : side === "CE" ? "nf-bear" : "nf-flip"}`}
           >
             {sellText}
           </button>
@@ -991,9 +1061,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
           >
             STOP
           </button>
-        </div>
-        <div className="mt-3">
-          <button type="button" disabled={busy} onClick={() => void squareAll()} className="ramsetu-glass-stop">
+          <button type="button" disabled={busy} onClick={() => void squareAll()} className="ramsetu-glass-stop nv-stop">
             SQUARE ALL
           </button>
         </div>
@@ -1069,9 +1137,10 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                Nifty above VWAP sells ATM PE. Nifty below VWAP sells ATM CE. A CE short books as soon as Nifty
-                crosses above VWAP, then PE is sold. A PE short does the opposite. The 1-minute close is not required.
-                CE and PE are never open together.
+                Nifty above VWAP sells the selected PE. Nifty below VWAP sells the selected CE. ATM keeps both
+                sides on the ATM strike. 1 sells CE one strike above and PE one strike below, up to 5. A CE short
+                books as soon as Nifty crosses above VWAP, then the selected PE is sold. A PE short does the opposite.
+                The 1-minute close is not required. CE and PE are never open together.
               </p>
             ) : (
               <ul className="space-y-1.5">
