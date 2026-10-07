@@ -3278,6 +3278,31 @@ body.sow-has-dashboard-bg {
   font-weight: 800;
 }
 
+.nf-qty:disabled {
+  opacity: 0.72;
+  cursor: default;
+}
+
+.nv-lock {
+  height: 36px;
+  padding: 0 10px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.nv-lock:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+  filter: grayscale(0.4);
+}
+
+.ramsetu-glass-stop.nv-lock:hover:disabled,
+.ramsetu-glass-exec.nv-lock:hover:disabled {
+  filter: grayscale(0.4);
+  transform: none;
+}
+
 .nf-ratio {
   height: 36px;
   min-width: 112px;

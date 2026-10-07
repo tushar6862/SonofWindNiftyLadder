@@ -84,6 +84,7 @@ type SessionBlob = {
   qtyText: string;
   size: SizeMult;
   targetText: string;
+  slText: string;
   position: VwapPosition | null;
   logs: VwapLog[];
   logId: number;
@@ -135,6 +136,7 @@ function loadSession(): SessionBlob | null {
     const qtyText = typeof parsed.qtyText === "string" ? parsed.qtyText : String(DEFAULT_QTY);
     const size = typeof parsed.size === "number" && isSizeMult(parsed.size) ? parsed.size : 1;
     const targetText = typeof parsed.targetText === "string" ? parsed.targetText : DEFAULT_TARGET;
+    const slText = typeof parsed.slText === "string" ? parsed.slText : "";
     const logs = Array.isArray(parsed.logs)
       ? parsed.logs.filter(
           (row): row is VwapLog =>
@@ -149,6 +151,7 @@ function loadSession(): SessionBlob | null {
       qtyText,
       size,
       targetText,
+      slText,
       position: readPosition(parsed.position),
       logs: logs.slice(0, 80),
       logId,
@@ -174,6 +177,13 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   const [qtyText, setQtyText] = useState(boot?.qtyText ?? String(DEFAULT_QTY));
   const [size, setSize] = useState<SizeMult>(boot?.size ?? 1);
   const [targetText, setTargetText] = useState(boot?.targetText ?? DEFAULT_TARGET);
+  const [armedTargetText, setArmedTargetText] = useState(boot?.targetText ?? DEFAULT_TARGET);
+  const [targetLocked, setTargetLocked] = useState(true);
+  const [slText, setSlText] = useState(boot?.slText ?? "");
+  const [armedSlText, setArmedSlText] = useState(boot?.slText ?? "");
+  const [slLocked, setSlLocked] = useState(parsePoints(boot?.slText ?? "") != null);
+  const [addQtyText, setAddQtyText] = useState("");
+  const [outQtyText, setOutQtyText] = useState("");
   const [position, setPosition] = useState<VwapPosition | null>(boot?.position ?? null);
   const [logs, setLogs] = useState<VwapLog[]>(boot?.logs ?? []);
   const [busy, setBusy] = useState(false);
@@ -184,7 +194,10 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   const chainRef = useRef(chain);
   const qtyRef = useRef(qtyText);
   const sizeRef = useRef(size);
-  const targetRef = useRef(targetText);
+  const targetRef = useRef(armedTargetText);
+  const slRef = useRef(armedSlText);
+  const slFloorKeyRef = useRef("");
+  const slFloorLiveRef = useRef(false);
   const positionRef = useRef(position);
   const quoteRef = useRef(quote);
   const liveSpotRef = useRef<number | null>(null);
@@ -198,7 +211,6 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   chainRef.current = chain;
   qtyRef.current = qtyText;
   sizeRef.current = size;
-  targetRef.current = targetText;
   positionRef.current = position;
   quoteRef.current = quote;
 
@@ -279,13 +291,21 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   }, []);
 
   useEffect(() => {
-    const blob: SessionBlob = { qtyText, size, targetText, position, logs, logId: logIdRef.current };
+    const blob: SessionBlob = {
+      qtyText,
+      size,
+      targetText: armedTargetText,
+      slText: armedSlText,
+      position,
+      logs,
+      logId: logIdRef.current,
+    };
     try {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify(blob));
     } catch {
       /* ignore quota */
     }
-  }, [qtyText, size, targetText, position, logs]);
+  }, [qtyText, size, armedTargetText, armedSlText, position, logs]);
 
   useEffect(() => {
     const instruments: { exchangeSegment: number; exchangeInstrumentID: number }[] = [];
@@ -441,9 +461,13 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
             ? "Nifty VWAP stop"
             : reason.startsWith("TARGET")
               ? "Nifty VWAP target"
-              : reason.startsWith("FLIP")
-                ? "Nifty VWAP flip"
-                : "Nifty VWAP booked",
+              : reason.startsWith("SL")
+                ? "Nifty VWAP SL"
+                : reason.startsWith("NIKAL")
+                  ? "Nifty VWAP nikal"
+                  : reason.startsWith("FLIP")
+                  ? "Nifty VWAP flip"
+                  : "Nifty VWAP booked",
           description: `${strike} ${open.side} @ ${fmtPrice(bookPx)} · MTM ${fmtPnl(booked)}`,
           variant: reason.startsWith("STOP") ? "destructive" : "default",
         });
@@ -470,9 +494,18 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
       if (ltp == null || !(ltp > 0)) return;
       if (open.fill >= 5 && ltp < 0.5) return;
       const target = parsePoints(targetRef.current);
+      const sl = parsePoints(slRef.current);
       const profitPts = open.fill - ltp;
+      const floorKey = `${open.iid}|${open.qty}|${open.fill}|${sl ?? ""}`;
+      if (slFloorKeyRef.current !== floorKey) {
+        slFloorKeyRef.current = floorKey;
+        slFloorLiveRef.current = false;
+      }
+      if (sl != null && profitPts > sl) slFloorLiveRef.current = true;
       if (target != null && profitPts >= target) {
         void bookRef.current(`TARGET ${target} pts`);
+      } else if (sl != null && slFloorLiveRef.current && profitPts <= sl) {
+        void bookRef.current(`SL ${sl} pts`);
       }
     }, GUARD_MS);
     return () => window.clearInterval(id);
@@ -519,6 +552,165 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
     });
   }, [spotPx, vwapPx, side, quote?.sessionDate, position?.side, position?.iid, flipMismatch]);
 
+  const lockTarget = () => {
+    const text = targetText.trim();
+    if (text && parsePoints(text) == null) {
+      toast({
+        title: "Target",
+        description: "Points likho. Khali chhod ke lock karoge to target off.",
+        variant: "destructive",
+      });
+      return;
+    }
+    const points = parsePoints(text);
+    const next = points == null ? "" : String(points);
+    setTargetText(next);
+    setArmedTargetText(next);
+    targetRef.current = next;
+    setTargetLocked(true);
+    toast({
+      title: "Target locked",
+      description: points == null ? "Target off." : `${points} pts`,
+    });
+  };
+
+  const unlockTarget = () => {
+    setTargetText(armedTargetText);
+    setTargetLocked(false);
+  };
+
+  const lockSl = () => {
+    const text = slText.trim();
+    if (text && parsePoints(text) == null) {
+      toast({
+        title: "SL",
+        description: "Points likho. Khali chhod ke lock karoge to SL off.",
+        variant: "destructive",
+      });
+      return;
+    }
+    const points = parsePoints(text);
+    const next = points == null ? "" : String(points);
+    setSlText(next);
+    setArmedSlText(next);
+    slRef.current = next;
+    setSlLocked(true);
+    toast({
+      title: points == null ? "SL off" : "SL locked",
+      description: points == null ? "Koi SL nahi." : `${points} pts. Points yahan tak girenge to book.`,
+    });
+  };
+
+  const unlockSl = () => {
+    setSlText(armedSlText);
+    setSlLocked(false);
+  };
+
+  const addToOpen = useCallback(async () => {
+    if (busyRef.current || flipHoldRef.current) return;
+    const open = positionRef.current;
+    if (!open) {
+      fail("Add — pehle trade open karo.");
+      return;
+    }
+    if (!addQtyText.trim()) {
+      fail("Add qty likho, phir Add dabao.");
+      return;
+    }
+    const parsedAdd = parseQty(addQtyText);
+    if (!parsedAdd.ok) {
+      fail(parsedAdd.error);
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const hint = await placeOrder("SELL", open.iid, parsedAdd.qty, open.segment);
+      const addFill =
+        positivePx(expectedLadderFill("SELL", hint.ltp, hint.bid, hint.ask)) ?? positivePx(peekTouchPx(open.iid));
+      if (addFill == null) throw new Error("Add sell sent, but no fill price came back.");
+      const totalQty = open.qty + parsedAdd.qty;
+      const avg = px2((open.fill * open.qty + addFill * parsedAdd.qty) / totalQty);
+      const next: VwapPosition = { ...open, qty: totalQty, fill: avg };
+      positionRef.current = next;
+      setPosition(next);
+      rememberShort(chainRef.current, next);
+      const strike = Math.round(open.strike).toLocaleString("en-IN");
+      pushLog(
+        `ADD: SELL ${strike} ${open.side} × ${fmtQty(parsedAdd.qty)} @ ${fmtPrice(addFill)} · qty ${fmtQty(open.qty)} → ${fmtQty(totalQty)} · avg ${fmtPrice(avg)}`,
+        "entry",
+      );
+      toast({
+        title: "Nifty VWAP add",
+        description: `${strike} ${open.side} +${fmtQty(parsedAdd.qty)} · now ${fmtQty(totalQty)} @ ${fmtPrice(avg)}`,
+      });
+      setAddQtyText("");
+    } catch (err: unknown) {
+      fail(err instanceof Error ? err.message : String(err));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }, [addQtyText, fail, placeOrder, pushLog]);
+
+  const takeOut = useCallback(async () => {
+    if (busyRef.current || flipHoldRef.current) return;
+    const open = positionRef.current;
+    if (!open) {
+      fail("Nikal — pehle trade open karo.");
+      return;
+    }
+    if (!outQtyText.trim()) {
+      fail("Nikal qty likho, phir Nikal dabao.");
+      return;
+    }
+    const parsedOut = parseQty(outQtyText);
+    if (!parsedOut.ok) {
+      fail(parsedOut.error);
+      return;
+    }
+    if (parsedOut.qty > open.qty) {
+      fail(`Nikal ${fmtQty(parsedOut.qty)} open qty ${fmtQty(open.qty)} se zyada hai.`);
+      return;
+    }
+    if (parsedOut.qty === open.qty) {
+      const booked = await bookOpen("NIKAL");
+      if (booked) setOutQtyText("");
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const hint = await placeOrder("BUY", open.iid, parsedOut.qty, open.segment);
+      const bookPx =
+        positivePx(expectedLadderFill("BUY", hint.ltp, hint.bid, hint.ask)) ??
+        positivePx(peekTouchPx(open.iid)) ??
+        open.fill;
+      const left = open.qty - parsedOut.qty;
+      const next: VwapPosition = { ...open, qty: left };
+      positionRef.current = next;
+      setPosition(next);
+      rememberShort(chainRef.current, next);
+      const strike = Math.round(open.strike).toLocaleString("en-IN");
+      const points = open.fill - bookPx;
+      const booked = shortMtm(open.fill, bookPx, parsedOut.qty);
+      pushLog(
+        `NIKAL: BUY ${strike} ${open.side} × ${fmtQty(parsedOut.qty)} @ ${fmtPrice(bookPx)} · ${points >= 0 ? "+" : ""}${points.toFixed(2)} pts · MTM ${fmtPnl(booked)} · left ${fmtQty(left)}`,
+        "exit",
+      );
+      toast({
+        title: "Nifty VWAP nikal",
+        description: `${strike} ${open.side} −${fmtQty(parsedOut.qty)} · left ${fmtQty(left)} · MTM ${fmtPnl(booked)}`,
+      });
+      setOutQtyText("");
+    } catch (err: unknown) {
+      fail(err instanceof Error ? err.message : String(err));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }, [bookOpen, fail, outQtyText, placeOrder, pushLog]);
+
   const squareAll = useCallback(async () => {
     if (busyRef.current) return;
     if (!positionRef.current) {
@@ -544,8 +736,14 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
 
   const gapClass = gap != null && gap > 0 ? "text-cd-green" : gap != null && gap < 0 ? "text-cd-red" : "";
   const gapText = gap == null ? "—" : `${gap > 0 ? "+" : ""}${gap.toFixed(2)} pts`;
-  const targetPts = parsePoints(targetText);
+  const targetPts = parsePoints(armedTargetText);
+  const draftPts = parsePoints(targetText);
+  const draftPending = !targetLocked && targetText.trim() !== armedTargetText.trim();
+  const slPts = parsePoints(armedSlText);
+  const slDraftPts = parsePoints(slText);
+  const slDraftPending = !slLocked && slText.trim() !== armedSlText.trim();
   const targetPx = position && targetPts != null ? position.fill - targetPts : null;
+  const slPx = position && slPts != null ? position.fill - slPts : null;
   const livePoints = position && liveLtp != null ? position.fill - liveLtp : null;
 
   return (
@@ -617,14 +815,66 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
           </div>
           <label className="flex flex-col gap-1">
             <span className="ramsetu-glass-toolbar__label">Target</span>
-            <input
-              aria-label="Target points"
-              inputMode="decimal"
-              autoComplete="off"
-              value={targetText}
-              onChange={(e) => setTargetText(e.target.value)}
-              className="ramsetu-glass-select nf-qty"
-            />
+            <div className="flex items-center gap-1">
+              <input
+                aria-label="Target points"
+                inputMode="decimal"
+                autoComplete="off"
+                value={targetText}
+                disabled={targetLocked}
+                onChange={(e) => setTargetText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !targetLocked) {
+                    e.preventDefault();
+                    lockTarget();
+                  }
+                }}
+                className="ramsetu-glass-select nf-qty"
+              />
+              <button
+                type="button"
+                disabled={targetLocked}
+                onClick={lockTarget}
+                className="ramsetu-glass-exec nv-lock"
+              >
+                Lock
+              </button>
+              <button
+                type="button"
+                disabled={!targetLocked}
+                onClick={unlockTarget}
+                className="ramsetu-glass-stop nv-lock"
+              >
+                Unlock
+              </button>
+            </div>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="ramsetu-glass-toolbar__label">SL</span>
+            <div className="flex items-center gap-1">
+              <input
+                aria-label="SL points"
+                inputMode="decimal"
+                autoComplete="off"
+                placeholder="pts"
+                value={slText}
+                disabled={slLocked}
+                onChange={(e) => setSlText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !slLocked) {
+                    e.preventDefault();
+                    lockSl();
+                  }
+                }}
+                className="ramsetu-glass-select nf-qty"
+              />
+              <button type="button" disabled={slLocked} onClick={lockSl} className="ramsetu-glass-exec nv-lock">
+                Lock
+              </button>
+              <button type="button" disabled={!slLocked} onClick={unlockSl} className="ramsetu-glass-stop nv-lock">
+                Unlock
+              </button>
+            </div>
           </label>
           <div className="flex flex-col gap-1">
             <span className="ramsetu-glass-toolbar__label">Order qty</span>
@@ -637,8 +887,86 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
         {!parsed.ok && <p className="mt-2 text-[12px] font-semibold text-amber-500">{parsed.error}</p>}
         <p className="mt-2 text-[13px] font-semibold tabular-nums text-cd-green">
           Target {targetPts == null ? "off" : `${targetPts} pts`}
+          {targetLocked ? " · locked" : ""}
           {targetPx != null ? ` · book ≤ ${fmtPrice(targetPx)}` : ""}
+          {draftPending ? (
+            <span className="text-amber-500">
+              {" "}
+              · lock to set {draftPts == null ? "off" : `${draftPts} pts`}
+            </span>
+          ) : null}
+          {livePoints != null ? ` · now ${livePoints >= 0 ? "+" : ""}${livePoints.toFixed(2)} pts` : ""}
         </p>
+        <p className={`mt-1 text-[13px] font-semibold tabular-nums ${slPts == null ? "text-muted-foreground" : "text-cd-red"}`}>
+          SL {slPts == null ? "off" : `${slPts} pts`}
+          {slLocked && slPts != null ? " · locked" : ""}
+          {slPx != null ? ` · book if points fall to ${slPts}` : ""}
+          {slDraftPending ? (
+            <span className="text-amber-500">
+              {" "}
+              · lock to set {slDraftPts == null ? "off" : `${slDraftPts} pts`}
+            </span>
+          ) : null}
+        </p>
+
+        <div className="mt-3 flex flex-wrap items-end gap-3">
+          <label className="flex flex-col gap-1">
+            <span className="ramsetu-glass-toolbar__label">Add qty</span>
+            <div className="flex items-center gap-1">
+              <input
+                aria-label="Add qty"
+                inputMode="numeric"
+                autoComplete="off"
+                placeholder="qty"
+                value={addQtyText}
+                onChange={(e) => setAddQtyText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void addToOpen();
+                  }
+                }}
+                className="ramsetu-glass-select nf-qty"
+              />
+              <button
+                type="button"
+                disabled={busy || !position}
+                onClick={() => void addToOpen()}
+                className="ramsetu-glass-exec nv-lock"
+              >
+                Add
+              </button>
+            </div>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="ramsetu-glass-toolbar__label">Nikal qty</span>
+            <div className="flex items-center gap-1">
+              <input
+                aria-label="Nikal qty"
+                inputMode="numeric"
+                autoComplete="off"
+                placeholder="qty"
+                value={outQtyText}
+                onChange={(e) => setOutQtyText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void takeOut();
+                  }
+                }}
+                className="ramsetu-glass-select nf-qty"
+              />
+              <button
+                type="button"
+                disabled={busy || !position}
+                onClick={() => void takeOut()}
+                className="ramsetu-glass-stop nv-lock"
+              >
+                Nikal
+              </button>
+            </div>
+          </label>
+        </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
@@ -719,6 +1047,12 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
                 <div className="ramsetu-glass-toolbar__label">Target</div>
                 <div className="text-[14px] font-extrabold tabular-nums text-cd-green">
                   {targetPx == null ? "Off" : `≤ ${fmtPrice(targetPx)}`}
+                </div>
+              </div>
+              <div>
+                <div className="ramsetu-glass-toolbar__label">SL</div>
+                <div className="text-[14px] font-extrabold tabular-nums text-cd-red">
+                  {slPx == null ? "Off" : `≥ ${fmtPrice(slPx)}`}
                 </div>
               </div>
             </div>
