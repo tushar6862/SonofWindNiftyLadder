@@ -16,6 +16,7 @@ from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash
 
+from ix_order_chase import response_is_full_fill, response_traded_qty
 from xts_client import XtsInteractiveClient, _xts_empty_data_error, _xts_unmapped_client_error
 from xts_md import (
     MarketDataStreamer,
@@ -4471,6 +4472,97 @@ def _chase_pending_xts_order(
     return res2, retry, hint2, None
 
 
+def _order_proof(row: dict[str, Any] | None, res: Any) -> Any:
+    if isinstance(row, dict):
+        return {"type": "success", "result": row}
+    return res
+
+
+def _respond_book_only_if_filled(
+    ix: XtsInteractiveClient,
+    client_id: str | None,
+    username: str,
+    payload: dict[str, Any],
+    res: Any,
+    fill_hint: Any,
+):
+    """Book a position only from shares that traded. Cancel a working order that is not a full fill."""
+    sent = int(payload.get("orderQuantity") or 0)
+
+    def ok_fill(proof: Any):
+        traded = response_traded_qty(proof, sent)
+        if traded <= 0 and response_is_full_fill(proof, sent):
+            traded = sent
+        return _json_no_store(
+            {"ok": True, "request": payload, "raw": proof, "fillHint": fill_hint, "filledQty": traded}
+        )
+
+    def not_filled(proof: Any, error: str = "Order not filled"):
+        return _json_no_store(
+            {"ok": False, "error": error, "request": payload, "raw": proof, "fillHint": fill_hint},
+            status=400,
+        )
+
+    if response_is_full_fill(res, sent):
+        return ok_fill(res)
+    if _xts_place_reject_reason(res) and response_traded_qty(res, sent) <= 0:
+        return not_filled(res)
+
+    app_id, res_uniq = _xts_place_app_ids(res)
+    uniq = str(payload.get("orderUniqueIdentifier") or res_uniq or "").strip()
+    row: dict[str, Any] | None = None
+    if sent > 0 and (app_id or uniq):
+        _state, row = _watch_working_order(ix, client_id, app_id, uniq, sent)
+    proof = _order_proof(row, res)
+    if response_is_full_fill(proof, sent):
+        return ok_fill(proof)
+
+    cancel_id = app_id or (_xts_app_order_id(row) if isinstance(row, dict) else "")
+    status = _xts_order_status(row) if isinstance(row, dict) else ""
+    already_dead = status in _XTS_DEAD_STATES or "REJECT" in status
+    if cancel_id and not already_dead:
+        app.logger.info(
+            "bookOnlyIfFilled %s %s is not a full fill — cancelling",
+            payload.get("orderSide"),
+            cancel_id,
+        )
+        cancel_err = _cancel_working_order(
+            ix,
+            client_id,
+            cancel_id,
+            uniq or (_xts_order_unique(row) if isinstance(row, dict) else ""),
+        )
+        time.sleep(0.25)
+        _ix_drop_orderbook_cache(username)
+        try:
+            again = _xts_find_order(ix, client_id, cancel_id, uniq)
+        except Exception:
+            again = None
+        if isinstance(again, dict):
+            proof = _order_proof(again, res)
+            if response_is_full_fill(proof, sent):
+                return ok_fill(proof)
+            traded = response_traded_qty(proof, sent)
+            again_status = _xts_order_status(again)
+            if again_status in _XTS_OPEN_STATES and _xts_leaves_qty(again, sent) > 0 and traded < sent:
+                detail = cancel_err or "cancel was not accepted"
+                return not_filled(proof, f"Pending order could not be cancelled: {detail}")
+            if traded <= 0:
+                return not_filled(proof)
+            return ok_fill(proof)
+        if cancel_err:
+            return not_filled(res, f"Pending order could not be cancelled: {cancel_err}")
+        traded_before = response_traded_qty(proof, sent)
+        if traded_before <= 0:
+            return not_filled(proof)
+        return ok_fill(proof)
+
+    traded = response_traded_qty(proof, sent)
+    if traded <= 0:
+        return not_filled(proof)
+    return ok_fill(proof)
+
+
 @app.post("/api/ix/place_order")
 def api_ix_place_order():
     username = (_current_user() or "").strip().upper()
@@ -4557,6 +4649,9 @@ def api_ix_place_order():
             ix = ix2
             oc = _ix_order_client_for(ix2, cid2)
             res = ix.place_order(client_id=oc, order=payload)
+        book_only = bool(body.get("bookOnlyIfFilled") or body.get("book_only_if_filled"))
+        if book_only:
+            return _respond_book_only_if_filled(ix, oc, username, payload, res, fill_hint)
         reject = _xts_place_reject_reason(res)
         if reject:
             return _json_no_store(

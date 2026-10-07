@@ -158,3 +158,91 @@ export function ixOrderRejectedMessage(raw: unknown): string | null {
   }
   return null;
 }
+
+const XTS_FILLED_STATUS = new Set(["FILLED", "COMPLETE", "COMPLETED", "TRADED"]);
+
+const TRADED_QTY_KEYS = [
+  "CumulativeQuantity",
+  "cumulativeQuantity",
+  "FilledQuantity",
+  "filledQuantity",
+  "OrderQuantityTraded",
+  "orderQuantityTraded",
+  "TradedQuantity",
+  "tradedQuantity",
+] as const;
+
+const TRADED_PX_KEYS = [
+  "OrderAverageTradedPrice",
+  "orderAverageTradedPrice",
+  "AverageTradedPrice",
+  "averageTradedPrice",
+  "AveragePrice",
+  "averagePrice",
+] as const;
+
+function xtsOrderStatus(row: Record<string, unknown>): string {
+  return String(row.OrderStatus ?? row.orderStatus ?? "")
+    .toUpperCase()
+    .replace(/\s+/g, "");
+}
+
+function explicitTradedQty(row: Record<string, unknown>): number | null {
+  for (const key of TRADED_QTY_KEYS) {
+    if (!(key in row) || row[key] == null || String(row[key]).trim() === "") continue;
+    const n = Number(String(row[key]).replace(/,/g, ""));
+    if (!Number.isFinite(n)) continue;
+    return Math.max(0, Math.floor(n));
+  }
+  return null;
+}
+
+/** Shares that actually traded. Pending, rejected, cancelled, or an ack with no traded quantity is 0. */
+export function orderTradedQty(raw: unknown, requestedQty = 0): number {
+  const rows = orderRowsFromPlaceRaw(raw);
+  let best = 0;
+  let filledFallback = 0;
+  for (const row of rows) {
+    const explicit = explicitTradedQty(row);
+    if (explicit != null) {
+      best = Math.max(best, explicit);
+      continue;
+    }
+    if (!XTS_FILLED_STATUS.has(xtsOrderStatus(row))) continue;
+    const orderQty = Number(String(row.OrderQuantity ?? row.orderQuantity ?? "").replace(/,/g, ""));
+    if (Number.isFinite(orderQty) && orderQty > 0) filledFallback = Math.max(filledFallback, Math.floor(orderQty));
+    else if (requestedQty > 0) filledFallback = Math.max(filledFallback, requestedQty);
+  }
+  const traded = best > 0 ? best : filledFallback;
+  if (!Number.isFinite(traded) || traded <= 0) return 0;
+  return requestedQty > 0 ? Math.min(traded, requestedQty) : traded;
+}
+
+/** True only for a real trade: traded quantity, or status Filled / Traded / Complete. */
+export function orderLooksFilled(raw: unknown): boolean {
+  const rows = orderRowsFromPlaceRaw(raw);
+  let filledStatus = false;
+  for (const row of rows) {
+    const explicit = explicitTradedQty(row);
+    if (explicit != null) {
+      if (explicit > 0) return true;
+      continue;
+    }
+    if (XTS_FILLED_STATUS.has(xtsOrderStatus(row))) filledStatus = true;
+  }
+  return filledStatus;
+}
+
+/** Average traded price from the order row. Touchline bid, ask, and LTP are not a fill. */
+export function xtsOrderFillPx(raw: unknown): number | null {
+  for (const row of orderRowsFromPlaceRaw(raw)) {
+    const explicit = explicitTradedQty(row);
+    const filled = XTS_FILLED_STATUS.has(xtsOrderStatus(row));
+    if (explicit === 0 || (explicit == null && !filled)) continue;
+    for (const key of TRADED_PX_KEYS) {
+      const n = Number(row[key]);
+      if (Number.isFinite(n) && n > 0) return Math.round(n * 100) / 100;
+    }
+  }
+  return null;
+}

@@ -8,7 +8,14 @@ import { liveAtmStrikeForChain, plausibleSpotPx } from "@/lib/liveAtmStrike";
 import { fmtPnl, fmtPrice, fmtQty } from "@/lib/formatNumber";
 import { apiFetch } from "@/lib/backend";
 import { bumpPositionsRefresh, clearLocalPosition, setLocalShortPosition } from "@/lib/ixPortfolio";
-import { expectedLadderFill, ixOrderRejectedMessage, ladderOrderPricing, XTS_IX_ORDER_BASE } from "@/lib/xtsOrder";
+import {
+  ixOrderRejectedMessage,
+  ladderOrderPricing,
+  orderLooksFilled,
+  orderTradedQty,
+  xtsOrderFillPx,
+  XTS_IX_ORDER_BASE,
+} from "@/lib/xtsOrder";
 import { toast } from "@/hooks/use-toast";
 import {
   DEFAULT_QTY,
@@ -98,10 +105,6 @@ function isNiftyChain(chain: ChainResolved): boolean {
   return String(chain.index || "").trim().toUpperCase() === UNDERLYING;
 }
 
-function positivePx(value: number | null | undefined): number | null {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
-}
-
 function px2(value: number): number {
   return Math.round((value + 1e-9) * 100) / 100;
 }
@@ -126,6 +129,10 @@ function fmtStrike(strike: number | null): string {
   return strike != null && Number.isFinite(strike) ? Math.round(strike).toLocaleString("en-IN") : "—";
 }
 
+function qtyNote(filled: number, requested: number): string {
+  return filled === requested ? fmtQty(filled) : `${fmtQty(filled)} of ${fmtQty(requested)}`;
+}
+
 /** Premium points. Blank or zero turns that exit off. */
 function parsePoints(raw: string): number | null {
   const text = raw.trim();
@@ -145,7 +152,7 @@ function readPosition(raw: unknown): VwapPosition | null {
   const segment = Number(row.segment);
   if (row.side !== "CE" && row.side !== "PE") return null;
   if (!Number.isFinite(strike) || strike <= 0) return null;
-  if (!Number.isSafeInteger(qty) || qty <= 0 || qty % LOT_SIZE !== 0) return null;
+  if (!Number.isSafeInteger(qty) || qty <= 0) return null;
   if (!Number.isFinite(fill) || fill <= 0) return null;
   if (!Number.isFinite(iid) || iid <= 0) return null;
   if (!Number.isFinite(segment) || segment <= 0) return null;
@@ -226,6 +233,9 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
   const slRef = useRef(armedSlText);
   const slFloorKeyRef = useRef("");
   const slFloorLiveRef = useRef(false);
+  const exitArmKeyRef = useRef("");
+  const targetFiredRef = useRef(false);
+  const slFiredRef = useRef(false);
   const positionRef = useRef(position);
   const quoteRef = useRef(quote);
   const liveSpotRef = useRef<number | null>(null);
@@ -362,29 +372,48 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
     return () => setHotFocus("vwap", []);
   }, [active, nifty, chain.optionSegment, position, side, tradeIid]);
 
-  const placeOrder = useCallback(async (orderSide: "BUY" | "SELL", instrumentId: number, qty: number, segment: number) => {
-    const tick = peekLiveTick(instrumentId);
-    const ltp = peekTouchPx(instrumentId);
-    const response = (await apiFetch("/api/ix/place_order", {
-      method: "POST",
-      body: JSON.stringify({
-        ...XTS_IX_ORDER_BASE,
-        ...ladderOrderPricing(orderSide, ltp, tick?.bid, tick?.ask),
-        exchangeSegment: segment,
-        exchangeInstrumentID: instrumentId,
-        orderSide,
-        orderQuantity: qty,
-      }),
-    })) as { ok?: boolean; error?: string; raw?: unknown; fillHint?: { ltp?: number; bid?: number; ask?: number } };
-    const rejected = ixOrderRejectedMessage(response?.raw) || ixOrderRejectedMessage(response);
-    if (rejected) throw new Error(rejected);
-    bumpPositionsRefresh();
-    return {
-      ltp: positivePx(response?.fillHint?.ltp) ?? ltp,
-      bid: positivePx(response?.fillHint?.bid) ?? positivePx(tick?.bid),
-      ask: positivePx(response?.fillHint?.ask) ?? positivePx(tick?.ask),
-    };
-  }, []);
+  const sendOrder = useCallback(
+    async (
+      orderSide: "BUY" | "SELL",
+      instrumentId: number,
+      qty: number,
+      segment: number,
+    ): Promise<{ ok: true; filledQty: number; fillPx: number } | { ok: false; error: string }> => {
+      const tick = peekLiveTick(instrumentId);
+      const ltp = peekTouchPx(instrumentId);
+      let response: { ok?: boolean; error?: string; raw?: unknown } | null = null;
+      try {
+        response = (await apiFetch("/api/ix/place_order", {
+          method: "POST",
+          body: JSON.stringify({
+            ...XTS_IX_ORDER_BASE,
+            ...ladderOrderPricing(orderSide, ltp, tick?.bid, tick?.ask),
+            exchangeSegment: segment,
+            exchangeInstrumentID: instrumentId,
+            orderSide,
+            orderQuantity: qty,
+            bookOnlyIfFilled: true,
+          }),
+        })) as { ok?: boolean; error?: string; raw?: unknown };
+      } catch (err: unknown) {
+        bumpPositionsRefresh();
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+      bumpPositionsRefresh();
+      const raw = response?.raw ?? response;
+      const filledQty = orderTradedQty(raw, qty);
+      if (!orderLooksFilled(raw) || filledQty <= 0) {
+        const rejected = ixOrderRejectedMessage(raw) || ixOrderRejectedMessage(response);
+        return { ok: false, error: rejected || "Order not filled" };
+      }
+      const fillPx = xtsOrderFillPx(raw);
+      if (fillPx == null) {
+        return { ok: false, error: "Order traded, but XTS sent no average traded price. Book left unchanged." };
+      }
+      return { ok: true, filledQty, fillPx };
+    },
+    [],
+  );
 
   const sellSide = useCallback(
     async (snapSide: FlipSide, note: string): Promise<boolean> => {
@@ -422,14 +451,15 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
         fail(`${Math.round(strike)} ${snapSide} is not in the chain. Order not sent.`);
         return false;
       }
-      const seen = peekTouchPx(iid);
       busyRef.current = true;
       setBusy(true);
       try {
-        const hint = await placeOrder("SELL", iid, sellQty, segment);
-        const fill = positivePx(expectedLadderFill("SELL", hint.ltp, hint.bid, hint.ask)) ?? seen;
-        if (fill == null) throw new Error("Sell sent, but no fill price came back.");
-        const next: VwapPosition = { strike, side: snapSide, qty: sellQty, fill, iid, segment };
+        const sent = await sendOrder("SELL", iid, sellQty, segment);
+        if (!sent.ok) {
+          fail(sent.error);
+          return false;
+        }
+        const next: VwapPosition = { strike, side: snapSide, qty: sent.filledQty, fill: sent.fillPx, iid, segment };
         positionRef.current = next;
         setPosition(next);
         rememberShort(chainRef.current, next);
@@ -437,23 +467,20 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
         const armedTarget = parsePoints(targetRef.current);
         const strikeTag = wingNow > 0 ? `${snapSide} ${strikeText}` : `ATM ${snapSide} ${strikeText}`;
         pushLog(
-          `${note}: SELL ${strikeTag} × ${fmtQty(sellQty)} @ ${fmtPrice(fill)} · target ${armedTarget ?? "off"}`,
+          `${note}: SELL ${strikeTag} × ${qtyNote(sent.filledQty, sellQty)} @ ${fmtPrice(sent.fillPx)} · target ${armedTarget ?? "off"}`,
           "entry",
         );
         toast({
           title: `Nifty VWAP SELL ${snapSide}`,
-          description: `${strikeText} @ ${fmtPrice(fill)} · ${fmtQty(sellQty)}`,
+          description: `${strikeText} @ ${fmtPrice(sent.fillPx)} · ${qtyNote(sent.filledQty, sellQty)}`,
         });
         return true;
-      } catch (err: unknown) {
-        fail(err instanceof Error ? err.message : String(err));
-        return false;
       } finally {
         busyRef.current = false;
         setBusy(false);
       }
     },
-    [fail, placeOrder, pushLog],
+    [fail, pushLog, sendOrder],
   );
 
   const sellSignal = useCallback(async () => {
@@ -486,46 +513,69 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
       busyRef.current = true;
       setBusy(true);
       try {
-        const hint = await placeOrder("BUY", open.iid, open.qty, open.segment);
-        const bookPx =
-          positivePx(expectedLadderFill("BUY", hint.ltp, hint.bid, hint.ask)) ??
-          positivePx(peekTouchPx(open.iid)) ??
-          open.fill;
-        const booked = shortMtm(open.fill, bookPx, open.qty);
+        const sent = await sendOrder("BUY", open.iid, open.qty, open.segment);
+        if (!sent.ok) {
+          fail(`${reason} book failed. Short still open. ${sent.error}`);
+          return false;
+        }
+        const closed = Math.min(sent.filledQty, open.qty);
+        if (closed <= 0) {
+          fail(`${reason} book failed. Short still open. Order not filled`);
+          return false;
+        }
+        const bookPx = sent.fillPx;
+        const booked = shortMtm(open.fill, bookPx, closed);
+        const strike = Math.round(open.strike).toLocaleString("en-IN");
+        const points = open.fill - bookPx;
+        const title = reason.startsWith("STOP")
+          ? "Nifty VWAP stop"
+          : reason.startsWith("TARGET")
+            ? "Nifty VWAP target"
+            : reason.startsWith("SL")
+              ? "Nifty VWAP SL"
+              : reason.startsWith("NIKAL")
+                ? "Nifty VWAP nikal"
+                : reason.startsWith("FLIP")
+                  ? "Nifty VWAP flip"
+                  : reason.startsWith("SQUARE")
+                    ? "Nifty VWAP square"
+                    : "Nifty VWAP booked";
+        if (closed < open.qty) {
+          const left = open.qty - closed;
+          const next: VwapPosition = { ...open, qty: left };
+          positionRef.current = next;
+          setPosition(next);
+          rememberShort(chainRef.current, next);
+          pushLog(
+            `${reason}: BUY ${strike} ${open.side} × ${qtyNote(closed, open.qty)} @ ${fmtPrice(bookPx)} · ${points >= 0 ? "+" : ""}${points.toFixed(2)} pts · MTM ${fmtPnl(booked)} · left ${fmtQty(left)}. Short still open.`,
+            "exit",
+          );
+          toast({
+            title,
+            description: `${strike} ${open.side} bought ${qtyNote(closed, open.qty)} · left ${fmtQty(left)}`,
+            variant: reason.startsWith("STOP") ? "destructive" : "default",
+          });
+          return false;
+        }
         clearLocalPosition(open.iid, booked);
         positionRef.current = null;
         setPosition(null);
-        const strike = Math.round(open.strike).toLocaleString("en-IN");
-        const points = open.fill - bookPx;
         pushLog(
-          `${reason}: BUY ${strike} ${open.side} × ${fmtQty(open.qty)} @ ${fmtPrice(bookPx)} · ${points >= 0 ? "+" : ""}${points.toFixed(2)} pts · MTM ${fmtPnl(booked)}`,
+          `${reason}: BUY ${strike} ${open.side} × ${qtyNote(closed, open.qty)} @ ${fmtPrice(bookPx)} · ${points >= 0 ? "+" : ""}${points.toFixed(2)} pts · MTM ${fmtPnl(booked)}`,
           "exit",
         );
         toast({
-          title: reason.startsWith("STOP")
-            ? "Nifty VWAP stop"
-            : reason.startsWith("TARGET")
-              ? "Nifty VWAP target"
-              : reason.startsWith("SL")
-                ? "Nifty VWAP SL"
-                : reason.startsWith("NIKAL")
-                  ? "Nifty VWAP nikal"
-                  : reason.startsWith("FLIP")
-                  ? "Nifty VWAP flip"
-                  : "Nifty VWAP booked",
+          title,
           description: `${strike} ${open.side} @ ${fmtPrice(bookPx)} · MTM ${fmtPnl(booked)}`,
           variant: reason.startsWith("STOP") ? "destructive" : "default",
         });
         return true;
-      } catch (err: unknown) {
-        fail(`${reason} book failed. Short still open. ${err instanceof Error ? err.message : String(err)}`);
-        return false;
       } finally {
         busyRef.current = false;
         setBusy(false);
       }
     },
-    [fail, placeOrder, pushLog],
+    [fail, pushLog, sendOrder],
   );
 
   const bookRef = useRef(bookOpen);
@@ -546,11 +596,26 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
         slFloorKeyRef.current = floorKey;
         slFloorLiveRef.current = false;
       }
+      const armKey = `${open.iid}|${open.fill}|${target ?? ""}|${sl ?? ""}`;
+      if (exitArmKeyRef.current !== armKey) {
+        exitArmKeyRef.current = armKey;
+        targetFiredRef.current = false;
+        slFiredRef.current = false;
+      }
       if (sl != null && profitPts > sl) slFloorLiveRef.current = true;
       if (target != null && profitPts >= target) {
-        void bookRef.current(`TARGET ${target} pts`);
+        if (!targetFiredRef.current) {
+          targetFiredRef.current = true;
+          void bookRef.current(`TARGET ${target} pts`);
+        }
       } else if (sl != null && slFloorLiveRef.current && profitPts <= sl) {
-        void bookRef.current(`SL ${sl} pts`);
+        if (!slFiredRef.current) {
+          slFiredRef.current = true;
+          void bookRef.current(`SL ${sl} pts`);
+        }
+      } else {
+        targetFiredRef.current = false;
+        if (sl == null || profitPts > sl) slFiredRef.current = false;
       }
     }, GUARD_MS);
     return () => window.clearInterval(id);
@@ -573,7 +638,7 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
       const sold = await sellSide(want, note);
       flipHoldRef.current = false;
       if (!sold) {
-        pushLog(`FLIP ${minute}: short booked, new ${want} sell failed. Flat.`, "error");
+        pushLog(`FLIP ${minute}: short booked, new ${want} sell was not filled. Flat. No cover buy.`, "error");
       }
       return sold;
     },
@@ -670,33 +735,32 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
     busyRef.current = true;
     setBusy(true);
     try {
-      const hint = await placeOrder("SELL", open.iid, parsedAdd.qty, open.segment);
-      const addFill =
-        positivePx(expectedLadderFill("SELL", hint.ltp, hint.bid, hint.ask)) ?? positivePx(peekTouchPx(open.iid));
-      if (addFill == null) throw new Error("Add sell sent, but no fill price came back.");
-      const totalQty = open.qty + parsedAdd.qty;
-      const avg = px2((open.fill * open.qty + addFill * parsedAdd.qty) / totalQty);
+      const sent = await sendOrder("SELL", open.iid, parsedAdd.qty, open.segment);
+      if (!sent.ok) {
+        fail(sent.error);
+        return;
+      }
+      const totalQty = open.qty + sent.filledQty;
+      const avg = px2((open.fill * open.qty + sent.fillPx * sent.filledQty) / totalQty);
       const next: VwapPosition = { ...open, qty: totalQty, fill: avg };
       positionRef.current = next;
       setPosition(next);
       rememberShort(chainRef.current, next);
       const strike = Math.round(open.strike).toLocaleString("en-IN");
       pushLog(
-        `ADD: SELL ${strike} ${open.side} × ${fmtQty(parsedAdd.qty)} @ ${fmtPrice(addFill)} · qty ${fmtQty(open.qty)} → ${fmtQty(totalQty)} · avg ${fmtPrice(avg)}`,
+        `ADD: SELL ${strike} ${open.side} × ${qtyNote(sent.filledQty, parsedAdd.qty)} @ ${fmtPrice(sent.fillPx)} · qty ${fmtQty(open.qty)} → ${fmtQty(totalQty)} · avg ${fmtPrice(avg)}`,
         "entry",
       );
       toast({
         title: "Nifty VWAP add",
-        description: `${strike} ${open.side} +${fmtQty(parsedAdd.qty)} · now ${fmtQty(totalQty)} @ ${fmtPrice(avg)}`,
+        description: `${strike} ${open.side} +${qtyNote(sent.filledQty, parsedAdd.qty)} · now ${fmtQty(totalQty)} @ ${fmtPrice(avg)}`,
       });
       setAddQtyText("");
-    } catch (err: unknown) {
-      fail(err instanceof Error ? err.message : String(err));
     } finally {
       busyRef.current = false;
       setBusy(false);
     }
-  }, [addQtyText, fail, placeOrder, pushLog]);
+  }, [addQtyText, fail, pushLog, sendOrder]);
 
   const takeOut = useCallback(async () => {
     if (busyRef.current || flipHoldRef.current) return;
@@ -726,35 +790,45 @@ export default function NiftyVwapPanel({ chain, active }: { chain: ChainResolved
     busyRef.current = true;
     setBusy(true);
     try {
-      const hint = await placeOrder("BUY", open.iid, parsedOut.qty, open.segment);
-      const bookPx =
-        positivePx(expectedLadderFill("BUY", hint.ltp, hint.bid, hint.ask)) ??
-        positivePx(peekTouchPx(open.iid)) ??
-        open.fill;
-      const left = open.qty - parsedOut.qty;
-      const next: VwapPosition = { ...open, qty: left };
-      positionRef.current = next;
-      setPosition(next);
-      rememberShort(chainRef.current, next);
+      const sent = await sendOrder("BUY", open.iid, parsedOut.qty, open.segment);
+      if (!sent.ok) {
+        fail(`NIKAL book failed. Short still open. ${sent.error}`);
+        return;
+      }
+      const closed = Math.min(sent.filledQty, open.qty);
+      if (closed <= 0) {
+        fail("NIKAL book failed. Short still open. Order not filled");
+        return;
+      }
+      const bookPx = sent.fillPx;
+      const left = open.qty - closed;
       const strike = Math.round(open.strike).toLocaleString("en-IN");
       const points = open.fill - bookPx;
-      const booked = shortMtm(open.fill, bookPx, parsedOut.qty);
+      const booked = shortMtm(open.fill, bookPx, closed);
+      if (left <= 0) {
+        clearLocalPosition(open.iid, booked);
+        positionRef.current = null;
+        setPosition(null);
+      } else {
+        const next: VwapPosition = { ...open, qty: left };
+        positionRef.current = next;
+        setPosition(next);
+        rememberShort(chainRef.current, next);
+      }
       pushLog(
-        `NIKAL: BUY ${strike} ${open.side} × ${fmtQty(parsedOut.qty)} @ ${fmtPrice(bookPx)} · ${points >= 0 ? "+" : ""}${points.toFixed(2)} pts · MTM ${fmtPnl(booked)} · left ${fmtQty(left)}`,
+        `NIKAL: BUY ${strike} ${open.side} × ${qtyNote(closed, parsedOut.qty)} @ ${fmtPrice(bookPx)} · ${points >= 0 ? "+" : ""}${points.toFixed(2)} pts · MTM ${fmtPnl(booked)} · left ${fmtQty(left)}`,
         "exit",
       );
       toast({
         title: "Nifty VWAP nikal",
-        description: `${strike} ${open.side} −${fmtQty(parsedOut.qty)} · left ${fmtQty(left)} · MTM ${fmtPnl(booked)}`,
+        description: `${strike} ${open.side} −${qtyNote(closed, parsedOut.qty)} · left ${fmtQty(left)} · MTM ${fmtPnl(booked)}`,
       });
       setOutQtyText("");
-    } catch (err: unknown) {
-      fail(err instanceof Error ? err.message : String(err));
     } finally {
       busyRef.current = false;
       setBusy(false);
     }
-  }, [bookOpen, fail, outQtyText, placeOrder, pushLog]);
+  }, [bookOpen, fail, outQtyText, pushLog, sendOrder]);
 
   const squareAll = useCallback(async () => {
     if (busyRef.current) return;
