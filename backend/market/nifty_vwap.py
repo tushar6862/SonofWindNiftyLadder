@@ -31,7 +31,8 @@ ANCHOR_VWAP = 22558.77
 ANCHOR_TOLERANCE = 0.15
 
 _CACHE: dict[str, Any] = {}
-_CACHE_TTL_SEC = 12.0
+# Closed VWAP changes once a minute. The 1-minute candles are the shared Fyers cache.
+_CACHE_TTL_SEC = 55.0
 _refresh_guard = threading.Lock()
 _refreshing = False
 _FRONT_CACHE: dict[str, Any] = {}

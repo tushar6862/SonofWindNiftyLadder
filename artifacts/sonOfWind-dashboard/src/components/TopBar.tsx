@@ -177,6 +177,7 @@ export default function TopBar({
   const [fyersAuthed, setFyersAuthed] = useState(false);
   const [fyersExpired, setFyersExpired] = useState(false);
   const [fyersBusy, setFyersBusy] = useState(false);
+  const [fyersBudget, setFyersBudget] = useState("");
 
   useEffect(() => {
     const t = setInterval(() => setTime(new Date()), 1000);
@@ -194,10 +195,14 @@ export default function TopBar({
           enabled?: boolean;
           expired?: boolean;
           lastError?: string;
+          budget?: { dayUsed?: number; dayCap?: number };
         };
         if (!cancelled && res?.ok) {
           setFyersAuthed(Boolean(res.authed));
           setFyersExpired(Boolean(res.expired));
+          const used = res.budget?.dayUsed;
+          const cap = res.budget?.dayCap;
+          setFyersBudget(typeof used === "number" && typeof cap === "number" ? `${used}/${cap}` : "");
         }
       } catch {
         /* ignore */
@@ -534,7 +539,7 @@ export default function TopBar({
               disabled={fyersBusy}
               title={
                 fyersAuthed
-                  ? "Spot / VIX / ATM / LIVE LTP = Fyers"
+                  ? `Fyers socket live. Free REST ${fyersBudget || "0/1500"} kept under the 5000/day plan`
                   : fyersExpired
                     ? "Fyers token expired (daily login) — click to reconnect"
                     : "Connect Fyers for TopBar + LIVE LTP (once per day)"

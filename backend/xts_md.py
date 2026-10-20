@@ -2812,6 +2812,8 @@ class MarketDataStreamer:
             "_ltp1501": ltp_f,
             "_fyersLtp": True,
         }
+        if isinstance(extras, dict) and float(extras.get("fromRest") or 0.0) > 0:
+            tick["_fyersRest"] = True
         try:
             if float(ltt or 0.0) > 1e9:
                 tick["exchange_ts"] = float(ltt)
@@ -2853,13 +2855,15 @@ class MarketDataStreamer:
                 pass
 
     def _refresh_hot_focus_once(self) -> None:
-        """XTS touchline seed only when Fyers LTP is off."""
-        if _fyers_ltp_on():
-            return
+        """XTS touchline seed for tokens the Fyers socket is not carrying."""
         with self._hot_lock:
             hot = dict(self._hot_tokens)
         if not hot:
             return
+        if _fyers_ltp_on():
+            hot = {tid: seg for tid, seg in hot.items() if not _fyers_owns_token(int(tid))}
+            if not hot:
+                return
         client = self._client
         if not client:
             return
@@ -3900,8 +3904,11 @@ class MarketDataStreamer:
             out["_hotLtp"] = True
         if tick.get("_fyersLtp"):
             out["_fyersLtp"] = True
-        # Same token is on Fyers — do not ship an XTS last-trade on this packet.
-        if paint_ltp and not tick.get("_fyersLtp") and tid > 0 and _fyers_owns_token(tid):
+        if tick.get("_fyersRest"):
+            out["_fyersRest"] = True
+        # Same token is on the Fyers list — XTS last-trade and day OHLC stay off this packet.
+        fyers_owned = (not tick.get("_fyersLtp")) and tid > 0 and _fyers_owns_token(tid)
+        if paint_ltp and fyers_owned:
             paint_ltp = False
         try:
             ltp = float(tick.get("ltp") or 0.0)
@@ -3931,6 +3938,8 @@ class MarketDataStreamer:
             "oi",
             "volume",
         ):
+            if fyers_owned and k in ("prevClose", "percentChange", "dayOpen", "dayHigh", "dayLow"):
+                continue
             v = tick.get(k)
             if v is None:
                 continue
@@ -4082,6 +4091,8 @@ class MarketDataStreamer:
             if row.get("_fyersLtp") and row_ltp > 0:
                 out["ltp"] = row_ltp
                 out["_fyersLtp"] = True
+                if row.get("_fyersRest"):
+                    out["_fyersRest"] = True
             elif mc_i in (1501, 1512) and tick_ltp > 0:
                 out["ltp"] = tick_ltp
             elif ltp_1501 > 0:

@@ -202,34 +202,46 @@ class TickEngine:
         }
         if keep_fyers:
             out["_fyersLtp"] = True
-        try:
-            pc = float(d.get("prevClose") or 0.0)
-            if pc > 0:
-                out["prevClose"] = pc
-        except Exception:
-            pass
-        try:
-            ch = float(d.get("percentChange") or float("nan"))
-            if ch == ch:
-                out["percentChange"] = ch
-        except Exception:
-            pass
-        try:
-            op = float(d.get("dayOpen") or 0.0)
-            if op > 0:
-                out["dayOpen"] = op
-        except Exception:
-            pass
-        try:
-            hi = float(d.get("dayHigh") or 0.0)
-            lo = float(d.get("dayLow") or 0.0)
-            if hi > 0 and lo > 0:
-                if hi < lo:
-                    hi, lo = lo, hi
-                out["dayHigh"] = hi
-                out["dayLow"] = lo
-        except Exception:
-            pass
+            if fyers_print and raw.get("_fyersRest"):
+                out["_fyersRest"] = True
+            elif not fyers_print and prev_row.get("_fyersRest"):
+                out["_fyersRest"] = True
+        # Day OHLC rides the same tape as LTP. An XTS packet must not replace
+        # open/high/low that already came from Fyers.
+        take_anchors = fyers_print or not keep_fyers
+        if keep_fyers and not fyers_print:
+            for anchor in ("prevClose", "percentChange", "dayOpen", "dayHigh", "dayLow"):
+                if anchor in prev_row and prev_row.get(anchor) is not None:
+                    out[anchor] = prev_row[anchor]
+        if take_anchors:
+            try:
+                pc = float(d.get("prevClose") or 0.0)
+                if pc > 0:
+                    out["prevClose"] = pc
+            except Exception:
+                pass
+            try:
+                ch = float(d.get("percentChange") or float("nan"))
+                if ch == ch:
+                    out["percentChange"] = ch
+            except Exception:
+                pass
+            try:
+                op = float(d.get("dayOpen") or 0.0)
+                if op > 0:
+                    out["dayOpen"] = op
+            except Exception:
+                pass
+            try:
+                hi = float(d.get("dayHigh") or 0.0)
+                lo = float(d.get("dayLow") or 0.0)
+                if hi > 0 and lo > 0:
+                    if hi < lo:
+                        hi, lo = lo, hi
+                    out["dayHigh"] = hi
+                    out["dayLow"] = lo
+            except Exception:
+                pass
         ema21 = get_ema21_engine().on_ltp(token, new_ltp, ts_wall)
         if ema21 > 0:
             out["ema21"] = ema21

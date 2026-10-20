@@ -21,7 +21,10 @@ _CACHE = Path(__file__).resolve().parent.parent / "cache" / "fyers_tokens.json"
 _MASTER_GLOB = "instruments_master_*.txt"
 _QUOTES_URL = "https://api-t1.fyers.in/data/quotes"
 _AUTH_URL = "https://api-t1.fyers.in/api/v3/validate-authcode"
-_POLL_SEC = max(0.05, float(os.environ.get("FYERS_LTP_POLL_SEC", "0.08") or "0.08"))
+# REST quotes are the free-plan budget. The socket is the live path.
+_QUOTES_FALLBACK_SEC = max(10.0, float(os.environ.get("FYERS_QUOTES_FALLBACK_SEC", "30") or "30"))
+# Standard data socket allows 100 symbols. Stay under it.
+_WS_SYMBOL_CAP = max(4, int(os.environ.get("FYERS_WS_SYMBOL_CAP", "90") or "90"))
 # Fyers access tokens are day-scoped; treat slightly early so UI prompts re-login.
 _TOKEN_SKEW_SEC = 60
 
@@ -46,6 +49,15 @@ LtpHandler = Callable[[int, int, float, float, dict[str, float]], None]
 
 def _env(key: str, default: str = "") -> str:
     return str(os.environ.get(key) or default).strip()
+
+
+def _budget_snapshot() -> dict[str, Any]:
+    try:
+        from market.fyers_budget import snapshot
+
+        return snapshot()
+    except Exception:
+        return {}
 
 
 def fyers_enabled() -> bool:
@@ -256,11 +268,45 @@ def fyers_symbol_for_iid(exchange_instrument_id: int) -> str | None:
     return _option_symbol_index().get(tid)
 
 
+_LAST_PX: dict[int, tuple[float, float]] = {}
+_LAST_PX_LOCK = threading.Lock()
+# Standard plan: at most 50 symbols on one Quotes call. Stay at 40 per request.
+_QUOTES_PER_REQUEST = 50
+_QUOTE_CHUNK = 40
+_QUOTE_MAX_SYMBOLS = 80
+
+
+def remember_ltp(exchange_instrument_id: int, ltp: float) -> None:
+    tid = int(exchange_instrument_id or 0)
+    px = float(ltp or 0.0)
+    if tid <= 0 or px <= 0:
+        return
+    with _LAST_PX_LOCK:
+        _LAST_PX[tid] = (time.monotonic(), px)
+
+
+def cached_ltp(exchange_instrument_id: int, max_age: float) -> float:
+    tid = int(exchange_instrument_id or 0)
+    if tid <= 0:
+        return 0.0
+    with _LAST_PX_LOCK:
+        row = _LAST_PX.get(tid)
+    if not row:
+        return 0.0
+    seen, px = row
+    if max_age > 0 and (time.monotonic() - seen) > max_age:
+        return 0.0
+    return px
+
+
 def quote_iids(exchange_instrument_ids: list[int]) -> dict[str, float]:
-    """One Fyers quotes call. Keys are XTS instrument ids as strings."""
+    """LTP for XTS instrument ids. Socket cache first; one budgeted Quotes call for the rest."""
     if not has_access_token():
         raise RuntimeError("Fyers not connected")
+    from market.fyers_budget import note_rate_limit, try_consume
+
     sym_to_tid: dict[str, int] = {}
+    out: dict[str, float] = {}
     for raw in exchange_instrument_ids or []:
         try:
             tid = int(raw or 0)
@@ -268,18 +314,23 @@ def quote_iids(exchange_instrument_ids: list[int]) -> dict[str, float]:
             continue
         if tid <= 0 or tid in sym_to_tid.values():
             continue
+        fresh = cached_ltp(tid, _QUOTES_FALLBACK_SEC)
+        if fresh > 0:
+            out[str(tid)] = fresh
+            continue
         sym = fyers_symbol_for_iid(tid)
-        if sym:
+        if sym and sym not in sym_to_tid and len(sym_to_tid) < _QUOTE_MAX_SYMBOLS:
             sym_to_tid[sym] = tid
     if not sym_to_tid:
-        return {}
+        return out
     hdr = access_token_header()
     if not hdr:
         raise RuntimeError("Fyers not connected")
-    out: dict[str, float] = {}
     symbols = list(sym_to_tid.keys())
-    for i in range(0, len(symbols), 40):
-        chunk = symbols[i : i + 40]
+    for i in range(0, len(symbols), _QUOTE_CHUNK):
+        chunk = symbols[i : i + _QUOTE_CHUNK][:_QUOTES_PER_REQUEST]
+        if not try_consume("quotes"):
+            break
         r = requests.get(
             _QUOTES_URL,
             params={"symbols": ",".join(chunk)},
@@ -289,6 +340,9 @@ def quote_iids(exchange_instrument_ids: list[int]) -> dict[str, float]:
         data = r.json() if r.content else {}
         if not isinstance(data, dict):
             continue
+        if r.status_code == 429 or str(data.get("s") or "").lower() == "error":
+            note_rate_limit(r.status_code, str(data.get("message") or data))
+            break
         rows = data.get("d") or data.get("data") or []
         if not isinstance(rows, list):
             continue
@@ -311,6 +365,18 @@ def quote_iids(exchange_instrument_ids: list[int]) -> dict[str, float]:
                         break
             if tid and ltp > 0:
                 out[str(tid)] = ltp
+                remember_ltp(tid, ltp)
+    if len(out) < len(exchange_instrument_ids or []):
+        for raw in exchange_instrument_ids or []:
+            try:
+                tid = int(raw or 0)
+            except Exception:
+                continue
+            if tid <= 0 or str(tid) in out:
+                continue
+            stale = cached_ltp(tid, 6 * 3600)
+            if stale > 0:
+                out[str(tid)] = stale
     return out
 
 
@@ -399,20 +465,24 @@ class FyersLtpFeed:
         self._last_ws_rx = 0.0
         self._last_sym_rx: dict[str, float] = {}
         self._last_top_poll = 0.0
+        self._last_rest_poll = 0.0
+        self._ws_dropped = 0
+        self._last_emit_mono: dict[int, float] = {}
 
     def set_ltp_handler(self, fn: LtpHandler | None) -> None:
         self._on_ltp = fn
 
     def owns_token(self, exchange_instrument_id: int) -> bool:
-        """True when this XTS token is on the Fyers LTP subscription."""
+        """True while this token is on the Fyers socket list.
+
+        Subscribed spot, VIX and option prices stay on Fyers for the whole
+        session. A quiet print must not hand the same token back to XTS.
+        """
         tid = int(exchange_instrument_id or 0)
         if tid <= 0 or not fyers_enabled() or not has_access_token():
             return False
         with self._lock:
-            for pair in self._want.values():
-                if int(pair[0]) == tid:
-                    return True
-        return False
+            return any(int(pair[0]) == tid for pair in self._want.values())
 
     def status(self) -> dict[str, Any]:
         tok = access_token_raw()
@@ -434,6 +504,9 @@ class FyersLtpFeed:
             "mode": self._mode if authed else "",
             "symbols": sorted(self._want.keys()) if authed else [],
             "rx": int(self._rx),
+            "wsCap": _WS_SYMBOL_CAP,
+            "wsDropped": int(self._ws_dropped),
+            "budget": _budget_snapshot(),
             "lastError": self._last_err
             or ("Fyers access token expired — reconnect Fyers" if expired else ""),
             "appId": (_app_id()[:6] + "…") if _app_id() else "",
@@ -443,7 +516,17 @@ class FyersLtpFeed:
         with self._lock:
             prev = set(self._want.keys())
             # TopBar index/VIX symbols win if a live option row collides on the same Fyers symbol.
-            merged = {**self._want_live, **self._want_topbar}
+            top = dict(self._want_topbar)
+            live = {k: v for k, v in self._want_live.items() if k not in top}
+            room = max(0, _WS_SYMBOL_CAP - len(top))
+            live_keys = list(live.keys())
+            if len(live_keys) > room:
+                self._ws_dropped = len(live_keys) - room
+                live = {k: live[k] for k in live_keys[:room]}
+            else:
+                self._ws_dropped = 0
+            # Anything past the Standard 100-symbol socket stays on the XTS feed.
+            merged = {**live, **top}
             self._want = merged
             nxt = set(merged.keys())
         return nxt - prev, prev - nxt
@@ -626,10 +709,10 @@ class FyersLtpFeed:
             feed._last_err = str(msg)
 
         def onclose(_msg: Any) -> None:
-            with feed._lock:
-                feed._started = False
-                feed._ws = None
-                feed._mode = ""
+            # Keep the socket object. Fyers reconnects it, and onopen must still subscribe.
+            # Dropping _ws here left the tape on the last print.
+            feed._mode = "reconnect"
+            feed._last_err = "Fyers socket reconnecting"
             try:
                 feed._start_poll_loop()
             except Exception:
@@ -678,7 +761,7 @@ class FyersLtpFeed:
             self._started = True
 
         def loop() -> None:
-            while not stop.wait(0.4):
+            while not stop.wait(5.0):
                 try:
                     self._poll_quotes_once()
                 except Exception as e:
@@ -699,18 +782,35 @@ class FyersLtpFeed:
         return None
 
     def _poll_quotes_once(self) -> None:
+        """REST quotes only as a socket fallback. A live socket does not spend the free bucket."""
+        from market.fyers_budget import try_consume
+
         now = time.monotonic()
+        socket_alive = self._ws is not None and (now - self._last_ws_rx) < _QUOTES_FALLBACK_SEC
+        gap = 120.0 if socket_alive else _QUOTES_FALLBACK_SEC
+        if now - self._last_rest_poll < gap:
+            return
         with self._lock:
             topbar = dict(self._want_topbar)
+            want = dict(self._want)
             live = {k: v for k, v in self._want_live.items() if k not in self._want_topbar}
-        # Option prints must not hide a quiet index. Poll Spot/VIX only when they themselves go silent.
-        quiet = {sym: pair for sym, pair in topbar.items() if now - self._last_sym_rx.get(sym, 0.0) >= 1.0}
-        if quiet and now - self._last_top_poll >= 1.0:
-            self._last_top_poll = now
-            self._fetch_quote_rows(quiet)
-        # Option REST only when the socket itself is quiet, so a busy tape is not rate-limited.
-        if live and (self._ws is None or now - self._last_ws_rx >= 1.2):
-            self._fetch_quote_rows(live)
+        need: dict[str, tuple[int, int]] = {}
+        if socket_alive:
+            for sym, pair in topbar.items():
+                if now - self._last_sym_rx.get(sym, 0.0) >= gap:
+                    need[sym] = pair
+        else:
+            need.update(topbar)
+            for sym, pair in live.items():
+                if sym in need or sym not in want:
+                    continue
+                if len(need) >= 40:
+                    break
+                need[sym] = pair
+        if not need or not try_consume("quotes"):
+            return
+        self._last_rest_poll = now
+        self._fetch_quote_rows(need)
 
     def _fetch_quote_rows(self, want: dict[str, tuple[int, int]]) -> None:
         if not want:
@@ -719,9 +819,10 @@ class FyersLtpFeed:
         if not hdr:
             return
         started = time.monotonic()
+        symbols = list(want.keys())[:_QUOTES_PER_REQUEST]
         r = requests.get(
             _QUOTES_URL,
-            params={"symbols": ",".join(want.keys())},
+            params={"symbols": ",".join(symbols)},
             headers={"Authorization": hdr},
             timeout=1.5,
         )
@@ -731,6 +832,12 @@ class FyersLtpFeed:
         if str(data.get("s") or "").lower() not in ("ok", "") and data.get("code") not in (200, None, 0):
             msg = str(data.get("message") or data)
             self._last_err = msg
+            try:
+                from market.fyers_budget import note_rate_limit
+
+                note_rate_limit(int(r.status_code or 0), msg)
+            except Exception:
+                pass
             # Token died mid-session — force UI back to Connect Fyers.
             code = data.get("code")
             low = msg.lower()
@@ -764,10 +871,12 @@ class FyersLtpFeed:
             if pair is None:
                 continue
             # Keep a newer socket print for this symbol. Another symbol's tick must not drop Spot.
-            if self._last_sym_rx.get(sym, 0.0) >= started:
+            # A socket print in the last few seconds is the live price.
+            # A quote snapshot must not rewind it.
+            if time.monotonic() - self._last_sym_rx.get(sym, 0.0) < 8.0:
                 continue
             tid, seg = pair
-            self._emit(tid, seg, ltp, _px(v.get("tt")), extras)
+            self._emit(tid, seg, ltp, _px(v.get("tt")), extras, from_rest=True)
 
     def _on_ws_message(self, msg: Any) -> None:
         if isinstance(msg, list):
@@ -809,11 +918,26 @@ class FyersLtpFeed:
         tid, seg = pair
         self._emit(tid, seg, ltp, ltt, extras)
 
-    def _emit(self, tid: int, seg: int, ltp: float, ltt: float, extras: dict[str, float] | None = None) -> None:
+    def _emit(
+        self,
+        tid: int,
+        seg: int,
+        ltp: float,
+        ltt: float,
+        extras: dict[str, float] | None = None,
+        from_rest: bool = False,
+    ) -> None:
         self._rx += 1
+        # Only a socket print owns the token. A REST snapshot must not block the live tape.
+        if not from_rest:
+            self._last_emit_mono[int(tid)] = time.monotonic()
+        remember_ltp(tid, ltp)
         fn = self._on_ltp
         if fn:
-            fn(int(tid), int(seg), float(ltp), float(ltt), dict(extras or {}))
+            payload = dict(extras or {})
+            if from_rest:
+                payload["fromRest"] = 1.0
+            fn(int(tid), int(seg), float(ltp), float(ltt), payload)
 
 
 _FEED: FyersLtpFeed | None = None

@@ -30,11 +30,15 @@ PE_AUTO_EXIT_THRESHOLD = 25.0
 
 SUPPORTED_TIMEFRAMES = [1, 2, 3, 5, 10, 15, 30]
 
-# Simple in-memory cache to avoid hammering APIs when polled every 5s
+# Chart payload cache. History itself is shared and budgeted in fyers_budget.
 _CACHE: dict[int, dict[str, Any]] = {}  # tf_minutes -> {ts, payload}
-_CACHE_TTL_SEC = 60.0
 _refresh_guard = threading.Lock()
 _refreshing: set[int] = set()
+
+
+def _rsi_cache_ttl(tf: int) -> float:
+    """Forming RSI uses live spot. Closed candles refresh once per bar."""
+    return max(50.0, float(tf) * 60.0 - 8.0)
 
 
 def compute_wilder_rsi_series(closes: list[float], period: int = RSI_PERIOD) -> tuple[list[float | None], float | None, float | None]:
@@ -122,20 +126,21 @@ def _fyers_history_date(epoch: int) -> str:
 
 def _fetch_fyers_history(symbol: str, resolution: str, from_epoch: int, to_epoch: int) -> list[dict[str, Any]]:
     """
-    Fetch historical candles from Fyers API v3.
-    Returns list of dict: {time, open, high, low, close, volume}
+    Fyers history, served from the shared disk/Redis candle cache when it is fresh.
+    A network pull is one Standard-plan data call and is skipped once the free budget is held.
     """
     global _HIST_FAIL_UNTIL, _HIST_FAIL_LOG_AT
+    from market.fyers_budget import cached_history, history_is_fresh, note_rate_limit, store_history, try_consume
     from market.fyers_ltp import access_token_header, has_access_token
 
-    if not has_access_token():
-        return []
-    if time.time() < _HIST_FAIL_UNTIL:
-        return []
-
+    cached = cached_history(symbol, resolution, from_epoch, to_epoch)
+    if history_is_fresh(symbol, resolution):
+        return cached
+    if not has_access_token() or time.time() < _HIST_FAIL_UNTIL:
+        return cached
     hdr = access_token_header()
-    if not hdr:
-        return []
+    if not hdr or not try_consume("history"):
+        return cached
 
     url = "https://api-t1.fyers.in/data/history"
     params = {
@@ -149,17 +154,19 @@ def _fetch_fyers_history(symbol: str, resolution: str, from_epoch: int, to_epoch
     try:
         r = requests.get(url, params=params, headers={"Authorization": hdr}, timeout=12)
         if r.status_code != 200:
+            note_rate_limit(r.status_code, r.text[:300])
             # 429 means the data API is exhausted — back off long enough for the limit to clear.
             _HIST_FAIL_UNTIL = time.time() + (180.0 if r.status_code == 429 else 20.0)
             if time.time() - _HIST_FAIL_LOG_AT > 30.0:
                 _HIST_FAIL_LOG_AT = time.time()
                 _log.warning("Fyers history API returned %s — backing off", r.status_code)
-            return []
-        _HIST_FAIL_UNTIL = 0.0
-        data = r.json()
+            return cached
+        data = r.json() if r.content else {}
         if not isinstance(data, dict) or data.get("s") != "ok":
+            note_rate_limit(int(data.get("code") or 0) if isinstance(data, dict) else 0, str(data))
             _HIST_FAIL_UNTIL = time.time() + 20.0
-            return []
+            return cached
+        _HIST_FAIL_UNTIL = 0.0
         raw_candles = data.get("candles") or []
         bars: list[dict[str, Any]] = []
         for c in raw_candles:
@@ -172,13 +179,16 @@ def _fetch_fyers_history(symbol: str, resolution: str, from_epoch: int, to_epoch
                     "close": float(c[4]),
                     "volume": float(c[5]) if len(c) > 5 else 0.0,
                 })
-        return bars
+        if bars:
+            store_history(symbol, resolution, bars)
+            return cached_history(symbol, resolution, from_epoch, to_epoch)
+        return cached
     except Exception as e:
         _HIST_FAIL_UNTIL = time.time() + 20.0
         if time.time() - _HIST_FAIL_LOG_AT > 30.0:
             _HIST_FAIL_LOG_AT = time.time()
             _log.warning("Fyers history API exception: %s", e)
-        return []
+        return cached
 
 
 def _fetch_xts_candles(client: Any, tf_minutes: int) -> list[dict[str, Any]]:
@@ -326,14 +336,17 @@ def _history_span_days(tf_minutes: int) -> int:
 
 
 def _load_spot_candles(symbol: str, tf: int, now_epoch: int) -> list[dict[str, Any]]:
+    """One shared 1-minute history pull. Higher RSI timeframes are built locally."""
+    from market.fyers_budget import aggregate_1m
+
     span = _history_span_days(tf)
-    candles = _fetch_fyers_history(symbol, str(tf), now_epoch - span * 86400, now_epoch)
+    raw = _fetch_fyers_history(symbol, "1", now_epoch - span * 86400, now_epoch)
     # A holiday cluster can still leave fewer than 15 closes. Widen once.
-    if len(candles) <= RSI_PERIOD and time.time() >= _HIST_FAIL_UNTIL:
-        wider = _fetch_fyers_history(symbol, str(tf), now_epoch - span * 2 * 86400, now_epoch)
-        if len(wider) > len(candles):
-            candles = wider
-    return candles
+    if len(raw) <= RSI_PERIOD and time.time() >= _HIST_FAIL_UNTIL:
+        wider = _fetch_fyers_history(symbol, "1", now_epoch - span * 2 * 86400, now_epoch)
+        if len(wider) > len(raw):
+            raw = wider
+    return aggregate_1m(raw, tf)
 
 
 def _schedule_rsi_refresh(tf: int, live_spot: float | None, xts_client: Any) -> None:
@@ -369,7 +382,7 @@ def get_rsi_analysis(
     cached = _CACHE.get(tf)
     if isinstance(cached, dict) and isinstance(cached.get("payload"), dict):
         payload = _apply_live_spot(dict(cached["payload"]), live_spot)
-        if (now_epoch - float(cached.get("ts") or 0)) >= _CACHE_TTL_SEC:
+        if (now_epoch - float(cached.get("ts") or 0)) >= _rsi_cache_ttl(tf):
             _schedule_rsi_refresh(tf, live_spot, xts_client)
         return payload
     return _compute_rsi_analysis(tf, live_spot, xts_client)

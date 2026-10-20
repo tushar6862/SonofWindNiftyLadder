@@ -52,16 +52,19 @@ const liveTickPeek = new Map<number, LiveTickPeek>();
 const ltpPaintListeners = new Map<number, Set<(ltp: number) => void>>();
 /** Socket / Fyers last-trade time. REST must not stamp this. */
 const socketPrintAt = new Map<number, number>();
-/** Tokens Fyers has printed. XTS / REST must not change their LTP for the session. */
+/** Last Fyers socket print. A Fyers REST snapshot must not rewind it. */
 const fyersPrintAt = new Map<number, number>();
+/** Tokens whose price is Fyers for this login. XTS must not paint them again. */
+const fyersOwnedIds = new Set<number>();
+const FYERS_OWNS_MS = 8000;
 
 /** REST seeds only when socket/Fyers quiet. */
 export const SOCKET_LTP_BEATS_REST_MS = 2000;
 
-/** True after the first Fyers last-trade on this token. Does not expire. */
+/** True once Fyers has priced this token. Ownership lasts until logout. */
 export function fyersOwnsLtp(id: number): boolean {
   if (!Number.isFinite(id) || id <= 0) return false;
-  return fyersPrintAt.has(id);
+  return fyersOwnedIds.has(id);
 }
 
 export function fyersBeatsXts(id: number): boolean {
@@ -491,6 +494,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
     const onLtpSnapshot = (ev: Event) => {
       const ce = ev as CustomEvent<{ map?: Record<number, number>; source?: string }>;
       const snap = ce?.detail?.map;
+      const fromFyers = ce?.detail?.source === "fyers";
       if (!snap || typeof snap !== "object") return;
       setMap((prev) => {
         let changed = false;
@@ -499,8 +503,9 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           const id = Number(k);
           if (!Number.isFinite(id) || id <= 0) continue;
           if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) continue;
-          // Fyers owns LIVE for this token. XTS quote seed must not replace it.
-          if (fyersOwnsLtp(id) || socketBeatsRest(id)) continue;
+          if (fromFyers) fyersOwnedIds.add(id);
+          // Fyers owns LIVE for this token. An XTS quote seed must not replace it.
+          if (!fromFyers && (fyersOwnsLtp(id) || socketBeatsRest(id))) continue;
           rememberLiveTick(id, v, null, null, true);
           if (next[id] !== v) {
             next[id] = v;
@@ -529,6 +534,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
     liveTickPeek.clear();
     socketPrintAt.clear();
     fyersPrintAt.clear();
+    fyersOwnedIds.clear();
     pendingRef.current.clear();
     cancelScheduledFlush(flushScheduledRef, flushRafRef);
     if (reconnectTimerRef.current != null) {
@@ -685,14 +691,30 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
               : null;
         const gapFill = t._gapFill === true || t._fromRestQuote === true || t._hotLtp === true;
         const fyersLtp = t._fyersLtp === true;
+        const fyersRest = t._fyersRest === true;
         const xtsLtpBlocked = !fyersLtp && fyersOwnsLtp(id);
-        // Fyers LIVE / TopBar LTP — paint first. Later XTS packets cannot replace this price.
+        // Fyers socket LTP paints first. A REST snapshot must not rewind that print,
+        // and it must not lock XTS out — that lock was the sahi/galat/sahi flicker.
         if (fyersLtp && ltpFastRaw != null) {
-          // Always paint the latest Fyers price. An older exchange timestamp must not
-          // freeze LIVE until a later print "catches up" (SS: stuck 73.10 while tape moved).
-          rememberLiveTick(id, ltpFastRaw, null, null, false, null);
-          fyersPrintAt.set(id, performance.now());
-          socketPrintAt.set(id, performance.now());
+          if (fyersRest) {
+            const age = socketPrintAgeMs(id);
+            if (age != null && age < FYERS_OWNS_MS) return;
+          }
+          const fyersTs =
+            typeof t.exchange_ts === "number" && t.exchange_ts > 1e9
+              ? t.exchange_ts
+              : typeof t.LastTradedTime === "number" && t.LastTradedTime > 1e9
+                ? t.LastTradedTime > 1e12
+                  ? t.LastTradedTime / 1000
+                  : t.LastTradedTime
+                : null;
+          rememberLiveTick(id, ltpFastRaw, null, null, fyersRest, fyersTs);
+          if (fyersRest && peekLiveLtp(id) !== ltpFastRaw) return;
+          fyersOwnedIds.add(id);
+          if (!fyersRest) {
+            fyersPrintAt.set(id, performance.now());
+            socketPrintAt.set(id, performance.now());
+          }
           streamLtpAtRef.current.set(id, performance.now());
           lastStreamLtpAtRef.current = Date.now();
           const pending = pendingRef.current;
@@ -852,11 +874,12 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
         }
 
         if (
-          prevClose !== undefined ||
-          pctFeed !== undefined ||
-          dayOpen !== undefined ||
-          dayHigh !== undefined ||
-          dayLow !== undefined
+          !xtsLtpBlocked &&
+          (prevClose !== undefined ||
+            pctFeed !== undefined ||
+            dayOpen !== undefined ||
+            dayHigh !== undefined ||
+            dayLow !== undefined)
         ) {
           const spotDay: SpotDayRefMap[number] = { ...row.spotDay };
           if (prevClose !== undefined) spotDay.prevClose = prevClose;

@@ -445,7 +445,7 @@ export default function RsiBandPanel({ chain, active }: { chain: ChainResolved; 
       }
     };
     void run();
-    const id = window.setInterval(() => void run(), 45000);
+    const id = window.setInterval(() => void run(), 120000);
     return () => {
       cancelled = true;
       window.clearInterval(id);
