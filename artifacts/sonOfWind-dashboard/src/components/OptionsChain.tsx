@@ -4,11 +4,11 @@ import { lotSizeForIndex } from "@/lib/lot";
 import type { ChainResolved, ExpiryRow } from "@/types/market";
 import { apiFetch } from "@/lib/backend";
 import { toast } from "@/hooks/use-toast";
-import NiftyFlipPanel from "@/components/NiftyFlipPanel";
 import NiftyLadderPanel from "@/components/NiftyLadderPanel";
 import NiftySnakePanel from "@/components/NiftySnakePanel";
 import RsiBandPanel from "@/components/RsiBandPanel";
 import NiftyVwapPanel from "@/components/NiftyVwapPanel";
+import NiftyFastPanel from "@/components/NiftyFastPanel";
 import { bumpPositionsRefresh } from "@/lib/ixPortfolio";
 
 export default function OptionsChain({
@@ -21,8 +21,6 @@ export default function OptionsChain({
   error?: string | null;
   range: number;
   onRangeChange?: (range: number) => void;
-  wings?: number;
-  onWingsChange?: (wings: number) => void;
   selectedStrike?: number | null;
   onStrikeSelect?: (strike: number) => void;
   expiryRows?: ExpiryRow[];
@@ -31,7 +29,7 @@ export default function OptionsChain({
 }) {
   const lotSize = lotSizeForIndex(index);
   const qty = Math.max(1, lotSize);
-  const [desk, setDesk] = useState<"ladder" | "snake" | "rsi" | "flip" | "vwap">("ladder");
+  const [desk, setDesk] = useState<"ladder" | "snake" | "rsi" | "vwap" | "fast">("ladder");
   const [exitBusy, setExitBusy] = useState(false);
   const [exitSelected, setExitSelected] = useState<25 | 50 | 75 | 100 | null>(null);
 
@@ -98,17 +96,17 @@ export default function OptionsChain({
         </button>
         <button
           type="button"
-          className={`sow-glass-tab${desk === "flip" ? " sow-glass-tab--active" : ""}`}
-          onClick={() => setDesk("flip")}
-        >
-          Nifty Flip
-        </button>
-        <button
-          type="button"
           className={`sow-glass-tab${desk === "vwap" ? " sow-glass-tab--active" : ""}`}
           onClick={() => setDesk("vwap")}
         >
-          Nifty VWAP
+          VWAP
+        </button>
+        <button
+          type="button"
+          className={`sow-glass-tab${desk === "fast" ? " sow-glass-tab--active" : ""}`}
+          onClick={() => setDesk("fast")}
+        >
+          1 min Fast
         </button>
       </div>
 
@@ -129,7 +127,7 @@ export default function OptionsChain({
               {error ? "Chain load failed" : "Syncing option chain"}
             </div>
             <div className="text-[11px] text-muted-foreground mt-0.5">
-              {error || "Subscribing LTP and building NIFTY strikes…"}
+              {error || `Subscribing LTP and building ${index} strikes…`}
             </div>
           </div>
           <div className="z-10 w-full max-w-[520px] flex flex-col items-center gap-3">
@@ -160,14 +158,14 @@ export default function OptionsChain({
           <div className={desk === "rsi" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "rsi"}>
             <RsiBandPanel chain={resolved} active={desk === "rsi"} />
           </div>
-          <div className={desk === "flip" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "flip"}>
-            <NiftyFlipPanel chain={resolved} active={desk === "flip"} />
-          </div>
-          <div className={desk === "vwap" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "vwap"}>
-            <NiftyVwapPanel chain={resolved} active={desk === "vwap"} />
-          </div>
         </>
       )}
+      <div className={desk === "vwap" && resolved ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "vwap" || !resolved}>
+        <NiftyVwapPanel index={index} chain={resolved} active={desk === "vwap" && !!resolved} />
+      </div>
+      <div className={desk === "fast" && resolved ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "fast" || !resolved}>
+        <NiftyFastPanel index={index} chain={resolved} active={desk === "fast" && !!resolved} />
+      </div>
 
       <div className="sow-footer-scroll sow-glass-footer-bar w-full min-w-0 shrink-0 text-[11px]">
         <div className="flex min-w-max items-center gap-2">

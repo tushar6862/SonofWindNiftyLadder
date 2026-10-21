@@ -337,8 +337,6 @@ export default function DashboardPage() {
                 error={chainError}
                 range={range}
                 onRangeChange={setRange}
-                wings={wings}
-                onWingsChange={setWings}
                 selectedStrike={strikeFocus}
                 onStrikeSelect={(s) => setStrikeFocus((prev) => (prev === s ? null : s))}
                 expiryRows={expiryRows}

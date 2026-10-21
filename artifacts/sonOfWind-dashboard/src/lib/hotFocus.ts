@@ -8,6 +8,32 @@ let lastKey = "";
 
 let topbarTimer: number | null = null;
 let topbarKey = "";
+let topbarBody: {
+  index: string;
+  spot: HotInst | null;
+  vix: HotInst | null;
+  options: HotInst[];
+} | null = null;
+
+function postHotFocus(instruments: HotInst[]): void {
+  void apiFetch("/api/md/hot_focus", {
+    method: "POST",
+    body: JSON.stringify({ instruments }),
+  }).catch(() => {
+    /* best-effort */
+  });
+}
+
+function postTopbar(): void {
+  const body = topbarBody;
+  if (!body) return;
+  void apiFetch("/api/fyers/topbar_focus", {
+    method: "POST",
+    body: JSON.stringify(body),
+  }).catch(() => {
+    /* best-effort */
+  });
+}
 
 function flush(): void {
   timer = null;
@@ -26,16 +52,32 @@ function flush(): void {
     .join("|");
   if (key === lastKey) return;
   lastKey = key;
-  void apiFetch("/api/md/hot_focus", {
-    method: "POST",
-    body: JSON.stringify({ instruments }),
-  }).catch(() => {
-    /* best-effort */
-  });
+  postHotFocus(instruments);
+}
+
+/**
+ * Backend restart keeps the page's last pin and never sends it again.
+ * Spot/VIX then stay on the old print because XTS touchline is not their feed.
+ */
+function repinAfterRestart(): void {
+  const merged = new Map<number, HotInst>();
+  for (const list of bySource.values()) {
+    for (const inst of list) {
+      if (inst.exchangeInstrumentID > 0 && inst.exchangeSegment > 0) {
+        merged.set(inst.exchangeInstrumentID, inst);
+      }
+    }
+  }
+  postHotFocus(Array.from(merged.values()));
+  postTopbar();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("sonofwind_md_resubscribe", repinAfterRestart);
 }
 
 /** Pin LIVE/hunt tokens so the backend polls touchline ~200ms for those strikes only. */
-export function setHotFocus(source: "ladder" | "snake" | "flip" | "rsi" | "vwap", instruments: HotInst[]): void {
+export function setHotFocus(source: "ladder" | "snake" | "rsi" | "vwap" | "fast", instruments: HotInst[]): void {
   bySource.set(
     source,
     instruments.filter((i) => i.exchangeInstrumentID > 0 && i.exchangeSegment > 0),
@@ -61,21 +103,12 @@ export function setFyersTopbarFocus(args: {
     vix ? `${vix.exchangeSegment}:${vix.exchangeInstrumentID}` : "",
     ...options.map((o) => `${o.exchangeSegment}:${o.exchangeInstrumentID}`).sort(),
   ].join("|");
+  topbarBody = { index: args.index, spot, vix, options };
   if (key === topbarKey) return;
   topbarKey = key;
   if (topbarTimer != null) window.clearTimeout(topbarTimer);
   topbarTimer = window.setTimeout(() => {
     topbarTimer = null;
-    void apiFetch("/api/fyers/topbar_focus", {
-      method: "POST",
-      body: JSON.stringify({
-        index: args.index,
-        spot,
-        vix,
-        options,
-      }),
-    }).catch(() => {
-      /* best-effort */
-    });
+    postTopbar();
   }, 50);
 }

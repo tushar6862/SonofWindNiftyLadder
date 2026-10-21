@@ -640,13 +640,30 @@ def rsi_data():
 
 @app.route("/api/vwap/data", methods=["GET"])
 def vwap_data():
-    """Nifty session VWAP from Fyers spot candles and front-month futures volume."""
+    """Session VWAP for the top-bar index. Spot candles come from Fyers."""
+    index = str(request.args.get("index") or "NIFTY").strip().upper()
+    if index not in ("NIFTY", "BANKNIFTY", "SENSEX"):
+        return jsonify({"ok": False, "error": "index must be NIFTY, BANKNIFTY, or SENSEX"}), 400
     try:
-        from market.nifty_vwap import get_nifty_vwap
+        from market.nifty_vwap import get_index_vwap
 
-        return jsonify(get_nifty_vwap())
+        return jsonify(get_index_vwap(index))
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "index": index, "error": str(e)}), 500
+
+
+@app.route("/api/fast/open920", methods=["GET"])
+def fast_open920():
+    """09:20 one-minute open for the top-bar index. Spot candles come from Fyers."""
+    index = str(request.args.get("index") or "NIFTY").strip().upper()
+    if index not in ("NIFTY", "BANKNIFTY", "SENSEX"):
+        return jsonify({"ok": False, "error": "index must be NIFTY, BANKNIFTY, or SENSEX"}), 400
+    try:
+        from market.open920 import get_index_open920
+
+        return jsonify(get_index_open920(index))
+    except Exception as e:
+        return jsonify({"ok": False, "index": index, "error": str(e)}), 500
 
 
 @app.post("/api/md/dada/range")

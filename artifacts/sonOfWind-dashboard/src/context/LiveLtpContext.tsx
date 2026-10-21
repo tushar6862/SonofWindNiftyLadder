@@ -956,6 +956,12 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
       es.onopen = () => {
         backoffMs = 500;
         mdStreamLive = true;
+        // A dead tape must not keep blocking XTS. Fyers takes the token back on its next print.
+        const last = lastStreamLtpAtRef.current;
+        if (last && Date.now() - last > FYERS_OWNS_MS) {
+          fyersOwnedIds.clear();
+          fyersPrintAt.clear();
+        }
       };
 
       es.onmessage = (ev) => {

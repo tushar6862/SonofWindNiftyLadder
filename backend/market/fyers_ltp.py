@@ -464,6 +464,8 @@ class FyersLtpFeed:
         self._mode = ""
         self._last_ws_rx = 0.0
         self._last_sym_rx: dict[str, float] = {}
+        self._last_px: dict[str, float] = {}
+        self._last_px_change: dict[str, float] = {}
         self._last_top_poll = 0.0
         self._last_rest_poll = 0.0
         self._ws_dropped = 0
@@ -739,6 +741,23 @@ class FyersLtpFeed:
                 on_error=onerror,
                 on_message=onmessage,
             )
+            # SDK 3.0.9 decodes the JWT by splitting the whole access token on ".".
+            # "APPID:eyJ...." fails that decode, connect() never opens the socket,
+            # and spot/ATM only jump when the slow quote poll lands.
+            _bare = token.split(":", 1)[1] if ":" in token.split(".", 1)[0] else token
+            _orig_decode = ws.access_token_to_hsmtoken
+            _tok_attr = "_FyersDataSocket__access_token"
+
+            def _decode_jwt() -> bool:
+                saved = getattr(ws, _tok_attr)
+                if _bare and _bare != saved:
+                    setattr(ws, _tok_attr, _bare)
+                try:
+                    return bool(_orig_decode())
+                finally:
+                    setattr(ws, _tok_attr, saved)
+
+            ws.access_token_to_hsmtoken = _decode_jwt
             self._ws = ws
             self._mode = "ws"
             with self._lock:
@@ -787,9 +806,8 @@ class FyersLtpFeed:
 
         now = time.monotonic()
         socket_alive = self._ws is not None and (now - self._last_ws_rx) < _QUOTES_FALLBACK_SEC
-        gap = 120.0 if socket_alive else _QUOTES_FALLBACK_SEC
-        if now - self._last_rest_poll < gap:
-            return
+        # A socket that keeps echoing the same index print must not hide a live quote.
+        stale_px = 12.0
         with self._lock:
             topbar = dict(self._want_topbar)
             want = dict(self._want)
@@ -797,9 +815,14 @@ class FyersLtpFeed:
         need: dict[str, tuple[int, int]] = {}
         if socket_alive:
             for sym, pair in topbar.items():
-                if now - self._last_sym_rx.get(sym, 0.0) >= gap:
+                changed = self._last_px_change.get(sym, 0.0)
+                if changed <= 0 or now - changed >= stale_px:
                     need[sym] = pair
+            if not need or now - self._last_rest_poll < stale_px:
+                return
         else:
+            if now - self._last_rest_poll < _QUOTES_FALLBACK_SEC:
+                return
             need.update(topbar)
             for sym, pair in live.items():
                 if sym in need or sym not in want:
@@ -870,12 +893,17 @@ class FyersLtpFeed:
             pair = self._resolve_pair(sym)
             if pair is None:
                 continue
-            # Keep a newer socket print for this symbol. Another symbol's tick must not drop Spot.
-            # A socket print in the last few seconds is the live price.
-            # A quote snapshot must not rewind it.
-            if time.monotonic() - self._last_sym_rx.get(sym, 0.0) < 8.0:
+            # A socket print that actually changed the price wins.
+            # The same repeated print must not block a newer quote.
+            changed = self._last_px_change.get(sym, 0.0)
+            if changed > 0 and time.monotonic() - changed < 8.0:
                 continue
             tid, seg = pair
+            now_px = time.monotonic()
+            prev_px = self._last_px.get(sym)
+            if prev_px is None or abs(prev_px - ltp) >= 0.01:
+                self._last_px[sym] = ltp
+                self._last_px_change[sym] = now_px
             self._emit(tid, seg, ltp, _px(v.get("tt")), extras, from_rest=True)
 
     def _on_ws_message(self, msg: Any) -> None:
@@ -915,6 +943,10 @@ class FyersLtpFeed:
         now_rx = time.monotonic()
         self._last_ws_rx = now_rx
         self._last_sym_rx[sym] = now_rx
+        prev_px = self._last_px.get(sym)
+        if prev_px is None or abs(prev_px - ltp) >= 0.01:
+            self._last_px[sym] = ltp
+            self._last_px_change[sym] = now_rx
         tid, seg = pair
         self._emit(tid, seg, ltp, ltt, extras)
 

@@ -30,11 +30,14 @@ ANCHOR_CLOSE = 22609.0
 ANCHOR_VWAP = 22558.77
 ANCHOR_TOLERANCE = 0.15
 
-_CACHE: dict[str, Any] = {}
-# Closed VWAP changes once a minute. The 1-minute candles are the shared Fyers cache.
+_INDEXES = ("NIFTY", "BANKNIFTY", "SENSEX")
+_LABELS = {"NIFTY": "Nifty", "BANKNIFTY": "Bank Nifty", "SENSEX": "Sensex"}
+
+# Per index: {"ts", "payload"}. Closed VWAP changes once a minute.
+_CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_TTL_SEC = 55.0
 _refresh_guard = threading.Lock()
-_refreshing = False
+_refreshing: set[str] = set()
 _FRONT_CACHE: dict[str, Any] = {}
 
 
@@ -248,12 +251,31 @@ def anchor_check(closed: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def normalize_index(index_key: str | None) -> str:
+    key = str(index_key or "NIFTY").strip().upper()
+    if key not in _INDEXES:
+        raise ValueError("index must be NIFTY, BANKNIFTY, or SENSEX")
+    return key
+
+
+def _label(index_key: str) -> str:
+    return _LABELS[index_key]
+
+
+def _spot_symbol(index_key: str) -> str:
+    from market.fyers_ltp import FYERS_INDEX_SYMBOL
+
+    return FYERS_INDEX_SYMBOL[index_key]
+
+
 def build_vwap_from_candles(
     spot_bars: list[dict[str, Any]],
     fut_bars: list[dict[str, Any]],
     now: datetime,
     future_symbol: str = "",
     future_expiry: str = "",
+    label: str = "Nifty",
+    index_key: str = "NIFTY",
 ) -> dict[str, Any]:
     spot_days = _index_session_bars(spot_bars)
     fut_days = _index_session_bars(fut_bars)
@@ -261,7 +283,8 @@ def build_vwap_from_candles(
     if session is None:
         return {
             "ok": False,
-            "error": "No Nifty cash-session candles from Fyers yet.",
+            "index": index_key,
+            "error": f"No {label} cash-session candles from Fyers yet.",
             "source": "fyers",
             "futureSymbol": future_symbol,
         }
@@ -269,7 +292,8 @@ def build_vwap_from_candles(
     if summed["vwap"] is None:
         return {
             "ok": False,
-            "error": "Nifty spot volume has not printed for this session.",
+            "index": index_key,
+            "error": f"{label} spot volume has not printed for this session.",
             "source": "fyers",
             "sessionDate": session.isoformat(),
             "futureSymbol": future_symbol,
@@ -289,6 +313,7 @@ def build_vwap_from_candles(
         )
     return {
         "ok": True,
+        "index": index_key,
         "source": "fyers",
         "sessionDate": session.isoformat(),
         "futureSymbol": future_symbol,
@@ -375,63 +400,77 @@ def _resolve_front(as_of: date) -> dict[str, str] | None:
     return found
 
 
-def _compute(now: datetime) -> dict[str, Any]:
+def _compute(now: datetime, index_key: str = "NIFTY") -> dict[str, Any]:
     from market.rsi_band import _fetch_fyers_history
 
+    key = normalize_index(index_key)
+    symbol = _spot_symbol(key)
+    label = _label(key)
     now_epoch = int(now.timestamp())
     start_epoch = int((now - timedelta(days=6)).timestamp())
-    spot = _fetch_fyers_history(SPOT_SYMBOL, "1", start_epoch, now_epoch)
+    spot = _fetch_fyers_history(symbol, "1", start_epoch, now_epoch)
     if not spot:
         return {
             "ok": False,
-            "error": "Fyers Nifty spot history is unavailable.",
+            "index": key,
+            "error": f"Fyers {label} spot history is unavailable.",
             "source": "fyers",
-            "futureSymbol": SPOT_SYMBOL,
+            "futureSymbol": symbol,
         }
-    return build_vwap_from_candles(spot, [], now, future_symbol=SPOT_SYMBOL)
+    return build_vwap_from_candles(
+        spot,
+        [],
+        now,
+        future_symbol=symbol,
+        label=label,
+        index_key=key,
+    )
 
 
-def _schedule_refresh() -> None:
-    global _refreshing
+def _schedule_refresh(index_key: str) -> None:
+    key = normalize_index(index_key)
     with _refresh_guard:
-        if _refreshing:
+        if key in _refreshing:
             return
-        _refreshing = True
+        _refreshing.add(key)
 
     def run() -> None:
-        global _refreshing
         try:
-            payload = _compute(datetime.now(IST))
+            payload = _compute(datetime.now(IST), key)
             if payload.get("ok"):
-                _CACHE["ts"] = time.time()
-                _CACHE["payload"] = payload
-            elif _CACHE.get("payload"):
-                _log.info("Nifty VWAP refresh kept the last Fyers session: %s", payload.get("error"))
+                _CACHE[key] = {"ts": time.time(), "payload": payload}
+            elif (_CACHE.get(key) or {}).get("payload"):
+                _log.info("%s VWAP refresh kept the last Fyers session: %s", _label(key), payload.get("error"))
         finally:
             with _refresh_guard:
-                _refreshing = False
+                _refreshing.discard(key)
 
-    threading.Thread(target=run, name="nifty-vwap", daemon=True).start()
+    threading.Thread(target=run, name=f"{key.lower()}-vwap", daemon=True).start()
 
 
-def get_nifty_vwap() -> dict[str, Any]:
-    """Cached session VWAP. History refresh stays off the request after the first fill."""
-    cached = _CACHE.get("payload")
-    age = time.time() - float(_CACHE.get("ts") or 0)
+def get_index_vwap(index_key: str = "NIFTY") -> dict[str, Any]:
+    """Cached session VWAP for the top-bar index. History refresh stays off the request after the first fill."""
+    key = normalize_index(index_key)
+    bucket = _CACHE.get(key) or {}
+    cached = bucket.get("payload")
+    age = time.time() - float(bucket.get("ts") or 0)
     if isinstance(cached, dict) and cached.get("ok"):
         if age >= _CACHE_TTL_SEC:
-            _schedule_refresh()
+            _schedule_refresh(key)
         return cached
-    payload = _compute(datetime.now(IST))
+    payload = _compute(datetime.now(IST), key)
     if payload.get("ok"):
-        _CACHE["ts"] = time.time()
-        _CACHE["payload"] = payload
+        _CACHE[key] = {"ts": time.time(), "payload": payload}
         return payload
     if isinstance(cached, dict):
         stale = dict(cached)
         stale["stale"] = True
         return stale
     return payload
+
+
+def get_nifty_vwap() -> dict[str, Any]:
+    return get_index_vwap("NIFTY")
 
 
 def _self_check() -> None:
@@ -487,6 +526,14 @@ def _self_check() -> None:
     front = front_month_nifty_future(date(2026, 10, 5), master)
     if not front or front["symbol"] != "NSE:NIFTY26OCTFUT":
         raise SystemExit(f"front month picked {front}")
+    if _spot_symbol("SENSEX") != "BSE:SENSEX-INDEX" or _spot_symbol("BANKNIFTY") != "NSE:NIFTYBANK-INDEX":
+        raise SystemExit("index spot symbols drifted")
+    try:
+        normalize_index("FINNIFTY")
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("unknown index was accepted")
     print("nifty vwap self-check ok")
 
 
