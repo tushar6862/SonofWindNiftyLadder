@@ -666,6 +666,35 @@ def fast_open920():
         return jsonify({"ok": False, "index": index, "error": str(e)}), 500
 
 
+@app.route("/api/cd/range", methods=["GET"])
+def cd_range():
+    """SENSEX range from the saved timeframe, candle count, and min gap. The forming bar is excluded."""
+    try:
+        from market.cd_range import get_cd_range
+
+        allowed_tf = (1, 5, 15, 30)
+        try:
+            tf = int(request.args.get("tf", 15))
+        except (TypeError, ValueError):
+            tf = 15
+        if tf not in allowed_tf:
+            tf = 15
+        try:
+            candles = int(request.args.get("candles", 4))
+        except (TypeError, ValueError):
+            candles = 4
+        candles = max(1, min(20, candles))
+        try:
+            gap = float(request.args.get("gap", 50))
+        except (TypeError, ValueError):
+            gap = 50.0
+        if gap < 0 or gap > 100000:
+            gap = 50.0
+        return jsonify(get_cd_range(candles, tf, gap))
+    except Exception as e:
+        return jsonify({"ok": False, "index": "SENSEX", "error": str(e)}), 500
+
+
 @app.post("/api/md/dada/range")
 def md_dada_range():
     """DADA strategy: first 15-min (09:15–09:30 IST) spot HIGH / LOW."""
