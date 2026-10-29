@@ -4,11 +4,8 @@ import { lotSizeForIndex } from "@/lib/lot";
 import type { ChainResolved, ExpiryRow } from "@/types/market";
 import { apiFetch } from "@/lib/backend";
 import { toast } from "@/hooks/use-toast";
-import NiftyLadderPanel from "@/components/NiftyLadderPanel";
 import NiftySnakePanel from "@/components/NiftySnakePanel";
-import RsiBandPanel from "@/components/RsiBandPanel";
 import NiftyVwapPanel from "@/components/NiftyVwapPanel";
-import NiftyFastPanel from "@/components/NiftyFastPanel";
 import CdRangePanel from "@/components/CdRangePanel";
 import { bumpPositionsRefresh } from "@/lib/ixPortfolio";
 
@@ -30,7 +27,7 @@ export default function OptionsChain({
 }) {
   const lotSize = lotSizeForIndex(index);
   const qty = Math.max(1, lotSize);
-  const [desk, setDesk] = useState<"ladder" | "snake" | "rsi" | "vwap" | "fast" | "cd">("ladder");
+  const [desk, setDesk] = useState<"snake" | "vwap" | "cd">("snake");
   const [exitBusy, setExitBusy] = useState(false);
   const [exitSelected, setExitSelected] = useState<25 | 50 | 75 | 100 | null>(null);
 
@@ -76,13 +73,6 @@ export default function OptionsChain({
       <div className="sow-glass-tabs shrink-0">
         <button
           type="button"
-          className={`sow-glass-tab${desk === "ladder" ? " sow-glass-tab--active" : ""}`}
-          onClick={() => setDesk("ladder")}
-        >
-          Nifty Ladder
-        </button>
-        <button
-          type="button"
           className={`sow-glass-tab${desk === "snake" ? " sow-glass-tab--active" : ""}`}
           onClick={() => setDesk("snake")}
         >
@@ -90,24 +80,10 @@ export default function OptionsChain({
         </button>
         <button
           type="button"
-          className={`sow-glass-tab${desk === "rsi" ? " sow-glass-tab--active" : ""}`}
-          onClick={() => setDesk("rsi")}
-        >
-          Nifty RSI
-        </button>
-        <button
-          type="button"
           className={`sow-glass-tab${desk === "vwap" ? " sow-glass-tab--active" : ""}`}
           onClick={() => setDesk("vwap")}
         >
           VWAP
-        </button>
-        <button
-          type="button"
-          className={`sow-glass-tab${desk === "fast" ? " sow-glass-tab--active" : ""}`}
-          onClick={() => setDesk("fast")}
-        >
-          1 min Fast
         </button>
         <button
           type="button"
@@ -157,22 +133,13 @@ export default function OptionsChain({
 
       {resolved && (
         <>
-          <div className={desk === "ladder" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "ladder"}>
-            <NiftyLadderPanel chain={resolved} qty={qty} />
-          </div>
           <div className={desk === "snake" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "snake"}>
             <NiftySnakePanel chain={resolved} qty={qty} />
-          </div>
-          <div className={desk === "rsi" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "rsi"}>
-            <RsiBandPanel chain={resolved} active={desk === "rsi"} />
           </div>
         </>
       )}
       <div className={desk === "vwap" && resolved ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "vwap" || !resolved}>
         <NiftyVwapPanel index={index} chain={resolved} active={desk === "vwap" && !!resolved} />
-      </div>
-      <div className={desk === "fast" && resolved ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "fast" || !resolved}>
-        <NiftyFastPanel index={index} chain={resolved} active={desk === "fast" && !!resolved} />
       </div>
       <div className={desk === "cd" && resolved ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "cd" || !resolved}>
         <CdRangePanel index={index} chain={resolved} active={desk === "cd" && !!resolved} />

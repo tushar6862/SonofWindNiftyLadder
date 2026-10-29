@@ -600,44 +600,6 @@ def fyers_topbar_focus():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/api/rsi/data", methods=["GET", "POST"])
-def rsi_data():
-    """
-    Wilder RSI(14) indicator for NIFTY spot closes.
-    Supports 1, 2, 3, 5, 10, 15, and 30-minute timeframes.
-    Uses Fyers market data first, falling back to XTS.
-    """
-    username = (_current_user() or "").strip().upper()
-    if request.method == "POST":
-        data = request.get_json(silent=True) or {}
-        tf = data.get("timeframe", 5)
-        live_spot = data.get("liveSpot")
-    else:
-        tf = request.args.get("timeframe", 5)
-        live_spot = request.args.get("liveSpot")
-
-    try:
-        tf_i = int(tf)
-    except Exception:
-        tf_i = 5
-
-    live_f = None
-    if live_spot is not None:
-        try:
-            live_f = float(live_spot)
-        except Exception:
-            live_f = None
-
-    client = _XTS_IX.get(username) if username else None
-
-    try:
-        from market.rsi_band import get_rsi_analysis
-        payload = get_rsi_analysis(timeframe=tf_i, live_spot=live_f, xts_client=client)
-        return jsonify(payload)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
 @app.route("/api/vwap/data", methods=["GET"])
 def vwap_data():
     """Session VWAP for the top-bar index. Spot candles come from Fyers."""
@@ -648,20 +610,6 @@ def vwap_data():
         from market.nifty_vwap import get_index_vwap
 
         return jsonify(get_index_vwap(index))
-    except Exception as e:
-        return jsonify({"ok": False, "index": index, "error": str(e)}), 500
-
-
-@app.route("/api/fast/open920", methods=["GET"])
-def fast_open920():
-    """09:20 one-minute open for the top-bar index. Spot candles come from Fyers."""
-    index = str(request.args.get("index") or "NIFTY").strip().upper()
-    if index not in ("NIFTY", "BANKNIFTY", "SENSEX"):
-        return jsonify({"ok": False, "error": "index must be NIFTY, BANKNIFTY, or SENSEX"}), 400
-    try:
-        from market.open920 import get_index_open920
-
-        return jsonify(get_index_open920(index))
     except Exception as e:
         return jsonify({"ok": False, "index": index, "error": str(e)}), 500
 
@@ -796,50 +744,6 @@ def md_dada_sl3m():
 def md_dada_sl5m():
     """Backward-compatible alias → 1m ORB SL bars."""
     return md_dada_sl1m()
-
-
-@app.post("/api/md/nifty_ladder/open_drive")
-def md_nifty_ladder_open_drive():
-    """NIFTY Ladder: 09:15 IST 1-minute open-drive hint (UP→PE / DOWN→CE / FLAT)."""
-    username = (_current_user() or "").strip().upper()
-    if not username:
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    seg = data.get("exchangeSegment", data.get("ExchangeSegment"))
-    tid = data.get("exchangeInstrumentID", data.get("ExchangeInstrumentID"))
-    live_ltp = data.get("liveLtp", data.get("ltp", 0))
-    if seg is None or tid is None:
-        return jsonify({"ok": False, "error": "exchangeSegment + exchangeInstrumentID required"}), 400
-    try:
-        seg_i = int(seg)
-        tid_i = int(tid)
-        live_f = float(live_ltp or 0)
-    except Exception:
-        return jsonify({"ok": False, "error": "invalid segment/instrument/ltp"}), 400
-    if not (seg_i > 0 and tid_i > 0):
-        return jsonify({"ok": False, "error": "invalid segment/instrument"}), 400
-
-    try:
-        _ensure_market_streamer(username)
-        from market.dashboard_connector import wire_market_streamer
-
-        wire_market_streamer(_MD_STREAMER)
-        cli = _MD_STREAMER.rest_client()
-        if cli is None:
-            return jsonify({"ok": False, "error": "Market data client not ready"}), 503
-        from market.nifty_ladder import build_open_drive_payload
-
-        payload = build_open_drive_payload(
-            cli,
-            exchange_segment=seg_i,
-            exchange_instrument_id=tid_i,
-            live_ltp=live_f,
-        )
-        return jsonify(payload)
-    except Exception as e:
-        app.logger.exception("md_nifty_ladder_open_drive failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.post("/api/md/nifty_snake/hedge_candidates")
@@ -1872,6 +1776,7 @@ def chain_resolve():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
+    skip_notify = bool(data.get("skipNotify") or data.get("skip_notify"))
     index_key = str(data.get("index") or "").strip().upper()
     expiry_label = _normalize_expiry_label(str(data.get("expiry") or data.get("expiryLabel") or ""))
     # This endpoint can become very slow (each strike triggers 2 REST calls). Keep it bounded.
@@ -2109,12 +2014,13 @@ def chain_resolve():
                 "vixDayOpen": vix_day_open_o,
                 "warnings": [{"notice": "resolved_via_instruments_master_cache", "cacheDay": datetime.now().strftime("%Y%m%d")}],
             }
-            try:
-                from market.dashboard_connector import notify_chain_resolved
+            if not skip_notify:
+                try:
+                    from market.dashboard_connector import notify_chain_resolved
 
-                notify_chain_resolved(payload_ok, username)
-            except Exception:
-                pass
+                    notify_chain_resolved(payload_ok, username)
+                except Exception:
+                    pass
             return jsonify(payload_ok)
     except Exception:
         pass
@@ -2410,12 +2316,13 @@ def chain_resolve():
         "warnings": resolve_errors[:20] if resolve_errors else [],
     }
 
-    try:
-        from market.dashboard_connector import notify_chain_resolved
+    if not skip_notify:
+        try:
+            from market.dashboard_connector import notify_chain_resolved
 
-        notify_chain_resolved(payload_ok, username)
-    except Exception:
-        pass
+            notify_chain_resolved(payload_ok, username)
+        except Exception:
+            pass
 
     return jsonify(payload_ok)
 
@@ -3746,7 +3653,7 @@ def _algo_limit_buf() -> float:
 
 
 def _tight_limit_buf(px: float) -> float:
-    """~0.4% of premium, 0.20–0.50 — Nifty Ladder LIMIT must not walk the book."""
+    """~0.4% of premium, 0.20–0.50 — tight LIMIT so the book cannot walk."""
     tick = _fo_price_tick()
     base = float(px) if px and px > 0 else 100.0
     ticks = int(round((base * 0.004) / tick))

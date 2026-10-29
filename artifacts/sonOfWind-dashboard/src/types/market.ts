@@ -10,6 +10,7 @@ export interface ChainResolved {
   optionSeries?: string;
   optionSymbol?: string;
   expiryApi?: string;
+  expiryUi?: string;
   instrumentMap: Record<string, ChainInstrumentRow>;
   /** Strikes resolved each side of ATM (±chainWings steps); see chainWingsCap. */
   chainWings?: number;

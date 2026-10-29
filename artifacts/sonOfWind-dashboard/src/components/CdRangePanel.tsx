@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { ChainResolved } from "@/types/market";
+import type { ChainExpiriesResponse, ChainResolved, ChainResolveResponse } from "@/types/market";
 import { peekLiveTick, useLiveLtp } from "@/context/LiveLtpContext";
 import { FastLtp } from "@/components/FastLtp";
 import { setHotFocus } from "@/lib/hotFocus";
@@ -9,6 +9,7 @@ import { fmtPnl, fmtPrice, fmtQty } from "@/lib/formatNumber";
 import { apiFetch } from "@/lib/backend";
 import { bumpPositionsRefresh, clearLocalPosition, setLocalShortPosition } from "@/lib/ixPortfolio";
 import {
+  cdSellPricing,
   ixOrderRejectedMessage,
   ladderOrderPricing,
   orderLooksFilled,
@@ -26,16 +27,18 @@ import {
   breakSide,
   dayStopHit,
   decideCdAction,
+  CD_NO_THURSDAY,
+  cdChainIsPick,
   defaultCdParams,
   draftFromParams,
   entryWindowOpen,
-  expiryIsSameIstDay,
   firstEntryClock,
   formatHm,
   insideRange,
   istClock,
   orderQty,
   parseCdParams,
+  pickCdThursdayExpiry,
   readCdParams,
   scoreClose,
   squareTime,
@@ -44,6 +47,7 @@ import {
   trailArmPx,
   trailCoverPx,
   type CdCloseKind,
+  type CdExpiryPick,
   type CdParamDraft,
   type CdParams,
 } from "@/lib/cdRangeRules";
@@ -216,13 +220,13 @@ function fmtScore(score: number): string {
 }
 
 function rememberShort(chain: ChainResolved | null, pos: CdPosition) {
-  const expiry = chain && chain.expiryApi ? ` ${chain.expiryApi}` : "";
+  const expiry = chain?.expiryUi || chain?.expiryApi || "";
   setLocalShortPosition({
     exchangeInstrumentID: pos.iid,
     exchangeSegment: pos.segment,
     qty: pos.qty,
     fillPx: pos.fill,
-    tradingSymbol: `SENSEX${expiry} ${pos.strike} ${pos.side}`,
+    tradingSymbol: `SENSEX${expiry ? ` ${expiry}` : ""} ${pos.strike} ${pos.side}`,
   });
 }
 
@@ -246,6 +250,9 @@ export default function CdRangePanel({
   const [insideSeen, setInsideSeen] = useState(boot.insideSeen);
   const [sellRetryAt, setSellRetryAt] = useState(boot.sellRetryAt);
   const [started, setStarted] = useState(boot.started);
+  const [cdChain, setCdChain] = useState<ChainResolved | null>(null);
+  const [cdPick, setCdPick] = useState<CdExpiryPick | null>(null);
+  const [expiryState, setExpiryState] = useState<"idle" | "loading" | "ready" | "none" | "error">("idle");
   const [busy, setBusy] = useState(false);
   const [quote, setQuote] = useState<RangePayload | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -274,10 +281,15 @@ export default function CdRangePanel({
   const logIdRef = useRef(boot.logId);
   const restoredRef = useRef(false);
   const sessionDateRef = useRef(boot.sessionDate);
+  const pickRef = useRef<CdExpiryPick | null>(null);
+  const cdChainRef = useRef<ChainResolved | null>(null);
+  const expiryLoggedRef = useRef("");
 
   activeRef.current = active;
   indexRef.current = index;
-  chainRef.current = chain;
+  chainRef.current = cdChain;
+  pickRef.current = cdPick;
+  cdChainRef.current = cdChain;
   positionRef.current = position;
   quoteRef.current = quote;
   scoreRef.current = score;
@@ -287,7 +299,7 @@ export default function CdRangePanel({
   sellRetryRef.current = sellRetryAt;
   startedRef.current = started;
 
-  const sensexChain = chain != null && chainIndexOf(chain) === "SENSEX" ? chain : null;
+  const sensexChain = cdChain != null && chainIndexOf(cdChain) === "SENSEX" ? cdChain : null;
   const qty = orderQty(saved.lots);
   paramsRef.current = saved;
   lotsRef.current = saved.lots;
@@ -312,7 +324,7 @@ export default function CdRangePanel({
   const entryFrom = firstEntryClock(saved.candles, saved.barMinutes);
   const side: FlipSide | null =
     spotPx != null && high != null && low != null ? breakSide(spotPx, high, low, saved.extraBreak) : null;
-  const sameDayExpiry = sensexChain ? expiryIsSameIstDay(String(sensexChain.expiryApi || "")) : false;
+  const istDate = istClock(new Date(nowMs)).date;
   const stopped = dayStopHit(score);
   const windowOpen = entryWindowOpen(new Date(nowMs), entryFrom);
   const squaredNow = squared || squareTime(new Date(nowMs));
@@ -367,6 +379,95 @@ export default function CdRangePanel({
     sellRetryRef.current = at;
     setSellRetryAt(at);
   }, []);
+
+  useEffect(() => {
+    if (index !== "SENSEX") {
+      setCdPick(null);
+      setCdChain(null);
+      setExpiryState("idle");
+      return;
+    }
+    if (!active) return;
+    let cancelled = false;
+    const logOnce = (text: string, kind: CdLog["kind"]) => {
+      if (expiryLoggedRef.current === text) return;
+      expiryLoggedRef.current = text;
+      pushLog(text, kind);
+    };
+    const run = async () => {
+      if (!cdChainRef.current) setExpiryState((prev) => (prev === "ready" ? prev : "loading"));
+      let raw: ChainExpiriesResponse;
+      try {
+        raw = (await apiFetch("/api/chain/expiries", {
+          method: "POST",
+          body: JSON.stringify({ index: "SENSEX" }),
+        })) as ChainExpiriesResponse;
+      } catch (err: unknown) {
+        if (cancelled) return;
+        setCdPick(null);
+        setCdChain(null);
+        setExpiryState("error");
+        logOnce(err instanceof Error ? err.message : "Sensex expiry list failed. No entry.", "error");
+        return;
+      }
+      if (cancelled) return;
+      if (!raw.ok) {
+        setCdPick(null);
+        setCdChain(null);
+        setExpiryState("error");
+        logOnce(raw.error || "Sensex expiry list failed. No entry.", "error");
+        return;
+      }
+      const pick = pickCdThursdayExpiry(raw.expiries ?? []);
+      if (!pick) {
+        setCdPick(null);
+        setCdChain(null);
+        setExpiryState("none");
+        logOnce(CD_NO_THURSDAY, "info");
+        return;
+      }
+      setCdPick(pick);
+      const held = cdChainRef.current;
+      if (held && cdChainIsPick(String(held.expiryApi || ""), String(held.expiryUi || ""), pick)) {
+        setExpiryState("ready");
+        return;
+      }
+      const parent = chain;
+      if (parent && chainIndexOf(parent) === "SENSEX" && cdChainIsPick(String(parent.expiryApi || ""), String(parent.expiryUi || ""), pick)) {
+        setCdChain(parent);
+        setExpiryState("ready");
+        expiryLoggedRef.current = "";
+        return;
+      }
+      let resolved: ChainResolveResponse;
+      try {
+        resolved = (await apiFetch("/api/chain/resolve", {
+          method: "POST",
+          body: JSON.stringify({ index: "SENSEX", expiry: pick.api, wings: 12, skipNotify: true }),
+        })) as ChainResolveResponse;
+      } catch (err: unknown) {
+        if (cancelled) return;
+        setCdChain(null);
+        setExpiryState("error");
+        logOnce(err instanceof Error ? err.message : "Next Thursday chain failed. No entry.", "error");
+        return;
+      }
+      if (cancelled) return;
+      if (!resolved.ok || !cdChainIsPick(String(resolved.expiryApi || ""), String(resolved.expiryUi || ""), pick)) {
+        setCdChain(null);
+        setExpiryState("error");
+        logOnce(!resolved.ok ? resolved.error || "Next Thursday chain failed. No entry." : "Next Thursday chain failed. No entry.", "error");
+        return;
+      }
+      setCdChain(resolved);
+      setExpiryState("ready");
+      expiryLoggedRef.current = "";
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [index, istDate, chain, pushLog, active]);
 
   const applyScore = useCallback(
     (kind: CdCloseKind, sold: number, cover: number) => {
@@ -492,7 +593,9 @@ export default function CdRangePanel({
           method: "POST",
           body: JSON.stringify({
             ...XTS_IX_ORDER_BASE,
-            ...ladderOrderPricing(orderSide, ltp, tick?.bid, tick?.ask),
+            ...(orderSide === "SELL"
+              ? cdSellPricing(ltp, tick?.bid)
+              : ladderOrderPricing(orderSide, ltp, tick?.bid, tick?.ask)),
             exchangeSegment: segment,
             exchangeInstrumentID: instrumentId,
             orderSide,
@@ -529,10 +632,14 @@ export default function CdRangePanel({
         fail(`${text} Next sell try in 60s.`);
         return false as const;
       };
+      const pick = pickRef.current;
+      if (!pick) {
+        fail(CD_NO_THURSDAY);
+        return false;
+      }
       const current = chainRef.current;
-      if (!current || chainIndexOf(current) !== "SENSEX") return deny("Select SENSEX. Order not sent.");
-      if (expiryIsSameIstDay(String(current.expiryApi || ""))) {
-        return deny("Expiry is today. CD uses the next Thursday. Order not sent.");
+      if (!current || chainIndexOf(current) !== "SENSEX" || !cdChainIsPick(String(current.expiryApi || ""), String(current.expiryUi || ""), pick)) {
+        return deny("Next Thursday chain is not ready. Order not sent.");
       }
       const sellQty = orderQty(lotsRef.current);
       if (!Number.isSafeInteger(sellQty) || sellQty <= 0 || sellQty % CD_RULES.lotSize !== 0) {
@@ -739,7 +846,11 @@ export default function CdRangePanel({
                 const snapNow = quoteRef.current;
                 const gapNow = typeof snapNow?.gap === "number" ? snapNow.gap : null;
                 const chainNow = chainRef.current;
-                const expiryToday = chainNow ? expiryIsSameIstDay(String(chainNow.expiryApi || "")) : true;
+                const flipPick = pickRef.current;
+                const expiryOk =
+                  !!flipPick &&
+                  !!chainNow &&
+                  cdChainIsPick(String(chainNow.expiryApi || ""), String(chainNow.expiryUi || ""), flipPick);
                 const allowFlip =
                   startedRef.current &&
                   lotsOkRef.current &&
@@ -753,7 +864,7 @@ export default function CdRangePanel({
                   !squareTime() &&
                   !squaredRef.current &&
                   !dayStopHit(scoreRef.current) &&
-                  !expiryToday &&
+                  expiryOk &&
                   Date.now() >= sellRetryRef.current;
                 if (!allowFlip) {
                   const why = !startedRef.current
@@ -764,9 +875,11 @@ export default function CdRangePanel({
                       ? `Day stop ${CD_RULES.dayStop}.`
                       : gapNow != null && gapNow < rules.minGap
                         ? `Gap under ${rules.minGap}.`
-                        : expiryToday
-                          ? "Expiry is today."
-                          : "Flip not allowed.";
+                        : !flipPick
+                          ? CD_NO_THURSDAY
+                          : !expiryOk
+                            ? "Next Thursday chain is not ready."
+                            : "Flip not allowed.";
                   pushRef.current(`OPPOSITE covered. ${why} No flip.`, "info");
                   return;
                 }
@@ -802,7 +915,8 @@ export default function CdRangePanel({
           if (spot == null) return;
           if (squaredRef.current || squareTime(now) || !entryWindowOpen(now, from)) return;
           if (dayStopHit(scoreRef.current)) return;
-          if (expiryIsSameIstDay(String(chainNow.expiryApi || ""))) return;
+          const entryPick = pickRef.current;
+          if (!entryPick || !cdChainIsPick(String(chainNow.expiryApi || ""), String(chainNow.expiryUi || ""), entryPick)) return;
           if (needInsideRef.current && !insideSeenRef.current) return;
           if (Date.now() < sellRetryRef.current) return;
           const want = breakSide(spot, rangeHigh, rangeLow, rules.extraBreak);
@@ -874,11 +988,15 @@ export default function CdRangePanel({
   const block =
     index !== "SENSEX"
       ? "Select SENSEX on the top bar."
-      : !sensexChain
-        ? "Loading the Sensex chain."
-        : sameDayExpiry
-          ? "Expiry is today. CD uses the next Thursday."
-          : quote?.liveSession === false
+      : expiryState === "none"
+        ? CD_NO_THURSDAY
+        : expiryState === "error"
+          ? "Next Thursday chain failed. No entry."
+          : !sensexChain
+            ? cdPick
+              ? `Loading ${cdPick.label}.`
+              : "Loading the Sensex chain."
+            : quote?.liveSession === false
             ? "Not the live cash session."
             : (quote?.closedCount ?? 0) < saved.candles
               ? `Need ${saved.candles} closed ${saved.barMinutes}-minute bars. First entry is ${entryLabel}.`
@@ -936,9 +1054,11 @@ export default function CdRangePanel({
               {signalText}
             </div>
             <div className={`nv-sub text-[18px] font-extrabold ${signalSide === "PE" ? "text-cd-green" : signalSide === "CE" ? "text-cd-red" : ""}`}>
-              {signalSide == null
+              {!cdPick
                 ? "—"
-                : `${signalSide}${tradeStrike != null ? ` ${fmtStrike(tradeStrike)}` : ""}`}
+                : signalSide == null
+                  ? cdPick.label
+                  : `${signalSide}${tradeStrike != null ? ` ${fmtStrike(tradeStrike)}` : ""} · ${cdPick.label}`}
             </div>
           </div>
           <div className="nv-stat">
@@ -1147,7 +1267,7 @@ export default function CdRangePanel({
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                Entry is the live Sensex print, not the candle close. The forming 15-minute bar does not move HIGH or LOW. An opposite HIGH break
+                Entry is the live Sensex print, not the candle close. Orders use the next Thursday after today. The top bar expiry is not the CD contract. The break sell goes through the live bid and trades. The booked price is the fill. Cover, target, and stop stay on the tight limit. The forming 15-minute bar does not move HIGH or LOW. An opposite HIGH break
                 while short the CE covers and sells the ATM PE. A LOW break while short the PE covers and sells the ATM CE. Flips run until 14:30.
                 A failed sell waits 60 seconds. A target scores +1 only when the cover fill reached 10%, with one point of slack. Sold 772.32 covered
                 766.10 scores 0. A trail scores 0. A losing opposite break scores −0.5. Any other losing exit scores −1.

@@ -379,6 +379,71 @@ export function decideCdAction(input: {
   return null;
 }
 
+export const CD_NO_THURSDAY = "No Thursday expiry after today. No entry.";
+
+export type CdExpiryPick = { label: string; api: string };
+
+const EXPIRY_LABEL = /^(\d{2})([A-Za-z]{3})(\d{4})$/;
+
+function civilKey(year: number, month: number, day: number): number | null {
+  if (month < 1 || month > 12 || day < 1 || day > 31 || year < 2000) return null;
+  const utc = new Date(Date.UTC(year, month - 1, day));
+  if (utc.getUTCFullYear() !== year || utc.getUTCMonth() !== month - 1 || utc.getUTCDate() !== day) return null;
+  return year * 10000 + month * 100 + day;
+}
+
+/** Compact 29Oct2026 label, or an ISO date from the broker token. */
+export function expiryDayKey(text: string): number | null {
+  const raw = String(text || "").trim();
+  const compact = raw.replace(/[\s\-_/]/g, "");
+  const match = EXPIRY_LABEL.exec(compact);
+  if (match) {
+    const month = MONTHS.indexOf(match[2].toLowerCase() as (typeof MONTHS)[number]) + 1;
+    return civilKey(Number(match[3]), month, Number(match[1]));
+  }
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
+  if (!iso) return null;
+  return civilKey(Number(iso[1]), Number(iso[2]), Number(iso[3]));
+}
+
+function isThursdayKey(key: number): boolean {
+  const year = Math.floor(key / 10000);
+  const month = Math.floor((key % 10000) / 100);
+  const day = key % 100;
+  return new Date(Date.UTC(year, month - 1, day)).getUTCDay() === 4;
+}
+
+/**
+ * Nearest SENSEX Thursday after today IST.
+ * Labels must look like 29Oct2026, the date must be a Thursday, and today is dropped.
+ */
+export function pickCdThursdayExpiry(rows: readonly CdExpiryPick[], now = new Date()): CdExpiryPick | null {
+  const clock = istClock(now);
+  const today = civilKey(clock.year, clock.month, clock.day);
+  if (today == null) return null;
+  let bestKey = 0;
+  let best: CdExpiryPick | null = null;
+  for (const row of rows) {
+    const label = String(row?.label || "").trim();
+    const api = String(row?.api || "").trim();
+    if (!label || !api || !EXPIRY_LABEL.test(label)) continue;
+    const key = expiryDayKey(label);
+    if (key == null || key <= today || !isThursdayKey(key)) continue;
+    if (best == null || key < bestKey) {
+      bestKey = key;
+      best = { label, api };
+    }
+  }
+  return best;
+}
+
+export function cdChainIsPick(expiryApi: string, expiryUi: string, pick: CdExpiryPick): boolean {
+  if (String(expiryApi || "") === pick.api) return true;
+  const want = expiryDayKey(pick.label);
+  if (want == null) return false;
+  return expiryDayKey(expiryUi) === want || expiryDayKey(expiryApi) === want;
+}
+
 /** Nearest Thursday, never the same day. True when the chain expiry is today IST. */
 export function expiryIsSameIstDay(expiryText: string, now = new Date()): boolean {
   const clock = istClock(now);
@@ -433,6 +498,26 @@ function assertCdRules(): void {
     throw new Error("break");
   }
   if (!insideRange(90, 110, 90) || insideRange(89.9, 110, 90)) throw new Error("inside");
+  const book: CdExpiryPick[] = [
+    { label: "22Oct2026", api: "22" },
+    { label: "26Oct2026", api: "26" },
+    { label: "29Oct2026", api: "tok-29" },
+    { label: "30Oct2026", api: "30" },
+    { label: "04Nov2026", api: "04" },
+    { label: "05Nov2026", api: "tok-05" },
+    { label: "12Nov2026", api: "tok-12" },
+    { label: "29 Oct 2026", api: "spaced" },
+  ];
+  const at = (year: number, month: number, day: number) => new Date(Date.UTC(year, month - 1, day, 6, 30));
+  const picked = (day: Date) => pickCdThursdayExpiry(book, day)?.label ?? "";
+  if (picked(at(2026, 10, 26)) !== "29Oct2026") throw new Error("Monday 26 Oct selects 29Oct2026");
+  if (picked(at(2026, 10, 29)) !== "05Nov2026") throw new Error("Thursday 29 Oct skips today");
+  if (picked(at(2026, 10, 30)) !== "05Nov2026") throw new Error("Friday 30 Oct selects 05Nov2026");
+  if (picked(at(2026, 11, 5)) !== "12Nov2026") throw new Error("Thursday 5 Nov skips 05Nov2026");
+  if (pickCdThursdayExpiry([{ label: "29Oct2026", api: "tok-29" }], at(2026, 10, 29)) !== null) {
+    throw new Error("no Thursday after today");
+  }
+  if (!cdChainIsPick("tok-05", "05NOV2026", { label: "05Nov2026", api: "tok-05" })) throw new Error("chain pick");
 }
 
 assertCdRules();

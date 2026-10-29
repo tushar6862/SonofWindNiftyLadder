@@ -78,7 +78,7 @@ if (typeof window !== "undefined") {
 
 /** Pin LIVE/hunt tokens so the backend polls touchline ~200ms for those strikes only. */
 export function setHotFocus(
-  source: "ladder" | "snake" | "rsi" | "vwap" | "fast" | "cd",
+  source: "snake" | "vwap" | "cd",
   instruments: HotInst[],
 ): void {
   bySource.set(

@@ -1,4 +1,4 @@
-"""NIFTY Snake hedge lookup. Independent of Nifty Ladder."""
+"""NIFTY Snake hedge lookup."""
 
 from __future__ import annotations
 

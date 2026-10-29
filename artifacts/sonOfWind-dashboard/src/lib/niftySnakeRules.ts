@@ -1,6 +1,5 @@
 /**
- * NIFTY Snake — short-premium grid on ONE selected CE or PE strike.
- * Independent of Nifty Ladder (T1–T9 / 98–105). Do not import ladder modules.
+ * NIFTY Snake — short-premium grid on one selected CE or PE strike.
  */
 
 export const UNDERLYING = "NIFTY";
@@ -25,7 +24,7 @@ export const ENABLE_HEDGES = false;
 export const HEDGE_PREMIUM_LOW = 3;
 export const HEDGE_PREMIUM_HIGH = 4;
 export const HEDGE_PREMIUM_TARGET = 3.5;
-/** Global MTM Exit All — same window event, no ladder module import. */
+/** Global MTM Exit All — LeftPanel dispatches this so the snake session clears. */
 export const EV_MTM_FLAT = "sow:nifty_ladder_flat";
 export const EV_NIFTY_SNAKE_FLAT = "sow:nifty_snake_flat";
 export const SNAKE_STORE_KEY = "sow_nifty_snake_v1";

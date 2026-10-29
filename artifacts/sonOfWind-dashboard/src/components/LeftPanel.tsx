@@ -6,7 +6,7 @@ import { subscribeMdTouchline } from "@/lib/mdRegistry";
 import { useLiveLtp, peekLiveLtp } from "@/context/LiveLtpContext";
 import { toast } from "@/hooks/use-toast";
 import { fmtInrShort, fmtMtm } from "@/lib/formatNumber";
-import { EV_NIFTY_LADDER_FLAT } from "@/lib/niftyLadderRules";
+import { EV_MTM_FLAT } from "@/lib/niftySnakeRules";
 
 const MTM_STAR_COUNT = 6;
 const MTM_ARM_KEY = "sow_mtm_arm_v1";
@@ -327,7 +327,7 @@ export default function LeftPanel() {
     mtmExitBusyRef.current = true;
     setMtmExitBusy(true);
     try {
-      window.dispatchEvent(new CustomEvent(EV_NIFTY_LADDER_FLAT));
+      window.dispatchEvent(new CustomEvent(EV_MTM_FLAT));
       const r = (await apiFetch("/api/ix/exit_open_positions", {
         method: "POST",
         body: JSON.stringify({ percent: 100 }),
@@ -655,24 +655,6 @@ export default function LeftPanel() {
         )}
       </div>
 
-      <div className="flex-1 flex flex-col min-h-0 sow-glass-left-tabs mx-2 mb-2 rounded-lg overflow-hidden">
-        <div className="flex shrink-0 border-b border-border/50 px-2 py-1.5 items-center gap-2">
-          <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-            Nifty Ladder
-          </span>
-        </div>
-        <div className="flex-1 overflow-auto p-2 text-[11px] min-h-0">
-          <div className="ramsetu-glass-wrap -m-2 p-2 space-y-3">
-            <div className="ramsetu-glass-header">
-              <div className="ramsetu-glass-header__title">Same-strike short grid</div>
-              <div className="ramsetu-glass-header__note">Hunt 98–105 · T1 cover 30% · hard SL 30%</div>
-            </div>
-            <p className="ramsetu-glass-empty">
-              START AGAIN after 09:16 IST. Exit All / MTM target-SL yahan se ladder session clear karte hain.
-            </p>
-          </div>
-        </div>
-      </div>
     </div>
   );
 }

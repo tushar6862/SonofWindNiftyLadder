@@ -1638,8 +1638,7 @@ export default function NiftySnakePanel({ chain }: { chain: ChainResolved; qty?:
               START dabao — 09:16 ke baad selected CE/PE pe {BAND_LOW}–{BAND_HIGH} (prefer ~{BAND_TARGET}). Same
               strike short-only grid T1–T7 lots {TRANCHE_LOTS.join(", ")} — no long hedge BUY. Extras +3, book −3.
               T1 cover −30% / hard SL +30% original fill se (cover BUY = short exit). Hard SL ke baad same legs
-              re-SELL jab LTP SL ke neeche aaye. PAUSE pe naya sell nahi, exits chalu. Nifty Ladder se alag
-              engine hai.
+              re-SELL jab LTP SL ke neeche aaye. PAUSE pe naya sell nahi, exits chalu.
             </p>
           ) : (
             <ul className="space-y-1.5">
