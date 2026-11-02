@@ -10,6 +10,7 @@ export const CD_RULES = {
   minGap: 50,
   targetPct: 10,
   trailArmPct: 5,
+  trailCtcPct: 5,
   stopPct: 12,
   extraBreak: 0,
   trailLockPct: 0,
@@ -37,6 +38,7 @@ export type CdParams = {
   midStop: boolean;
   stopPct: number;
   trailArmPct: number;
+  trailCtcPct: number;
   trailLockPct: number;
   extraBreak: number;
   targetPct: number;
@@ -52,6 +54,7 @@ export function defaultCdParams(): CdParams {
     midStop: false,
     stopPct: 12,
     trailArmPct: 5,
+    trailCtcPct: 5,
     trailLockPct: 0,
     extraBreak: 0,
     targetPct: 10,
@@ -67,6 +70,31 @@ function finiteNum(raw: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/** Smallest whole TRAIL CTC that is still at least the Trail arm percent. */
+export function minTrailCtc(trailArmPct: number): number {
+  if (!Number.isFinite(trailArmPct) || trailArmPct <= 0) return 0;
+  return Math.min(100, Math.ceil(trailArmPct - 1e-9));
+}
+
+/** A missing TRAIL CTC matches Trail arm. A saved value below Trail arm is lifted. */
+function storedTrailCtc(trailArmPct: number, raw: number | null): number {
+  if (raw == null) return minTrailCtc(trailArmPct);
+  const whole = Math.round(raw);
+  return Math.min(100, Math.max(minTrailCtc(trailArmPct), whole));
+}
+
+/** Keep TRAIL CTC as a whole number at or above Trail arm while the boxes are edited. */
+export function syncTrailCtc(armText: string, ctcText: string): string {
+  const arm = Number(armText);
+  if (!Number.isFinite(arm)) return ctcText.replace(/[^\d]/g, "").slice(0, 3);
+  const floor = minTrailCtc(arm);
+  const digits = ctcText.replace(/[^\d]/g, "");
+  if (!digits) return String(floor);
+  const ctc = Number(digits);
+  if (!Number.isFinite(ctc) || ctc < arm) return String(floor);
+  return String(Math.min(100, Math.trunc(ctc)));
+}
+
 /** Keep a stored snapshot inside the boxes. Missing fields stay at the form defaults. */
 export function readCdParams(raw: unknown, legacyLots?: unknown): CdParams {
   const base = defaultCdParams();
@@ -77,6 +105,7 @@ export function readCdParams(raw: unknown, legacyLots?: unknown): CdParams {
   const minGap = finiteNum(row.minGap);
   const stopPct = finiteNum(row.stopPct);
   const trailArmPct = finiteNum(row.trailArmPct);
+  const trailCtcPct = finiteNum(row.trailCtcPct);
   const trailLockPct = finiteNum(row.trailLockPct);
   const extraBreak = finiteNum(row.extraBreak);
   const targetPct = finiteNum(row.targetPct);
@@ -88,6 +117,10 @@ export function readCdParams(raw: unknown, legacyLots?: unknown): CdParams {
     midStop: row.midStop === true,
     stopPct: stopPct != null ? Math.max(0, Math.min(100, stopPct)) : base.stopPct,
     trailArmPct: trailArmPct != null ? Math.max(0, Math.min(100, trailArmPct)) : base.trailArmPct,
+    trailCtcPct: storedTrailCtc(
+      trailArmPct != null ? Math.max(0, Math.min(100, trailArmPct)) : base.trailArmPct,
+      trailCtcPct,
+    ),
     trailLockPct: trailLockPct != null ? Math.max(0, Math.min(100, trailLockPct)) : base.trailLockPct,
     extraBreak: extraBreak != null ? Math.max(0, extraBreak) : base.extraBreak,
     targetPct: targetPct != null ? Math.max(0, Math.min(100, targetPct)) : base.targetPct,
@@ -102,6 +135,7 @@ export type CdParamDraft = {
   midStop: boolean;
   stopPct: string;
   trailArmPct: string;
+  trailCtcPct: string;
   trailLockPct: string;
   extraBreak: string;
   targetPct: string;
@@ -116,6 +150,7 @@ export function draftFromParams(params: CdParams): CdParamDraft {
     midStop: params.midStop,
     stopPct: String(params.stopPct),
     trailArmPct: String(params.trailArmPct),
+    trailCtcPct: String(params.trailCtcPct),
     trailLockPct: String(params.trailLockPct),
     extraBreak: String(params.extraBreak),
     targetPct: String(params.targetPct),
@@ -152,6 +187,9 @@ export function parseCdParams(draft: CdParamDraft): { ok: true; params: CdParams
   if (stopPct == null) return { ok: false, error: "SL % must be from 0 to 100." };
   const trailArmPct = nonNeg(draft.trailArmPct, 100);
   if (trailArmPct == null) return { ok: false, error: "Trail arm % must be from 0 to 100." };
+  const trailCtcPct = whole(draft.trailCtcPct, 0, 100);
+  if (trailCtcPct == null) return { ok: false, error: "TRAIL CTC must be a whole number from 0 to 100." };
+  if (trailCtcPct < trailArmPct) return { ok: false, error: "TRAIL CTC must be at least the Trail arm %." };
   const trailLockPct = nonNeg(draft.trailLockPct, 100);
   if (trailLockPct == null) return { ok: false, error: "Trail lock % must be from 0 to 100." };
   const extraBreak = nonNeg(draft.extraBreak, 100000);
@@ -168,6 +206,7 @@ export function parseCdParams(draft: CdParamDraft): { ok: true; params: CdParams
       midStop: draft.midStop === true,
       stopPct,
       trailArmPct,
+      trailCtcPct,
       trailLockPct,
       extraBreak,
       targetPct,
@@ -302,6 +341,32 @@ export function trailCoverPx(sold: number, pct: number = CD_RULES.trailLockPct):
   return levelPx(sold, 1 + pct / 100);
 }
 
+/** Profit percent locked once TRAIL CTC is reached. Arm 4 and CTC 6 lock 2. Equal values lock cost. */
+export function trailCtcLockPct(trailCtcPct: number, trailArmPct: number): number {
+  return Math.max(0, trailCtcPct - trailArmPct);
+}
+
+/** Premium at which a short has TRAIL CTC percent of profit. */
+export function trailCtcPx(sold: number, pct: number): number {
+  return levelPx(sold, 1 - pct / 100);
+}
+
+/**
+ * Cover after TRAIL CTC.
+ * The stop locks trailCtc − trailArm percent of profit, not the TRAIL CTC price.
+ * When those two match, the older trail-lock box still applies and 0 means cost.
+ */
+export function trailStopPx(
+  sold: number,
+  trailCtcPct: number,
+  trailArmPct: number,
+  trailLockPct: number = CD_RULES.trailLockPct,
+): number {
+  const lock = trailCtcLockPct(trailCtcPct, trailArmPct);
+  if (lock > 0) return levelPx(sold, 1 - lock / 100);
+  return trailCoverPx(sold, trailLockPct);
+}
+
 /** Spot above HIGH sells PE. Spot below LOW sells CE. Extra break is 0. */
 export function breakSide(spot: number, high: number, low: number, extra: number = CD_RULES.extraBreak): FlipSide | null {
   if (gt(spot, high + extra)) return "PE";
@@ -354,6 +419,7 @@ export function decideCdAction(input: {
   stopPct?: number;
   targetPct?: number;
   trailArmPct?: number;
+  trailCtcPct?: number;
   trailLockPct?: number;
 }): CdAction | null {
   if (input.squareTime) return { type: "SQUARE" };
@@ -362,6 +428,7 @@ export function decideCdAction(input: {
   const stopPct = input.stopPct ?? CD_RULES.stopPct;
   const targetPct = input.targetPct ?? CD_RULES.targetPct;
   const trailArmPct = input.trailArmPct ?? CD_RULES.trailArmPct;
+  const trailCtcPct = input.trailCtcPct ?? trailArmPct;
   const trailLockPct = input.trailLockPct ?? CD_RULES.trailLockPct;
   if (spot != null && high != null && low != null) {
     if (input.side === "CE" && gt(spot, high + extra)) return { type: "OPPOSITE", next: "PE" };
@@ -374,8 +441,9 @@ export function decideCdAction(input: {
   if (ltp == null || !(ltp > 0) || !(sold > 0)) return null;
   if (gte(ltp, stopPx(sold, stopPct))) return { type: "SL" };
   if (lte(ltp, targetPx(sold, targetPct))) return { type: "TARGET" };
-  if (input.trailArmed && gte(ltp, trailCoverPx(sold, trailLockPct))) return { type: "TRAIL" };
-  if (!input.trailArmed && lte(ltp, trailArmPx(sold, trailArmPct))) return { type: "ARM_TRAIL" };
+  const cover = trailStopPx(sold, trailCtcPct, trailArmPct, trailLockPct);
+  if (input.trailArmed && gte(ltp, cover)) return { type: "TRAIL" };
+  if (!input.trailArmed && lte(ltp, trailCtcPx(sold, trailCtcPct))) return { type: "ARM_TRAIL" };
   return null;
 }
 
@@ -480,6 +548,20 @@ function assertCdRules(): void {
   if (act({ ltp: 89, trailArmed: true })?.type !== "TARGET") throw new Error("a jump through 10% still targets");
   if (act({ ltp: 112, trailArmed: true })?.type !== "SL") throw new Error("12% stop is before the trail");
   if (act({ ltp: 105, trailArmed: true })?.type !== "TRAIL") throw new Error("trail covers between the fill and the stop");
+  if (act({ ltp: 96, trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("4% profit does not arm TRAIL CTC 6");
+  if (act({ ltp: 94, trailArmPct: 4, trailCtcPct: 6 })?.type !== "ARM_TRAIL") throw new Error("6% arms TRAIL CTC");
+  if (act({ ltp: 97, trailArmed: true, trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("2% lock stays open above the stop");
+  if (act({ ltp: 98, trailArmed: true, trailArmPct: 4, trailCtcPct: 6 })?.type !== "TRAIL") throw new Error("SL locks 2% profit");
+  if (act({ ltp: 94, trailArmed: true, trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("open profit stays until the 2% lock");
+  const draft = draftFromParams(defaultCdParams());
+  const lowCtc = parseCdParams({ ...draft, trailArmPct: "4", trailCtcPct: "3" });
+  if (lowCtc.ok) throw new Error("TRAIL CTC below trail arm");
+  const fraction = parseCdParams({ ...draft, trailArmPct: "4", trailCtcPct: "6.5" });
+  if (fraction.ok) throw new Error("TRAIL CTC must be a whole number");
+  const savedCtc = parseCdParams({ ...draft, trailArmPct: "4", trailCtcPct: "6" });
+  if (!savedCtc.ok || savedCtc.params.trailCtcPct !== 6 || trailCtcLockPct(6, 4) !== 2) throw new Error("TRAIL CTC 6 locks 2");
+  if (readCdParams({ trailArmPct: 4 }).trailCtcPct !== 4) throw new Error("TRAIL CTC defaults to trail arm");
+  if (syncTrailCtc("8", "6") !== "8" || syncTrailCtc("4.2", "4") !== "5") throw new Error("TRAIL CTC stays at or above trail arm");
   if (act({ spot: 111, high: 110, ltp: 80 })?.type !== "OPPOSITE") throw new Error("HIGH break while short CE flips");
   if (act({ squareTime: true, spot: 111, high: 110 })?.type !== "SQUARE") throw new Error("15:14 is first");
   if (act({ spot: 100, mid: 100, midOn: false }) !== null) throw new Error("MID stop is off");

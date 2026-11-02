@@ -380,6 +380,16 @@ def quote_iids(exchange_instrument_ids: list[int]) -> dict[str, float]:
     return out
 
 
+def _exchange_symbol(sym: str) -> str:
+    """Fyers prints sometimes omit the venue. Sensex contracts live on BSE."""
+    raw = str(sym or "").strip().upper()
+    if ":" in raw:
+        return raw
+    if "SENSEX" in raw:
+        return f"BSE:{raw}"
+    return f"NSE:{raw}"
+
+
 def _px(v: Any) -> float:
     try:
         n = float(v or 0.0)
@@ -455,6 +465,7 @@ class FyersLtpFeed:
         self._ws = None
         self._want_live: dict[str, tuple[int, int]] = {}
         self._want_topbar: dict[str, tuple[int, int]] = {}
+        self._want_pinned: dict[str, tuple[int, int]] = {}
         self._want: dict[str, tuple[int, int]] = {}
         self._on_ltp: LtpHandler | None = None
         self._started = False
@@ -518,9 +529,12 @@ class FyersLtpFeed:
         with self._lock:
             prev = set(self._want.keys())
             # TopBar index/VIX symbols win if a live option row collides on the same Fyers symbol.
+            # Pinned contracts (the CD future) stay on the socket across hot-focus refreshes.
             top = dict(self._want_topbar)
-            live = {k: v for k, v in self._want_live.items() if k not in top}
-            room = max(0, _WS_SYMBOL_CAP - len(top))
+            pinned = dict(self._want_pinned)
+            reserved = {**pinned, **top}
+            live = {k: v for k, v in self._want_live.items() if k not in reserved}
+            room = max(0, _WS_SYMBOL_CAP - len(reserved))
             live_keys = list(live.keys())
             if len(live_keys) > room:
                 self._ws_dropped = len(live_keys) - room
@@ -528,10 +542,27 @@ class FyersLtpFeed:
             else:
                 self._ws_dropped = 0
             # Anything past the Standard 100-symbol socket stays on the XTS feed.
-            merged = {**live, **top}
+            merged = {**live, **reserved}
             self._want = merged
             nxt = set(merged.keys())
         return nxt - prev, prev - nxt
+
+    def pin_symbol(self, symbol: str, exchange_instrument_id: int, exchange_segment: int) -> None:
+        """Keep one Fyers contract on the socket. A new pin replaces the previous one."""
+        sym = _exchange_symbol(symbol)
+        tid = int(exchange_instrument_id or 0)
+        seg = int(exchange_segment or 0)
+        if ":" not in sym or tid <= 0:
+            return
+        pair = (tid, seg if seg > 0 else 12)
+        with self._lock:
+            if self._want_pinned == {sym: pair} and sym in self._want:
+                return
+            self._want_pinned = {sym: pair}
+        added, removed = self._rebuild_want()
+        if has_access_token():
+            self.ensure_socket()
+            self._apply_subscriptions(added, removed)
 
     def set_hot_instruments(self, instruments: list[dict[str, Any]]) -> dict[str, Any]:
         """LIVE / hunt option tokens (does not clear TopBar Spot/VIX/ATM)."""
@@ -810,11 +841,13 @@ class FyersLtpFeed:
         stale_px = 12.0
         with self._lock:
             topbar = dict(self._want_topbar)
+            pinned = dict(self._want_pinned)
             want = dict(self._want)
-            live = {k: v for k, v in self._want_live.items() if k not in self._want_topbar}
+            live = {k: v for k, v in self._want_live.items() if k not in self._want_topbar and k not in self._want_pinned}
+        anchors = {**topbar, **pinned}
         need: dict[str, tuple[int, int]] = {}
         if socket_alive:
-            for sym, pair in topbar.items():
+            for sym, pair in anchors.items():
                 changed = self._last_px_change.get(sym, 0.0)
                 if changed <= 0 or now - changed >= stale_px:
                     need[sym] = pair
@@ -823,7 +856,7 @@ class FyersLtpFeed:
         else:
             if now - self._last_rest_poll < _QUOTES_FALLBACK_SEC:
                 return
-            need.update(topbar)
+            need.update(anchors)
             for sym, pair in live.items():
                 if sym in need or sym not in want:
                     continue
@@ -883,10 +916,7 @@ class FyersLtpFeed:
             if not sym:
                 continue
             if ":" not in sym:
-                if "SENSEX" in sym:
-                    sym = f"BSE:{sym}"
-                else:
-                    sym = f"NSE:{sym}"
+                sym = _exchange_symbol(sym)
             ltp, extras = _sanitize_index_quote(sym, _px(v.get("lp") or v.get("ltp")), _quote_extras(v))
             if ltp <= 0:
                 continue
@@ -922,7 +952,7 @@ class FyersLtpFeed:
         if not sym:
             return
         if ":" not in sym:
-            sym = f"NSE:{sym}"
+            sym = _exchange_symbol(sym)
         px = 0.0
         for key in ("ltp", "lp", "index_val", "last_traded_price"):
             px = _px(msg.get(key))

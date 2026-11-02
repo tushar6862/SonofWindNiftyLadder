@@ -40,12 +40,14 @@ import {
   parseCdParams,
   pickCdThursdayExpiry,
   readCdParams,
+  syncTrailCtc,
   scoreClose,
   squareTime,
   stopPx,
   targetPx,
-  trailArmPx,
-  trailCoverPx,
+  trailCtcLockPct,
+  trailCtcPx,
+  trailStopPx,
   type CdCloseKind,
   type CdExpiryPick,
   type CdParamDraft,
@@ -65,6 +67,9 @@ type RangePayload = {
   waiting?: boolean;
   sessionDate?: string;
   futureSymbol?: string;
+  futureExpiry?: string;
+  futureToken?: number;
+  futureLtp?: number | null;
   closedCount?: number;
   liveSession?: boolean;
   formingMinute?: string | null;
@@ -73,6 +78,8 @@ type RangePayload = {
   low?: number | null;
   mid?: number | null;
   gap?: number | null;
+  lookback?: number;
+  barMinutes?: number;
   bars?: RangeBar[];
 };
 
@@ -103,8 +110,18 @@ type SessionStore = {
   started: boolean;
 };
 
+const EXPIRY_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
 function px2(value: number): number {
   return Math.round((value + 1e-9) * 100) / 100;
+}
+
+function futureExpiryLabel(iso: string | undefined): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
+  if (!match) return "";
+  const month = EXPIRY_MONTHS[Number(match[2]) - 1];
+  if (!month) return "";
+  return `${Number(match[3])}${month}${match[1]}`;
 }
 
 function chainIndexOf(chain: ChainResolved | null): IndexName | null {
@@ -206,6 +223,20 @@ function qtyNote(filled: number, requested: number): string {
   return filled === requested ? fmtQty(filled) : `${fmtQty(filled)} of ${fmtQty(requested)}`;
 }
 
+/** Quantity box for an open short. A full exit may use the leftover qty. */
+function readBoardQty(raw: string, openQty: number, mode: "add" | "exit"): { ok: true; qty: number } | { ok: false; error: string } {
+  const text = raw.trim();
+  if (!/^\d+$/.test(text)) return { ok: false, error: "Enter a whole quantity." };
+  const n = Number(text);
+  if (!Number.isSafeInteger(n) || n <= 0) return { ok: false, error: "Enter a whole quantity." };
+  if (mode === "exit" && n > openQty) return { ok: false, error: `Exit qty is above the open qty ${fmtQty(openQty)}.` };
+  const fullExit = mode === "exit" && n === openQty;
+  if (!fullExit && n % CD_RULES.lotSize !== 0) {
+    return { ok: false, error: `Qty must be a multiple of ${CD_RULES.lotSize}.` };
+  }
+  return { ok: true, qty: n };
+}
+
 function CdField({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="cd-field">
@@ -257,6 +288,8 @@ export default function CdRangePanel({
   const [quote, setQuote] = useState<RangePayload | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [addQtyText, setAddQtyText] = useState("");
+  const [exitQtyText, setExitQtyText] = useState("");
 
   const ltps = useLiveLtp();
   const activeRef = useRef(active);
@@ -275,6 +308,7 @@ export default function CdRangePanel({
   const startedRef = useRef(started);
   const rangeKeyRef = useRef("");
   const liveSpotRef = useRef<number | null>(null);
+  const liveFutureRef = useRef<number | null>(null);
   const busyRef = useRef(false);
   const flipHoldRef = useRef(false);
   const tickingRef = useRef(false);
@@ -316,14 +350,24 @@ export default function CdRangePanel({
   }, [sensexChain, ltps]);
   liveSpotRef.current = liveSpot;
 
+  const liveFuture = useMemo(() => {
+    const token = quote?.futureToken;
+    if (typeof token === "number" && token > 0) {
+      const live = plausibleSpotPx("SENSEX", peekTouchPx(token, ltps) ?? ltps[token]);
+      if (live != null) return live;
+    }
+    return typeof quote?.futureLtp === "number" ? plausibleSpotPx("SENSEX", quote.futureLtp) ?? null : null;
+  }, [quote?.futureToken, quote?.futureLtp, ltps]);
+  liveFutureRef.current = liveFuture;
+
   const high = typeof quote?.high === "number" ? quote.high : null;
   const low = typeof quote?.low === "number" ? quote.low : null;
-  const mid = typeof quote?.mid === "number" ? quote.mid : null;
   const gap = typeof quote?.gap === "number" ? quote.gap : null;
-  const spotPx = liveSpot != null ? px2(liveSpot) : null;
+  const futurePx = liveFuture != null ? px2(liveFuture) : null;
+  const contractLabel = (quote?.futureSymbol || "").replace(/^(NSE|BSE):/, "") || "Future";
   const entryFrom = firstEntryClock(saved.candles, saved.barMinutes);
   const side: FlipSide | null =
-    spotPx != null && high != null && low != null ? breakSide(spotPx, high, low, saved.extraBreak) : null;
+    futurePx != null && high != null && low != null ? breakSide(futurePx, high, low, saved.extraBreak) : null;
   const istDate = istClock(new Date(nowMs)).date;
   const stopped = dayStopHit(score);
   const windowOpen = entryWindowOpen(new Date(nowMs), entryFrom);
@@ -343,8 +387,10 @@ export default function CdRangePanel({
   const mtm = position && liveLtp != null ? shortMtm(position.fill, liveLtp, position.qty) : null;
   const bookTarget = position ? targetPx(position.fill, saved.targetPct) : null;
   const bookStop = position ? stopPx(position.fill, saved.stopPct) : null;
-  const bookArm = position ? trailArmPx(position.fill, saved.trailArmPct) : null;
-  const bookTrail = position ? trailCoverPx(position.fill, saved.trailLockPct) : null;
+  const bookCtc = position ? trailCtcPx(position.fill, saved.trailCtcPct) : null;
+  const bookTrail = position
+    ? trailStopPx(position.fill, saved.trailCtcPct, saved.trailArmPct, saved.trailLockPct)
+    : null;
 
   const pushLog = useCallback((text: string, kind: CdLog["kind"]) => {
     const id = logIdRef.current++;
@@ -492,7 +538,7 @@ export default function CdRangePanel({
         setFetchError(res.error && !res.tradable ? res.error : null);
       } else {
         setQuote(null);
-        setFetchError(res?.error || "Sensex range unavailable");
+        setFetchError(res?.error || "Sensex future range unavailable");
       }
     } catch (err: unknown) {
       setFetchError(err instanceof Error ? err.message : String(err));
@@ -560,8 +606,8 @@ export default function CdRangePanel({
     if (rangeKeyRef.current === key) return;
     rangeKeyRef.current = key;
     if (!needInsideRef.current) return;
-    const spot = liveSpotRef.current;
-    markInside(spot != null && insideRange(spot, high, low));
+    const future = liveFutureRef.current;
+    markInside(future != null && insideRange(future, high, low));
   }, [high, low, quote?.sessionDate, markInside]);
 
   useEffect(() => {
@@ -793,7 +839,7 @@ export default function CdRangePanel({
           }
 
           const open = positionRef.current;
-          const spot = liveSpotRef.current;
+          const future = liveFutureRef.current;
           const snap = quoteRef.current;
           const rangeHigh = typeof snap?.high === "number" ? snap.high : null;
           const rangeLow = typeof snap?.low === "number" ? snap.low : null;
@@ -803,7 +849,7 @@ export default function CdRangePanel({
           const from = firstEntryClock(rules.candles, rules.barMinutes);
           if (squareTime(now)) markSquaredRef.current(true);
 
-          if (needInsideRef.current && spot != null && rangeHigh != null && rangeLow != null && insideRange(spot, rangeHigh, rangeLow)) {
+          if (needInsideRef.current && future != null && rangeHigh != null && rangeLow != null && insideRange(future, rangeHigh, rangeLow)) {
             if (!insideSeenRef.current) markInsideRef.current(true);
           }
 
@@ -813,7 +859,7 @@ export default function CdRangePanel({
             const action = decideCdAction({
               squareTime: squareTime(now),
               side: open.side,
-              spot,
+              spot: future,
               high: rangeHigh,
               low: rangeLow,
               mid: rangeMid,
@@ -825,6 +871,7 @@ export default function CdRangePanel({
               stopPct: rules.stopPct,
               targetPct: rules.targetPct,
               trailArmPct: rules.trailArmPct,
+              trailCtcPct: rules.trailCtcPct,
               trailLockPct: rules.trailLockPct,
             });
             if (!action) return;
@@ -832,8 +879,10 @@ export default function CdRangePanel({
               const next = { ...open, trailArmed: true };
               positionRef.current = next;
               setPosition(next);
+              const lockPct = trailCtcLockPct(rules.trailCtcPct, rules.trailArmPct);
+              const cover = trailStopPx(open.fill, rules.trailCtcPct, rules.trailArmPct, rules.trailLockPct);
               pushRef.current(
-                `Trail armed at ${fmtPrice(trailArmPx(open.fill, rules.trailArmPct))}. Cover if LTP comes back to ${fmtPrice(trailCoverPx(open.fill, rules.trailLockPct))}.`,
+                `TRAIL CTC ${rules.trailCtcPct}%. SL locks ${lockPct}% at ${fmtPrice(cover)}.`,
                 "info",
               );
               return;
@@ -883,7 +932,10 @@ export default function CdRangePanel({
                   pushRef.current(`OPPOSITE covered. ${why} No flip.`, "info");
                   return;
                 }
-                const sold = await sellRef.current(action.next, `FLIP spot ${fmtPrice(spot)} · booked ${open.side}, sell ${action.next}`);
+                const sold = await sellRef.current(
+                  action.next,
+                  `FLIP ${fmtPrice(future)} · booked ${open.side}, sell ${action.next}`,
+                );
                 if (!sold && !positionRef.current) {
                   pushRef.current("Flip sell was not filled. Flat. Next sell try in 60s.", "error");
                 }
@@ -912,18 +964,18 @@ export default function CdRangePanel({
           const chainNow = chainRef.current;
           if (!chainNow || chainIndexOf(chainNow) !== "SENSEX") return;
           if (!snap || snap.liveSession !== true || snap.tradable !== true || rangeHigh == null || rangeLow == null) return;
-          if (spot == null) return;
+          if (future == null) return;
           if (squaredRef.current || squareTime(now) || !entryWindowOpen(now, from)) return;
           if (dayStopHit(scoreRef.current)) return;
           const entryPick = pickRef.current;
           if (!entryPick || !cdChainIsPick(String(chainNow.expiryApi || ""), String(chainNow.expiryUi || ""), entryPick)) return;
           if (needInsideRef.current && !insideSeenRef.current) return;
           if (Date.now() < sellRetryRef.current) return;
-          const want = breakSide(spot, rangeHigh, rangeLow, rules.extraBreak);
+          const want = breakSide(future, rangeHigh, rangeLow, rules.extraBreak);
           if (!want) return;
           await sellRef.current(
             want,
-            `spot ${fmtPrice(px2(spot))} ${want === "PE" ? "above HIGH" : "below LOW"} ${fmtPrice(want === "PE" ? rangeHigh : rangeLow)}`,
+            `${fmtPrice(px2(future))} ${want === "PE" ? "above HIGH" : "below LOW"} ${fmtPrice(want === "PE" ? rangeHigh : rangeLow)}`,
           );
         } finally {
           tickingRef.current = false;
@@ -968,6 +1020,101 @@ export default function CdRangePanel({
     await cover("MANUAL", "STOP");
   }, [cover, pushLog]);
 
+  const applyAddQty = useCallback(async () => {
+    if (busyRef.current) return;
+    const open = positionRef.current;
+    if (!open) {
+      fail("No open CD trade. Quantity was not changed.");
+      return;
+    }
+    const parsed = readBoardQty(addQtyText, open.qty, "add");
+    if (!parsed.ok) {
+      fail(parsed.error);
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const sent = await sendOrder("SELL", open.iid, parsed.qty, open.segment);
+      if (!sent.ok) {
+        fail(`Add qty failed. Open quantity unchanged. ${sent.error}`);
+        return;
+      }
+      const base = positionRef.current?.iid === open.iid ? positionRef.current : open;
+      const next: CdPosition = { ...base, qty: base.qty + sent.filledQty };
+      positionRef.current = next;
+      setPosition(next);
+      rememberShort(chainRef.current, next);
+      const strike = Math.round(next.strike).toLocaleString("en-IN");
+      pushLog(
+        `ADD QTY: SELL ${strike} ${next.side} × ${qtyNote(sent.filledQty, parsed.qty)} @ ${fmtPrice(sent.fillPx)}. Open qty ${fmtQty(next.qty)}. Sold ${fmtPrice(next.fill)} unchanged.`,
+        "info",
+      );
+      toast({
+        title: "CD add qty",
+        description: `Open qty ${fmtQty(next.qty)}. Target and stop stay on ${fmtPrice(next.fill)}.`,
+      });
+      setAddQtyText("");
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }, [addQtyText, fail, pushLog, sendOrder]);
+
+  const applyExitQty = useCallback(async () => {
+    if (busyRef.current) return;
+    const open = positionRef.current;
+    if (!open) {
+      fail("No open CD trade. Quantity was not changed.");
+      return;
+    }
+    const parsed = readBoardQty(exitQtyText, open.qty, "exit");
+    if (!parsed.ok) {
+      fail(parsed.error);
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const sent = await sendOrder("BUY", open.iid, parsed.qty, open.segment);
+      if (!sent.ok) {
+        fail(`Exit qty failed. Open quantity unchanged. ${sent.error}`);
+        return;
+      }
+      const base = positionRef.current?.iid === open.iid ? positionRef.current : open;
+      const closed = Math.min(sent.filledQty, base.qty);
+      const left = base.qty - closed;
+      const strike = Math.round(base.strike).toLocaleString("en-IN");
+      if (left <= 0) {
+        positionRef.current = null;
+        setPosition(null);
+        clearLocalPosition(open.iid);
+        pushLog(
+          `EXIT QTY: BUY ${strike} ${base.side} × ${qtyNote(closed, parsed.qty)} @ ${fmtPrice(sent.fillPx)}. Flat. Sold ${fmtPrice(base.fill)} unchanged.`,
+          "exit",
+        );
+        toast({ title: "CD exit qty", description: `${strike} ${base.side} is flat.` });
+      } else {
+        const next: CdPosition = { ...base, qty: left };
+        positionRef.current = next;
+        setPosition(next);
+        rememberShort(chainRef.current, next);
+        pushLog(
+          `EXIT QTY: BUY ${strike} ${base.side} × ${qtyNote(closed, parsed.qty)} @ ${fmtPrice(sent.fillPx)}. Open qty ${fmtQty(left)}. Sold ${fmtPrice(next.fill)} unchanged.`,
+          "exit",
+        );
+        toast({
+          title: "CD exit qty",
+          description: `Open qty ${fmtQty(left)}. Target and stop stay on ${fmtPrice(next.fill)}.`,
+        });
+      }
+      setExitQtyText("");
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }, [exitQtyText, fail, pushLog, sendOrder]);
+
   const retryLeft = Math.max(0, Math.ceil((sellRetryAt - nowMs) / 1000));
   const rangeReady = (quote?.closedCount ?? 0) >= saved.candles && gap != null && gap >= saved.minGap;
   const tradeOn = rangeReady && side != null;
@@ -982,6 +1129,7 @@ export default function CdRangePanel({
     draft.midStop !== saved.midStop ||
     draft.stopPct !== String(saved.stopPct) ||
     draft.trailArmPct !== String(saved.trailArmPct) ||
+    draft.trailCtcPct !== String(saved.trailCtcPct) ||
     draft.trailLockPct !== String(saved.trailLockPct) ||
     draft.extraBreak !== String(saved.extraBreak) ||
     draft.targetPct !== String(saved.targetPct);
@@ -1018,13 +1166,17 @@ export default function CdRangePanel({
                             ? `${position.side} short is open.`
                             : side
                               ? "Break is live. CD sells the ATM on this print."
-                              : "Spot is inside the range.";
+                              : "Future is inside the range.";
 
   const gapClass = side === "PE" ? "text-cd-green" : side === "CE" ? "text-cd-red" : "";
-  const barText =
-    quote?.bars && quote.bars.length
-      ? quote.bars.map((bar) => bar.minute).join(" · ")
-      : `${quote?.closedCount ?? 0} / ${saved.candles} closed`;
+  const lastBar = quote?.bars && quote.bars.length ? quote.bars[quote.bars.length - 1]?.minute : "";
+  const candleCount = quote?.lookback ?? saved.candles;
+  const candleMinutes = quote?.barMinutes ?? saved.barMinutes;
+  const highSub = [contractLabel !== "Future" ? contractLabel : "", `${candleCount} × ${candleMinutes}m`, lastBar]
+    .filter(Boolean)
+    .join(" · ");
+  const expiryText = futureExpiryLabel(quote?.futureExpiry);
+  const lowSub = expiryText ? `min low · exp ${expiryText}` : "min low";
 
   return (
     <div className="flex flex-1 min-h-0 min-w-0 flex-col overflow-hidden text-[13px] ramsetu-glass-panel">
@@ -1033,18 +1185,19 @@ export default function CdRangePanel({
           <div className="nv-stat">
             <div className="nv-kicker">HIGH</div>
             <div className="nv-value">{fmtPrice(high)}</div>
-            <div className="nv-sub">{barText}</div>
+            <div className="nv-sub leading-snug">{highSub}</div>
           </div>
           <div className="nv-stat">
             <div className="nv-kicker">LOW</div>
             <div className="nv-value">{fmtPrice(low)}</div>
-            <div className="nv-sub">MID {fmtPrice(mid)}</div>
+            <div className="nv-sub leading-snug">{lowSub}</div>
           </div>
           <div className="nv-stat">
-            <div className="nv-kicker">Sensex</div>
-            <div className={`nv-value ${gapClass}`}>{fmtPrice(spotPx)}</div>
+            <div className="nv-kicker">{contractLabel}</div>
+            <div className={`nv-value ${gapClass}`}>{fmtPrice(futurePx)}</div>
             <div className={`nv-sub ${gapClass}`}>
               {gap == null ? "Gap —" : `Gap ${gap.toFixed(2)}`}
+              {quote?.futureExpiry ? ` · exp ${quote.futureExpiry.slice(5)}` : ""}
               {quote?.formingMinute ? ` · forming ${quote.formingMinute} out` : ""}
             </div>
           </div>
@@ -1138,6 +1291,19 @@ export default function CdRangePanel({
                 />
               </span>
             </CdField>
+            <CdField label="TRAIL CTC">
+              <input
+                aria-label="TRAIL CTC"
+                inputMode="numeric"
+                autoComplete="off"
+                value={draft.trailCtcPct}
+                onChange={(e) =>
+                  setDraft((row) => ({ ...row, trailCtcPct: e.target.value.replace(/[^\d]/g, "").slice(0, 3) }))
+                }
+                onBlur={() => setDraft((row) => ({ ...row, trailCtcPct: syncTrailCtc(row.trailArmPct, row.trailCtcPct) }))}
+                className="ramsetu-glass-select cd-field__control"
+              />
+            </CdField>
             <CdField label="SL % of premium sold">
               <input
                 aria-label="SL % of premium sold"
@@ -1154,7 +1320,14 @@ export default function CdRangePanel({
                 inputMode="decimal"
                 autoComplete="off"
                 value={draft.trailArmPct}
-                onChange={(e) => setDraft((row) => ({ ...row, trailArmPct: e.target.value.replace(/[^\d.]/g, "").slice(0, 6) }))}
+                onChange={(e) => {
+                  const trailArmPct = e.target.value.replace(/[^\d.]/g, "").slice(0, 6);
+                  setDraft((row) => ({
+                    ...row,
+                    trailArmPct,
+                    trailCtcPct: syncTrailCtc(trailArmPct, row.trailCtcPct),
+                  }));
+                }}
                 className="ramsetu-glass-select cd-field__control"
               />
             </CdField>
@@ -1204,8 +1377,8 @@ export default function CdRangePanel({
 
         {position && (
           <p className="mt-1 text-[13px] font-semibold tabular-nums text-cd-green">
-            Target ≤ {fmtPrice(bookTarget)} · trail arms ≤ {fmtPrice(bookArm)}
-            {position.trailArmed ? ` · trail stop ${fmtPrice(bookTrail)}` : ""} · SL ≥ {fmtPrice(bookStop)}
+            Target ≤ {fmtPrice(bookTarget)} · TRAIL CTC ≤ {fmtPrice(bookCtc)} · lock {fmtPrice(bookTrail)} · SL ≥{" "}
+            {fmtPrice(bookStop)}
           </p>
         )}
       </div>
@@ -1255,6 +1428,50 @@ export default function CdRangePanel({
               </div>
             </div>
           )}
+          <div className="cd-qty">
+            <div className="cd-qty__row">
+              <CdField label="Add Qty">
+                <input
+                  aria-label="Add Qty"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={addQtyText}
+                  onChange={(e) => setAddQtyText(e.target.value.replace(/[^\d]/g, "").slice(0, 6))}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void applyAddQty();
+                    }
+                  }}
+                  className="ramsetu-glass-select cd-field__control"
+                />
+              </CdField>
+              <button type="button" disabled={busy || !position} onClick={() => void applyAddQty()} className="ramsetu-glass-exec">
+                Apply
+              </button>
+            </div>
+            <div className="cd-qty__row">
+              <CdField label="Exit Qty">
+                <input
+                  aria-label="Exit Qty"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={exitQtyText}
+                  onChange={(e) => setExitQtyText(e.target.value.replace(/[^\d]/g, "").slice(0, 6))}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void applyExitQty();
+                    }
+                  }}
+                  className="ramsetu-glass-select cd-field__control"
+                />
+              </CdField>
+              <button type="button" disabled={busy || !position} onClick={() => void applyExitQty()} className="ramsetu-glass-exec">
+                Apply
+              </button>
+            </div>
+          </div>
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col">
@@ -1267,7 +1484,7 @@ export default function CdRangePanel({
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                Entry is the live Sensex print, not the candle close. Orders use the next Thursday after today. The top bar expiry is not the CD contract. The break sell goes through the live bid and trades. The booked price is the fill. Cover, target, and stop stay on the tight limit. The forming 15-minute bar does not move HIGH or LOW. An opposite HIGH break
+                HIGH and LOW come from the active monthly SENSEX future. After that expiry the next month's future takes over. Entry is that future's live print, not the candle close. The option strike still follows Sensex spot. Orders use the next Thursday after today. The top bar expiry is not the CD contract. The break sell goes through the live bid and trades. The booked price is the fill. Cover, target, and stop stay on the tight limit. The forming bar does not move HIGH or LOW. A minute with no trades does not move them either. TRAIL CTC arms the trail. The stop locks TRAIL CTC minus Trail arm, so 6 and 4 lock 2% profit instead of the 6% price. An opposite HIGH break
                 while short the CE covers and sells the ATM PE. A LOW break while short the PE covers and sells the ATM CE. Flips run until 14:30.
                 A failed sell waits 60 seconds. A target scores +1 only when the cover fill reached 10%, with one point of slack. Sold 772.32 covered
                 766.10 scores 0. A trail scores 0. A losing opposite break scores −0.5. Any other losing exit scores −1.

@@ -616,7 +616,7 @@ def vwap_data():
 
 @app.route("/api/cd/range", methods=["GET"])
 def cd_range():
-    """SENSEX range from the saved timeframe, candle count, and min gap. The forming bar is excluded."""
+    """SENSEX future range from the saved timeframe, candle count, and min gap. The forming bar is excluded."""
     try:
         from market.cd_range import get_cd_range
 

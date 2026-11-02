@@ -3769,7 +3769,7 @@ body.sow-has-dashboard-bg {
 
 .cd-params__grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 12px 14px;
   align-items: end;
 }
@@ -3858,6 +3858,37 @@ body.sow-has-dashboard-bg {
   min-width: 108px;
   padding: 0 14px;
   font-size: 12px;
+}
+
+.cd-qty {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12px 18px;
+  margin-top: 14px;
+}
+
+.cd-qty__row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(100%, 280px);
+}
+
+.cd-qty__row .cd-field {
+  flex: 1;
+}
+
+.cd-qty__row .ramsetu-glass-exec {
+  height: 40px;
+  min-width: 88px;
+  padding: 0 14px;
+  font-size: 12px;
+}
+
+.cd-qty__row .ramsetu-glass-exec:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 @media (max-width: 1180px) {

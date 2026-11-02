@@ -1,14 +1,17 @@
 """
-CD desk: SENSEX range from the last 4 closed 15-minute spot bars.
+CD desk: SENSEX range from the active monthly future.
 
 Bars open at 09:15 IST. The forming candle is never in the range.
-HIGH is the max high of those 4 bars. LOW is the min low.
+HIGH is the max high of those closed bars. LOW is the min low.
 MID is (HIGH + LOW) / 2. HIGH − LOW under 50 is not a trade.
-The fourth bar closes at 10:15, which is the first entry time.
+A minute with no trades is left out, so a carried last price cannot set either level.
+The contract is the front SENSEX future through its expiry date,
+then the next month.
 """
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -20,7 +23,6 @@ from market.nifty_vwap import (
     _in_cash_window,
     _minute_dt,
     _px2,
-    _spot_symbol,
     select_session_date,
 )
 
@@ -31,9 +33,12 @@ LOOKBACK = 4
 TF_MINUTES = 15
 MIN_GAP = 50.0
 SESSION_OPEN = (9, 15)
+FUTURE_SEGMENT = 12
 _CACHE_TTL_SEC = 10.0
 _CACHE: dict[str, Any] = {}
 _lock = threading.Lock()
+_FUT_RE = re.compile(r"^SENSEX\d{2}[A-Z]{3}FUT$")
+_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 
 
 def _session_minutes(bars: list[dict[str, Any]]) -> dict[date, dict[datetime, dict[str, float]]]:
@@ -54,6 +59,9 @@ def _session_minutes(bars: list[dict[str, Any]]) -> dict[date, dict[datetime, di
             low = close
         if opened is None or opened <= 0:
             opened = close
+        volume = _as_float(bar.get("volume"))
+        if volume is not None and volume <= 0:
+            continue
         slot = by_day.setdefault(minute.date(), {})
         slot[minute] = {"open": opened, "high": high, "low": low, "close": close}
     return by_day
@@ -85,29 +93,139 @@ def score_close(kind: str, sold: float, cover: float, target_pct: float = 10.0) 
     return 0.0
 
 
+def _last_thursday(year: int, month: int) -> date:
+    if month == 12:
+        nxt = date(year + 1, 1, 1)
+    else:
+        nxt = date(year, month + 1, 1)
+    last = nxt - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - 3) % 7)
+
+
+def _calendar_front(as_of: date) -> dict[str, Any]:
+    """Last Thursday of this month, or next month once that Thursday has passed."""
+    expiry = _last_thursday(as_of.year, as_of.month)
+    if expiry < as_of:
+        if as_of.month == 12:
+            year, month = as_of.year + 1, 1
+        else:
+            year, month = as_of.year, as_of.month + 1
+        expiry = _last_thursday(year, month)
+    trading = f"SENSEX{expiry.year % 100:02d}{_MONTHS[expiry.month - 1]}FUT"
+    return {
+        "symbol": f"BSE:{trading}",
+        "expiry": expiry.isoformat(),
+        "tradingSymbol": trading,
+        "token": 0,
+        "segment": FUTURE_SEGMENT,
+    }
+
+
+def _master_texts() -> list[str]:
+    from market.fyers_ltp import _master_paths
+
+    texts: list[str] = []
+    for path in _master_paths():
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if "|SENSEX|SENSEX" in text and "FUT|" in text:
+            texts.append(text)
+            break
+    return texts
+
+
+def front_month_sensex_future(as_of: date, master_text: str | None = None) -> dict[str, Any]:
+    """Nearest SENSEX monthly future whose expiry is today or later. Not SENSEX50 or a spread."""
+    texts = [master_text] if master_text is not None else _master_texts()
+    best: tuple[date, str, int] | None = None
+    for text in texts:
+        for line in (text or "").splitlines():
+            parts = line.split("|")
+            if len(parts) < 17:
+                continue
+            venue = parts[0].strip().upper()
+            if venue not in ("BSEFO", "12"):
+                continue
+            if parts[3].strip().upper() != "SENSEX":
+                continue
+            if parts[5].strip().upper() not in ("IF", "FUTIDX"):
+                continue
+            symbol = parts[4].strip().upper()
+            if not _FUT_RE.match(symbol):
+                continue
+            match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", parts[16].strip())
+            if not match:
+                continue
+            expiry = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            if expiry < as_of:
+                continue
+            try:
+                token = int(parts[1].strip())
+            except ValueError:
+                token = 0
+            if best is None or expiry < best[0]:
+                best = (expiry, symbol, token)
+    if best is None:
+        return _calendar_front(as_of)
+    expiry, symbol, token = best
+    return {
+        "symbol": f"BSE:{symbol}",
+        "expiry": expiry.isoformat(),
+        "tradingSymbol": symbol,
+        "token": token,
+        "segment": FUTURE_SEGMENT,
+    }
+
+
+def _pin_future(front: dict[str, Any]) -> None:
+    token = int(front.get("token") or 0)
+    symbol = str(front.get("symbol") or "")
+    if token <= 0 or ":" not in symbol:
+        return
+    try:
+        from market.fyers_ltp import get_fyers_ltp_feed
+
+        get_fyers_ltp_feed().pin_symbol(symbol, token, int(front.get("segment") or FUTURE_SEGMENT))
+    except Exception as exc:
+        _log.info("CD future pin skipped: %s", exc)
+
+
+def _future_fields(front: dict[str, Any] | None) -> dict[str, Any]:
+    row = front or {}
+    return {
+        "futureSymbol": str(row.get("symbol") or ""),
+        "futureExpiry": str(row.get("expiry") or ""),
+        "futureToken": int(row.get("token") or 0),
+        "futureSegment": int(row.get("segment") or FUTURE_SEGMENT),
+    }
+
+
 def build_cd_range(
     bars: list[dict[str, Any]],
     now: datetime,
     lookback: int = LOOKBACK,
     tf_minutes: int = TF_MINUTES,
     min_gap: float = MIN_GAP,
+    front: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Last closed SENSEX spot bars. The forming bar is dropped."""
+    """Last closed bars of the active SENSEX future. The forming bar is dropped."""
     lookback = max(1, int(lookback))
     tf_minutes = max(1, int(tf_minutes))
     min_gap = float(min_gap)
     now = now.astimezone(IST)
     days = _session_minutes(bars)
     session = select_session_date(now, set(days))
-    symbol = _spot_symbol("SENSEX")
+    fields = _future_fields(front)
     if session is None:
         return {
             "ok": False,
             "index": "SENSEX",
-            "error": "No Sensex cash-session candles from Fyers yet.",
+            "error": "No Sensex future candles from Fyers yet.",
             "source": "fyers",
-            "futureSymbol": symbol,
             "tradable": False,
+            **fields,
         }
     buckets: dict[datetime, dict[str, float]] = {}
     for minute, row in days.get(session, {}).items():
@@ -132,7 +250,7 @@ def build_cd_range(
         "index": "SENSEX",
         "source": "fyers",
         "sessionDate": session.isoformat(),
-        "futureSymbol": symbol,
+        **fields,
         "lookback": lookback,
         "barMinutes": tf_minutes,
         "minGap": min_gap,
@@ -140,6 +258,7 @@ def build_cd_range(
         "liveSession": live,
         "firstEntry": f"{open_min // 60:02d}:{open_min % 60:02d}",
         "formingMinute": forming.strftime("%H:%M") if forming is not None else None,
+        "futureLtp": None,
         "tradable": False,
         "high": None,
         "low": None,
@@ -155,6 +274,10 @@ def build_cd_range(
             for bucket in used
         ],
     }
+    session_minutes = days.get(session, {})
+    if session_minutes:
+        latest = session_minutes[max(session_minutes)]
+        base["futureLtp"] = _px2(latest["close"])
     if len(used) < lookback:
         base["waiting"] = True
         base["error"] = (
@@ -177,24 +300,26 @@ def build_cd_range(
 def _compute(now: datetime, lookback: int = LOOKBACK, tf_minutes: int = TF_MINUTES, min_gap: float = MIN_GAP) -> dict[str, Any]:
     from market.rsi_band import _fetch_fyers_history
 
-    symbol = _spot_symbol("SENSEX")
+    front = front_month_sensex_future(now.astimezone(IST).date())
+    _pin_future(front)
+    symbol = str(front.get("symbol") or "")
     now_epoch = int(now.timestamp())
     start_epoch = int((now - timedelta(days=5)).timestamp())
-    bars = _fetch_fyers_history(symbol, "1", start_epoch, now_epoch)
+    bars = _fetch_fyers_history(symbol, "1", start_epoch, now_epoch) if symbol else []
     if not bars:
         return {
             "ok": False,
             "index": "SENSEX",
-            "error": "Fyers Sensex spot history is unavailable.",
+            "error": f"Fyers {symbol or 'Sensex future'} history is unavailable.",
             "source": "fyers",
-            "futureSymbol": symbol,
             "tradable": False,
+            **_future_fields(front),
         }
-    return build_cd_range(bars, now, lookback, tf_minutes, min_gap)
+    return build_cd_range(bars, now, lookback, tf_minutes, min_gap, front)
 
 
 def get_cd_range(lookback: int = LOOKBACK, tf_minutes: int = TF_MINUTES, min_gap: float = MIN_GAP) -> dict[str, Any]:
-    """Cached SENSEX range for the saved timeframe, candle count, and gap."""
+    """Cached SENSEX future range for the saved timeframe, candle count, and gap."""
     lookback = max(1, int(lookback))
     tf_minutes = max(1, int(tf_minutes))
     min_gap = float(min_gap)
@@ -255,6 +380,15 @@ def _self_check() -> None:
     bars += _bucket(day, 9, 45, 80150, 79900)
     bars += _bucket(day, 10, 0, 80300, 80050, spike_at=14)
     bars += _bucket(day, 10, 15, 90000, 10000)
+    ghost = day.replace(hour=10, minute=1)
+    for bar in bars:
+        stamp = datetime.fromtimestamp(int(bar["time"]), IST)
+        if stamp == ghost:
+            bar["volume"] = 0
+            bar["open"] = bar["high"] = bar["low"] = bar["close"] = 10000.0
+            break
+    else:
+        raise SystemExit("missing 10:01 bar for the no-trade carry")
 
     early = build_cd_range(bars, day.replace(hour=10, minute=14))
     if early.get("tradable") or early.get("closedCount") != 3:
@@ -267,6 +401,8 @@ def _self_check() -> None:
         raise SystemExit(f"10:15 must be tradable: {ready}")
     if ready.get("high") != 80300 or ready.get("low") != 79900:
         raise SystemExit(f"range drifted: {ready.get('high')} {ready.get('low')}")
+    if ready.get("low") == 10000:
+        raise SystemExit("zero-volume carry set LOW")
     if ready.get("gap") != 400 or ready.get("mid") != 80100:
         raise SystemExit(f"gap/mid drifted: {ready}")
     if ready.get("formingMinute") != "10:15":
@@ -310,6 +446,26 @@ def _self_check() -> None:
         raise SystemExit("a losing stop scores -1")
     if score_close("SQUARE", 100, 99) != 0:
         raise SystemExit("a winning square does not score +1")
+
+    master = (
+        "BSEFO|1112362|1|SENSEX50|SENSEX5026NOVFUT|IF|x|1|1|1|1|1|1|1|1|SNSX50|2026-11-26T00:00:00|\n"
+        "BSEFO|820243|4|SENSEX|SENSEX26NOV27JANFUT|IF|x|1|1|1|1|1|1|1|1||2026-11-26T00:00:00|\n"
+        "BSEFO|1145756|1|SENSEX|SENSEX26DECFUT|IF|x|1|1|1|1|1|1|1|1|SENSEX|2026-12-31T00:00:00|\n"
+        "BSEFO|1100929|1|SENSEX|SENSEX26NOVFUT|IF|x|1|1|1|1|1|1|1|1|SENSEX|2026-11-26T00:00:00|\n"
+        "BSEFO|1172959|1|SENSEX|SENSEX27JANFUT|IF|x|1|1|1|1|1|1|1|1|SENSEX|2027-01-28T00:00:00|\n"
+    )
+    nov = front_month_sensex_future(date(2026, 11, 2), master)
+    if nov.get("symbol") != "BSE:SENSEX26NOVFUT" or nov.get("expiry") != "2026-11-26" or nov.get("token") != 1100929:
+        raise SystemExit(f"November future picked {nov}")
+    expiry_day = front_month_sensex_future(date(2026, 11, 26), master)
+    if expiry_day.get("symbol") != "BSE:SENSEX26NOVFUT":
+        raise SystemExit(f"expiry day must stay on November: {expiry_day}")
+    rolled = front_month_sensex_future(date(2026, 11, 27), master)
+    if rolled.get("symbol") != "BSE:SENSEX26DECFUT" or rolled.get("expiry") != "2026-12-31":
+        raise SystemExit(f"contract did not roll: {rolled}")
+    guessed = front_month_sensex_future(date(2026, 11, 27), "")
+    if guessed.get("symbol") != "BSE:SENSEX26DECFUT" or guessed.get("token") != 0:
+        raise SystemExit(f"calendar roll drifted: {guessed}")
     print("cd range self-check ok")
 
 
