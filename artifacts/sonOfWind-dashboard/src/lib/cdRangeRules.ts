@@ -226,6 +226,9 @@ export function formatHm(hour: number, minute: number): string {
 
 export type CdCloseKind = "TARGET" | "SL" | "TRAIL" | "MID" | "OPPOSITE" | "SQUARE" | "MANUAL";
 
+/** Off until Trail arm. CTC means the stop is the sell fill. Lock means TRAIL CTC tightened it. */
+export type CdTrailStage = "off" | "ctc" | "lock";
+
 export type CdAction =
   | { type: "SQUARE" }
   | { type: "OPPOSITE"; next: FlipSide }
@@ -233,7 +236,8 @@ export type CdAction =
   | { type: "SL" }
   | { type: "TARGET" }
   | { type: "TRAIL" }
-  | { type: "ARM_TRAIL" };
+  | { type: "ARM_CTC" }
+  | { type: "ARM_LOCK" };
 
 export type IstClock = {
   year: number;
@@ -352,9 +356,9 @@ export function trailCtcPx(sold: number, pct: number): number {
 }
 
 /**
- * Cover after TRAIL CTC.
+ * Cover after TRAIL CTC is reached.
  * The stop locks trailCtc − trailArm percent of profit, not the TRAIL CTC price.
- * When those two match, the older trail-lock box still applies and 0 means cost.
+ * When TRAIL CTC is not above Trail arm there is no tighter stop: Trail arm leaves the SL at cost.
  */
 export function trailStopPx(
   sold: number,
@@ -415,6 +419,7 @@ export function decideCdAction(input: {
   sold: number;
   ltp: number | null;
   trailArmed: boolean;
+  trailStage?: CdTrailStage;
   extraBreak?: number;
   stopPct?: number;
   targetPct?: number;
@@ -441,9 +446,19 @@ export function decideCdAction(input: {
   if (ltp == null || !(ltp > 0) || !(sold > 0)) return null;
   if (gte(ltp, stopPx(sold, stopPct))) return { type: "SL" };
   if (lte(ltp, targetPx(sold, targetPct))) return { type: "TARGET" };
-  const cover = trailStopPx(sold, trailCtcPct, trailArmPct, trailLockPct);
-  if (input.trailArmed && gte(ltp, cover)) return { type: "TRAIL" };
-  if (!input.trailArmed && lte(ltp, trailCtcPx(sold, trailCtcPct))) return { type: "ARM_TRAIL" };
+  const stage: CdTrailStage =
+    input.trailStage === "off" || input.trailStage === "ctc" || input.trailStage === "lock"
+      ? input.trailStage
+      : input.trailArmed
+        ? "lock"
+        : "off";
+  const ctcCover = trailCoverPx(sold, trailLockPct);
+  const profitCover = trailStopPx(sold, trailCtcPct, trailArmPct, trailLockPct);
+  const lockActive = trailCtcPct > trailArmPct;
+  if (stage !== "lock" && lockActive && lte(ltp, trailCtcPx(sold, trailCtcPct))) return { type: "ARM_LOCK" };
+  if (stage === "lock" && gte(ltp, profitCover)) return { type: "TRAIL" };
+  if (stage === "ctc" && gte(ltp, ctcCover)) return { type: "TRAIL" };
+  if (stage === "off" && trailArmPct > 0 && lte(ltp, trailArmPx(sold, trailArmPct))) return { type: "ARM_CTC" };
   return null;
 }
 
@@ -543,16 +558,23 @@ function assertCdRules(): void {
   };
   const act = (patch: Partial<typeof base>) => decideCdAction({ ...base, ...patch });
   if (act({ ltp: 89 })?.type !== "TARGET") throw new Error("a print through 10% is a target");
-  if (act({ ltp: 94 })?.type !== "ARM_TRAIL") throw new Error("5% arms the trail");
-  if (act({ ltp: 100, trailArmed: true })?.type !== "TRAIL") throw new Error("trail covers at the sell fill");
-  if (act({ ltp: 89, trailArmed: true })?.type !== "TARGET") throw new Error("a jump through 10% still targets");
-  if (act({ ltp: 112, trailArmed: true })?.type !== "SL") throw new Error("12% stop is before the trail");
-  if (act({ ltp: 105, trailArmed: true })?.type !== "TRAIL") throw new Error("trail covers between the fill and the stop");
-  if (act({ ltp: 96, trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("4% profit does not arm TRAIL CTC 6");
-  if (act({ ltp: 94, trailArmPct: 4, trailCtcPct: 6 })?.type !== "ARM_TRAIL") throw new Error("6% arms TRAIL CTC");
-  if (act({ ltp: 97, trailArmed: true, trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("2% lock stays open above the stop");
-  if (act({ ltp: 98, trailArmed: true, trailArmPct: 4, trailCtcPct: 6 })?.type !== "TRAIL") throw new Error("SL locks 2% profit");
-  if (act({ ltp: 94, trailArmed: true, trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("open profit stays until the 2% lock");
+  if (act({ ltp: 96 }) !== null) throw new Error("under 5% does not arm");
+  if (act({ ltp: 95 })?.type !== "ARM_CTC") throw new Error("5% moves the stop to CTC");
+  if (act({ ltp: 94, trailStage: "ctc" }) !== null) throw new Error("equal TRAIL CTC does not tighten past cost");
+  if (act({ ltp: 100, trailStage: "ctc" })?.type !== "TRAIL") throw new Error("CTC stop covers at the sell fill");
+  if (act({ ltp: 100, trailArmed: true })?.type !== "TRAIL") throw new Error("legacy armed covers at the sell fill");
+  if (act({ ltp: 89, trailStage: "ctc" })?.type !== "TARGET") throw new Error("a jump through 10% still targets");
+  if (act({ ltp: 112, trailStage: "ctc" })?.type !== "SL") throw new Error("12% stop is before the trail");
+  if (act({ ltp: 105, trailStage: "ctc" })?.type !== "TRAIL") throw new Error("CTC stop is between the fill and the hard stop");
+  if (act({ ltp: 97, trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("3% does not arm");
+  if (act({ ltp: 96, trailArmPct: 4, trailCtcPct: 6 })?.type !== "ARM_CTC") throw new Error("4% moves SL to CTC");
+  if (act({ ltp: 99, trailStage: "ctc", trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("open profit stays above cost");
+  if (act({ ltp: 100, trailStage: "ctc", trailArmPct: 4, trailCtcPct: 6 })?.type !== "TRAIL") throw new Error("CTC SL books at cost");
+  if (act({ ltp: 94, trailArmPct: 4, trailCtcPct: 6 })?.type !== "ARM_LOCK") throw new Error("6% locks 2% profit");
+  if (act({ ltp: 94, trailStage: "ctc", trailArmPct: 4, trailCtcPct: 6 })?.type !== "ARM_LOCK") throw new Error("CTC then TRAIL CTC");
+  if (act({ ltp: 97, trailStage: "lock", trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("2% lock stays open above the stop");
+  if (act({ ltp: 98, trailStage: "lock", trailArmPct: 4, trailCtcPct: 6 })?.type !== "TRAIL") throw new Error("SL locks 2% profit");
+  if (act({ ltp: 94, trailStage: "lock", trailArmPct: 4, trailCtcPct: 6 }) !== null) throw new Error("open profit stays until the 2% lock");
   const draft = draftFromParams(defaultCdParams());
   const lowCtc = parseCdParams({ ...draft, trailArmPct: "4", trailCtcPct: "3" });
   if (lowCtc.ok) throw new Error("TRAIL CTC below trail arm");

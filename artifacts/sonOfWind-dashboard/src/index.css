@@ -3905,3 +3905,464 @@ body.sow-has-dashboard-bg {
     margin-left: 0;
   }
 }
+
+.cv-root {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.cv-bar {
+  position: relative;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cv-bar__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 12px;
+}
+
+.cv-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.cv-field--strike {
+  position: relative;
+  flex: 1 1 240px;
+  max-width: 420px;
+}
+
+.cv-field--actions {
+  margin-left: auto;
+}
+
+.cv-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.cv-pill {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid hsl(var(--foreground) / 0.14);
+  background: hsl(var(--card) / 0.45);
+  color: hsl(var(--foreground) / 0.8);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.cv-pill--on {
+  color: hsl(240 14% 10%);
+  background: linear-gradient(145deg, hsl(38 68% 56% / 0.96) 0%, hsl(32 62% 44% / 0.98) 100%);
+  border-color: hsl(38 60% 58% / 0.55);
+}
+
+.light-theme .cv-pill--on {
+  color: hsl(30 25% 12%);
+}
+
+.cv-pill--ce.cv-pill--on {
+  color: hsl(0 0% 100%);
+  background: linear-gradient(145deg, hsl(0 72% 48%) 0%, hsl(0 68% 38%) 100%);
+  border-color: hsl(0 70% 46% / 0.6);
+}
+
+.cv-pill--pe.cv-pill--on {
+  color: hsl(0 0% 100%);
+  background: linear-gradient(145deg, hsl(152 55% 36%) 0%, hsl(152 50% 28%) 100%);
+  border-color: hsl(152 50% 34% / 0.6);
+}
+
+.cv-pill--sell.cv-pill--on {
+  color: hsl(0 0% 100%);
+  background: linear-gradient(145deg, hsl(0 72% 48%) 0%, hsl(0 68% 38%) 100%);
+  border-color: hsl(0 70% 46% / 0.6);
+}
+
+.cv-pill--buy.cv-pill--on {
+  color: hsl(0 0% 100%);
+  background: linear-gradient(145deg, hsl(152 55% 36%) 0%, hsl(152 50% 28%) 100%);
+  border-color: hsl(152 50% 34% / 0.6);
+}
+
+.cv-spot {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  height: 28px;
+}
+
+.cv-spot__px {
+  font-size: 16px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.cv-spot__meta {
+  font-size: 11px;
+  font-weight: 600;
+  color: hsl(var(--muted-foreground));
+}
+
+.cv-strike-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 220px;
+  height: 32px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.cv-strike-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.cv-strike-btn__num,
+.cv-strike-btn__px {
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
+.cv-strike-btn__side--ce {
+  color: hsl(0 72% 48%);
+}
+
+.cv-strike-btn__side--pe {
+  color: hsl(152 55% 36%);
+}
+
+.cv-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 40;
+  width: min(440px, 78vw);
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px;
+  border-radius: 10px;
+  border: 1px solid hsl(var(--foreground) / 0.12);
+  background: hsl(var(--card) / 0.96);
+  box-shadow: 0 12px 32px hsl(214 40% 10% / 0.28);
+}
+
+.light-theme .cv-menu {
+  background: hsl(0 0% 100% / 0.98);
+  border-color: hsl(213 40% 78%);
+}
+
+.cv-menu__head,
+.cv-menu__row {
+  display: grid;
+  grid-template-columns: 72px 84px 1fr 1fr;
+  gap: 4px;
+  align-items: center;
+}
+
+.cv-menu__head {
+  padding: 4px 6px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: hsl(var(--muted-foreground));
+}
+
+.cv-menu__row {
+  padding: 2px 4px;
+  border-radius: 8px;
+}
+
+.cv-menu__row--atm {
+  background: hsl(38 70% 50% / 0.08);
+}
+
+.cv-menu__row--on {
+  background: hsl(var(--foreground) / 0.06);
+}
+
+.cv-menu__off {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.cv-menu__strike {
+  font-size: 12px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-menu__px {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.cv-menu__px--ce {
+  color: hsl(0 72% 46%);
+}
+
+.cv-menu__px--pe {
+  color: hsl(152 55% 32%);
+}
+
+.cv-menu__px--on {
+  border-color: currentColor;
+  background: hsl(var(--foreground) / 0.04);
+}
+
+.cv-menu__px:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.cv-qty {
+  width: 96px;
+  height: 32px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-qty--row {
+  width: 72px;
+  height: 28px;
+}
+
+.cv-qty--pts {
+  width: 72px;
+}
+
+.cv-arm {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid hsl(38 60% 46% / 0.55);
+  background: linear-gradient(145deg, hsl(38 68% 52%) 0%, hsl(32 62% 40%) 100%);
+  color: hsl(30 25% 12%);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+}
+
+.cv-arm--sl {
+  border-color: hsl(0 70% 46% / 0.45);
+}
+
+.cv-arm--on {
+  box-shadow: inset 0 0 0 2px hsl(0 0% 100% / 0.35), 0 3px 10px hsl(32 55% 28% / 0.28);
+}
+
+.cv-arm:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.cv-levels {
+  font-size: 10px;
+  font-weight: 700;
+  color: hsl(var(--muted-foreground));
+}
+
+.cv-actions-top,
+.cv-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.cv-sell,
+.cv-buy {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  color: hsl(0 0% 100%);
+  cursor: pointer;
+}
+
+.cv-row-actions .cv-sell,
+.cv-row-actions .cv-buy {
+  height: 28px;
+  padding: 0 10px;
+}
+
+.cv-sell {
+  border: 1px solid hsl(0 70% 46% / 0.55);
+  background: linear-gradient(145deg, hsl(0 72% 48%) 0%, hsl(0 68% 36%) 100%);
+  box-shadow: inset 0 1px 0 hsl(0 0% 100% / 0.18), 0 3px 10px hsl(0 70% 36% / 0.25);
+}
+
+.cv-buy {
+  border: 1px solid hsl(152 50% 32% / 0.55);
+  background: linear-gradient(145deg, hsl(152 55% 36%) 0%, hsl(152 50% 26%) 100%);
+  box-shadow: inset 0 1px 0 hsl(0 0% 100% / 0.18), 0 3px 10px hsl(152 50% 26% / 0.25);
+}
+
+.cv-sell:hover:not(:disabled),
+.cv-buy:hover:not(:disabled),
+.cv-pill:hover:not(.cv-pill--on) {
+  filter: brightness(1.06);
+}
+
+.cv-sell:disabled,
+.cv-buy:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: grayscale(0.35);
+}
+
+.cv-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-note__err {
+  color: hsl(32 90% 46%);
+}
+
+.cv-note__pnl {
+  margin-left: auto;
+}
+
+.cv-other {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: hsl(32 90% 46%);
+}
+
+.cv-book {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.cv-book__title {
+  padding: 10px 12px 0;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: hsl(var(--foreground) / 0.72);
+}
+
+.cv-table-wrap {
+  padding-top: 4px;
+}
+
+.cv-table {
+  min-width: 980px;
+}
+
+.cv-empty {
+  text-align: center;
+  color: hsl(var(--muted-foreground));
+  font-weight: 600;
+}
+
+.cv-inst {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.cv-inst__strike {
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-side {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.cv-side--ce {
+  color: hsl(0 72% 46%);
+  background: hsl(0 72% 50% / 0.12);
+}
+
+.cv-side--pe {
+  color: hsl(152 55% 32%);
+  background: hsl(152 55% 40% / 0.14);
+}
+
+.cv-status {
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.cv-status--filled,
+.cv-status--open {
+  color: hsl(152 55% 34%);
+}
+
+.cv-status--partial {
+  color: hsl(32 90% 42%);
+}
+
+.cv-status--rejected,
+.cv-status--closed {
+  color: hsl(var(--muted-foreground));
+}
+
+.cv-status--rejected {
+  color: hsl(0 72% 48%);
+}
+
+.cv-row--closed td {
+  opacity: 0.72;
+}
+
+.cv-done {
+  font-size: 11px;
+  font-weight: 700;
+  color: hsl(var(--muted-foreground));
+}
+
+@media (max-width: 900px) {
+  .cv-field--actions {
+    margin-left: 0;
+  }
+}

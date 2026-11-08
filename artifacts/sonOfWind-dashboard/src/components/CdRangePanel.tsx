@@ -45,10 +45,13 @@ import {
   squareTime,
   stopPx,
   targetPx,
+  trailArmPx,
+  trailCoverPx,
   trailCtcLockPct,
   trailCtcPx,
   trailStopPx,
   type CdCloseKind,
+  type CdTrailStage,
   type CdExpiryPick,
   type CdParamDraft,
   type CdParams,
@@ -93,6 +96,7 @@ type CdPosition = {
   iid: number;
   segment: number;
   trailArmed: boolean;
+  trailStage: CdTrailStage;
 };
 
 type SessionStore = {
@@ -174,6 +178,12 @@ function readPosition(raw: unknown): CdPosition | null {
   if (!Number.isFinite(fill) || fill <= 0) return null;
   if (!Number.isFinite(iid) || iid <= 0) return null;
   if (!Number.isFinite(segment) || segment <= 0) return null;
+  const trailStage: CdTrailStage =
+    row.trailStage === "off" || row.trailStage === "ctc" || row.trailStage === "lock"
+      ? row.trailStage
+      : row.trailArmed === true
+        ? "lock"
+        : "off";
   return {
     strike,
     side: row.side,
@@ -181,7 +191,8 @@ function readPosition(raw: unknown): CdPosition | null {
     fill,
     iid,
     segment,
-    trailArmed: row.trailArmed === true,
+    trailArmed: trailStage !== "off",
+    trailStage,
   };
 }
 
@@ -387,7 +398,10 @@ export default function CdRangePanel({
   const mtm = position && liveLtp != null ? shortMtm(position.fill, liveLtp, position.qty) : null;
   const bookTarget = position ? targetPx(position.fill, saved.targetPct) : null;
   const bookStop = position ? stopPx(position.fill, saved.stopPct) : null;
+  const bookArm = position && saved.trailArmPct > 0 ? trailArmPx(position.fill, saved.trailArmPct) : null;
+  const bookCtcSl = position ? trailCoverPx(position.fill, saved.trailLockPct) : null;
   const bookCtc = position ? trailCtcPx(position.fill, saved.trailCtcPct) : null;
+  const lockActive = saved.trailCtcPct > saved.trailArmPct;
   const bookTrail = position
     ? trailStopPx(position.fill, saved.trailCtcPct, saved.trailArmPct, saved.trailLockPct)
     : null;
@@ -716,6 +730,7 @@ export default function CdRangePanel({
           iid,
           segment,
           trailArmed: false,
+          trailStage: "off",
         };
         positionRef.current = next;
         setPosition(next);
@@ -867,6 +882,7 @@ export default function CdRangePanel({
               sold: open.fill,
               ltp: sane ? ltp : null,
               trailArmed: open.trailArmed,
+              trailStage: open.trailStage,
               extraBreak: rules.extraBreak,
               stopPct: rules.stopPct,
               targetPct: rules.targetPct,
@@ -875,16 +891,22 @@ export default function CdRangePanel({
               trailLockPct: rules.trailLockPct,
             });
             if (!action) return;
-            if (action.type === "ARM_TRAIL") {
-              const next = { ...open, trailArmed: true };
+            if (action.type === "ARM_CTC" || action.type === "ARM_LOCK") {
+              const trailStage: CdTrailStage = action.type === "ARM_LOCK" ? "lock" : "ctc";
+              const next = { ...open, trailArmed: true, trailStage };
               positionRef.current = next;
               setPosition(next);
-              const lockPct = trailCtcLockPct(rules.trailCtcPct, rules.trailArmPct);
-              const cover = trailStopPx(open.fill, rules.trailCtcPct, rules.trailArmPct, rules.trailLockPct);
-              pushRef.current(
-                `TRAIL CTC ${rules.trailCtcPct}%. SL locks ${lockPct}% at ${fmtPrice(cover)}.`,
-                "info",
-              );
+              if (trailStage === "lock") {
+                const lockPct = trailCtcLockPct(rules.trailCtcPct, rules.trailArmPct);
+                const cover = trailStopPx(open.fill, rules.trailCtcPct, rules.trailArmPct, rules.trailLockPct);
+                pushRef.current(
+                  `TRAIL CTC ${rules.trailCtcPct}%. SL locks ${lockPct}% at ${fmtPrice(cover)}.`,
+                  "info",
+                );
+              } else {
+                const cover = trailCoverPx(open.fill, rules.trailLockPct);
+                pushRef.current(`Trail arm ${rules.trailArmPct}%. SL is CTC at ${fmtPrice(cover)}.`, "info");
+              }
               return;
             }
             if (action.type === "OPPOSITE") {
@@ -1377,7 +1399,9 @@ export default function CdRangePanel({
 
         {position && (
           <p className="mt-1 text-[13px] font-semibold tabular-nums text-cd-green">
-            Target ≤ {fmtPrice(bookTarget)} · TRAIL CTC ≤ {fmtPrice(bookCtc)} · lock {fmtPrice(bookTrail)} · SL ≥{" "}
+            Target ≤ {fmtPrice(bookTarget)}
+            {bookArm != null ? ` · arm ≤ ${fmtPrice(bookArm)}` : ""} · CTC SL ≥ {fmtPrice(bookCtcSl)}
+            {lockActive ? ` · TRAIL CTC ≤ ${fmtPrice(bookCtc)} · lock ≥ ${fmtPrice(bookTrail)}` : ""} · SL ≥{" "}
             {fmtPrice(bookStop)}
           </p>
         )}
@@ -1424,7 +1448,13 @@ export default function CdRangePanel({
               </div>
               <div>
                 <div className="ramsetu-glass-toolbar__label">Trail</div>
-                <div className="text-[14px] font-extrabold tabular-nums">{position.trailArmed ? "Armed" : "Off"}</div>
+                <div className="text-[14px] font-extrabold tabular-nums">
+                  {position.trailStage === "lock"
+                    ? `Lock ${trailCtcLockPct(saved.trailCtcPct, saved.trailArmPct)}%`
+                    : position.trailStage === "ctc"
+                      ? "CTC"
+                      : "Off"}
+                </div>
               </div>
             </div>
           )}
@@ -1484,7 +1514,7 @@ export default function CdRangePanel({
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                HIGH and LOW come from the active monthly SENSEX future. After that expiry the next month's future takes over. Entry is that future's live print, not the candle close. The option strike still follows Sensex spot. Orders use the next Thursday after today. The top bar expiry is not the CD contract. The break sell goes through the live bid and trades. The booked price is the fill. Cover, target, and stop stay on the tight limit. The forming bar does not move HIGH or LOW. A minute with no trades does not move them either. TRAIL CTC arms the trail. The stop locks TRAIL CTC minus Trail arm, so 6 and 4 lock 2% profit instead of the 6% price. An opposite HIGH break
+                HIGH and LOW come from the active monthly SENSEX future. After that expiry the next month's future takes over. Entry is that future's live print, not the candle close. The option strike still follows Sensex spot. Orders use the next Thursday after today. The top bar expiry is not the CD contract. The break sell goes through the live bid and trades. The booked price is the fill. Cover, target, and stop stay on the tight limit. The forming bar does not move HIGH or LOW. A minute with no trades does not move them either. Trail arm moves the stop to CTC once that profit is open. If TRAIL CTC is higher, reaching it locks TRAIL CTC minus Trail arm, so arm 4 and CTC 6 first put the stop at cost, then lock 2% profit. If TRAIL CTC is not above Trail arm, the stop stays at CTC. An opposite HIGH break
                 while short the CE covers and sells the ATM PE. A LOW break while short the PE covers and sells the ATM CE. Flips run until 14:30.
                 A failed sell waits 60 seconds. A target scores +1 only when the cover fill reached 10%, with one point of slack. Sold 772.32 covered
                 766.10 scores 0. A trail scores 0. A losing opposite break scores −0.5. Any other losing exit scores −1.
