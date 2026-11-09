@@ -3375,6 +3375,56 @@ body.sow-has-dashboard-bg {
   gap: 8px;
 }
 
+.n930-tape {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.n930-cell {
+  min-width: 0;
+  padding: 8px 10px 7px;
+  border-radius: 8px;
+  background: #101513;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.n930-kicker {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.n930-px {
+  margin-top: 1px;
+  font-size: 26px;
+  font-weight: 800;
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  color: #f3f6f4;
+}
+
+.n930-px--ce { color: #3ddc6a; }
+.n930-px--pe { color: #ff5c4d; }
+.n930-px--up { color: #3ddc6a; }
+.n930-px--down { color: #ff5c4d; }
+
+.n930-meta {
+  margin-top: 2px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+@media (max-width: 1180px) {
+  .n930-tape { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
 .nv-stat {
   min-width: 0;
   padding: 10px 12px 8px;

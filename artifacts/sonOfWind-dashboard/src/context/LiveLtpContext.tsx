@@ -54,6 +54,8 @@ const ltpPaintListeners = new Map<number, Set<(ltp: number) => void>>();
 const socketPrintAt = new Map<number, number>();
 /** Last Fyers socket print. A Fyers REST snapshot must not rewind it. */
 const fyersPrintAt = new Map<number, number>();
+/** Last Fyers websocket LTP only. REST, cache, and XTS never write this map. */
+const fyersWsLtp = new Map<number, number>();
 /** Tokens whose price is Fyers for this login. XTS must not paint them again. */
 const fyersOwnedIds = new Set<number>();
 const FYERS_OWNS_MS = 8000;
@@ -100,6 +102,13 @@ export function peekLiveTick(id: number): LiveTickPeek | null {
 export function peekLiveLtp(id: number): number | null {
   const row = peekLiveTick(id);
   return row && row.ltp > 0 ? row.ltp : null;
+}
+
+/** Fyers websocket last trade for this token. Blank when only REST or cache has a number. */
+export function peekFyersWsLtp(id: number): number | null {
+  if (!Number.isFinite(id) || id <= 0) return null;
+  const px = fyersWsLtp.get(id);
+  return px != null && px > 0 ? px : null;
 }
 
 /** Fires on every last-trade print — paint DOM without waiting for React. */
@@ -534,6 +543,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
     liveTickPeek.clear();
     socketPrintAt.clear();
     fyersPrintAt.clear();
+    fyersWsLtp.clear();
     fyersOwnedIds.clear();
     pendingRef.current.clear();
     cancelScheduledFlush(flushScheduledRef, flushRafRef);
@@ -712,6 +722,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           if (fyersRest && peekLiveLtp(id) !== ltpFastRaw) return;
           fyersOwnedIds.add(id);
           if (!fyersRest) {
+            fyersWsLtp.set(id, ltpFastRaw);
             fyersPrintAt.set(id, performance.now());
             socketPrintAt.set(id, performance.now());
           }

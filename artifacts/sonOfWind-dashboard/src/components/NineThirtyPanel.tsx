@@ -1,16 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { ChainExpiriesResponse, ChainResolved, ChainResolveResponse } from "@/types/market";
-import { peekLiveTick, useLiveLtp } from "@/context/LiveLtpContext";
-import { FastLtp } from "@/components/FastLtp";
+import { peekFyersWsLtp, peekLiveLtp, subscribeLiveLtp } from "@/context/LiveLtpContext";
 import { setHotFocus } from "@/lib/hotFocus";
-import { peekTouchPx } from "@/lib/liveQuote";
 import { fmtPnl, fmtPrice, fmtQty } from "@/lib/formatNumber";
 import { apiFetch } from "@/lib/backend";
 import { bumpPositionsRefresh, clearLocalPosition, setLocalShortPosition } from "@/lib/ixPortfolio";
+import { subscribeMdTouchline } from "@/lib/mdRegistry";
 import {
-  cdSellPricing,
+  ixOrderPricing,
   ixOrderRejectedMessage,
-  marketableLimitPrice,
   orderLooksFilled,
   orderTradedQty,
   xtsOrderFillPx,
@@ -18,482 +16,442 @@ import {
 } from "@/lib/xtsOrder";
 import { toast } from "@/hooks/use-toast";
 import type { IndexName } from "@/pages/Dashboard";
-import { lotSizeForIndex } from "@/lib/lot";
-import { shortMtm, type FlipSide } from "@/lib/niftyFlipRules";
-import { cdChainIsPick, istClock, type CdExpiryPick } from "@/lib/cdRangeRules";
-import { subscribeMdTouchline } from "@/lib/mdRegistry";
-import { seedChainSpotFromResolve } from "@/lib/seedChainSpot";
 import {
-  N930,
-  N930_NO_EXPIRY,
-  bookLots,
-  closeBlocksResell,
-  dayBookHit,
+  chargeBreakup,
+  clockMinutes,
+  dayLine,
   dayMtm,
-  liveMark,
-  loserHit,
-  loserPx,
-  maxStopHit,
-  maxStopPx,
-  parseLots,
-  pickNearestExpiry,
-  pickSellStrike,
-  sellQty,
-  trailArmPx,
-  trailCoverPx,
-  trailStep,
-  type BookLeg,
-  type CloseReason,
-  type MtmLeg,
-  type PremiumQuote,
+  defaultN930Params,
+  draftFromParams,
+  entryWindow,
+  eodDue,
+  expiryDayKey,
+  formatHm,
+  goodPremium,
+  istClock,
+  N930,
+  netPnl,
+  orderQty,
+  pairFillPlan,
+  parseN930Params,
+  pickCheapest,
+  pickNiftyWeek,
+  readN930Params,
+  slPrice,
+  tickActions,
+  warmupDue,
+  type IstClock,
+  type N930Action,
+  type N930Draft,
+  type N930ExpiryPick,
+  type N930Fill,
+  type N930LegSnap,
+  type N930Params,
+  type N930Side,
+  type WeekPick,
 } from "@/lib/nineThirtyRules";
 
-const SESSION_KEY = "sow_930_v1";
+const SESSION_KEY = "sow_930_v2";
 const GUARD_MS = 200;
+const CHAIN_MS = 5000;
+const ENTRY_BACKOFF_MS = 15_000;
+const EXIT_BACKOFF_MS = 2_000;
+const TRADE_STRIKES = 30;
+const OTHER_STRIKES = 12;
+const WINGS = 16;
 
 type LogKind = "entry" | "exit" | "error" | "info";
-type LogRow = { id: number; ts: number; text: string; kind: LogKind };
-type ExpiryState = "idle" | "loading" | "ready" | "none" | "error";
+type N930Log = { id: number; ts: number; text: string; kind: LogKind };
+type ClosedBy = "sl" | "leftover" | "square";
 
-type Leg = {
-  key: string;
-  index: IndexName;
-  side: FlipSide;
+type BookLeg = {
+  side: N930Side;
   strike: number;
-  qty: number;
-  fill: number;
   iid: number;
   segment: number;
-  expiry: string;
-  lotSize: number;
-  status: "open" | "closed";
-  mark: number | null;
-  closeReason: CloseReason | null;
-  trailArmed: boolean;
-  trailLow: number | null;
-  openedAt: number;
+  qty: number;
+  sold: number;
+  slPx: number;
+  slOn: boolean;
+  lockArmed: boolean;
+  lockPct: number;
+  open: boolean;
+  closedBy: ClosedBy | null;
+  coverPx: number | null;
 };
 
-type Store = {
+type NakedLeg = { side: N930Side; strike: number; iid: number; segment: number; qty: number };
+
+type Quote = { strike: number; iid: number; ltp: number };
+
+type SessionStore = {
   sessionDate: string;
-  lots: number;
-  legs: Leg[];
-  logs: LogRow[];
+  params: N930Params;
+  legs: BookLeg[];
+  fills: N930Fill[];
+  realized: number;
+  entered: boolean;
+  squared: boolean;
+  armed: boolean;
+  live: boolean;
+  logs: N930Log[];
   logId: number;
-  started: boolean;
-  dayBlocked: boolean;
-  retryCe: number;
-  retryPe: number;
 };
 
-const SIDES: FlipSide[] = ["CE", "PE"];
-
-function px2(value: number): number {
-  return Math.round((value + 1e-9) * 100) / 100;
-}
-
-function inr(value: number): string {
-  const rounded = Math.round(value * 100) / 100;
-  if (Math.abs(rounded - Math.round(rounded)) < 1e-6) return Math.round(rounded).toLocaleString("en-IN");
-  return rounded.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function chainIndex(chain: ChainResolved | null): IndexName | null {
-  const key = String(chain?.index || "").trim().toUpperCase();
-  if (key === "SENSEX" || key === "NIFTY" || key === "BANKNIFTY") return key;
-  return null;
-}
-
-function emptyStore(today: string): Store {
+function emptyStore(today: string, params = defaultN930Params()): SessionStore {
   return {
     sessionDate: today,
-    lots: N930.lotsDefault,
+    params,
     legs: [],
+    fills: [],
+    realized: 0,
+    entered: false,
+    squared: false,
+    armed: false,
+    live: false,
     logs: [],
     logId: 1,
-    started: false,
-    dayBlocked: false,
-    retryCe: 0,
-    retryPe: 0,
   };
 }
 
-function readLeg(raw: unknown): Leg | null {
-  if (!raw || typeof raw !== "object") return null;
-  const row = raw as Partial<Leg>;
-  const index = String(row.index || "").toUpperCase();
-  const side = row.side;
-  const strike = Number(row.strike);
-  const qty = Number(row.qty);
-  const fill = Number(row.fill);
-  const iid = Number(row.iid);
-  const segment = Number(row.segment);
-  const lotSize = Number(row.lotSize);
-  const openedAt = Number(row.openedAt);
-  if (index !== "SENSEX" && index !== "NIFTY" && index !== "BANKNIFTY") return null;
-  if (side !== "CE" && side !== "PE") return null;
-  if (!Number.isFinite(strike) || strike <= 0 || !Number.isSafeInteger(qty) || qty <= 0) return null;
-  if (!Number.isFinite(fill) || fill <= 0 || !Number.isFinite(iid) || iid <= 0) return null;
-  if (!Number.isFinite(segment) || segment <= 0 || !Number.isFinite(lotSize) || lotSize <= 0) return null;
-  const status = row.status === "closed" ? "closed" : "open";
-  const mark = Number(row.mark);
-  const closeReason =
-    row.closeReason === "DAY" ||
-    row.closeReason === "LOSS125" ||
-    row.closeReason === "STOP15" ||
-    row.closeReason === "TRAIL" ||
-    row.closeReason === "STOP"
-      ? row.closeReason
-      : null;
-  const trailLow = Number(row.trailLow);
-  return {
-    key: String(row.key || `${status}:${iid}:${openedAt || 0}`),
-    index,
-    side,
-    strike: Math.round(strike),
-    qty,
-    fill: px2(fill),
-    iid: Math.round(iid),
-    segment: Math.round(segment),
-    expiry: String(row.expiry || ""),
-    lotSize: Math.round(lotSize),
-    status,
-    mark: Number.isFinite(mark) && mark > 0 ? px2(mark) : null,
-    closeReason: status === "closed" ? closeReason : null,
-    trailArmed: row.trailArmed === true,
-    trailLow: Number.isFinite(trailLow) && trailLow > 0 ? px2(trailLow) : null,
-    openedAt: Number.isFinite(openedAt) ? openedAt : Date.now(),
-  };
-}
-
-function readLogs(raw: unknown): LogRow[] {
+function readLegs(raw: unknown): BookLeg[] {
   if (!Array.isArray(raw)) return [];
-  return raw
-    .filter(
-      (row): row is LogRow =>
-        !!row && typeof row === "object" && typeof (row as LogRow).id === "number" && typeof (row as LogRow).text === "string",
-    )
-    .slice(0, 80);
+  const out: BookLeg[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== "object") continue;
+    const leg = row as Partial<BookLeg>;
+    if (leg.side !== "CE" && leg.side !== "PE") continue;
+    const strike = Number(leg.strike);
+    const iid = Number(leg.iid);
+    const segment = Number(leg.segment);
+    const qty = Number(leg.qty);
+    const sold = Number(leg.sold);
+    const slPx = Number(leg.slPx);
+    if (!(strike > 0) || !(iid > 0) || !(segment > 0) || !(qty > 0) || !(sold > 0) || !(slPx > 0)) continue;
+    out.push({
+      side: leg.side,
+      strike,
+      iid,
+      segment,
+      qty,
+      sold,
+      slPx,
+      slOn: leg.slOn !== false && leg.open !== false,
+      lockArmed: leg.lockArmed === true,
+      lockPct: Number(leg.lockPct) > 0 ? Number(leg.lockPct) : 0,
+      open: leg.open !== false,
+      closedBy: leg.closedBy === "sl" || leg.closedBy === "leftover" || leg.closedBy === "square" ? leg.closedBy : null,
+      coverPx: Number(leg.coverPx) > 0 ? Number(leg.coverPx) : null,
+    });
+  }
+  return out.slice(0, 2);
 }
 
-function loadStore(): Store {
+function readFills(raw: unknown): N930Fill[] {
+  if (!Array.isArray(raw)) return [];
+  const out: N930Fill[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== "object") continue;
+    const fill = row as Partial<N930Fill>;
+    if (fill.side !== "BUY" && fill.side !== "SELL") continue;
+    const premium = Number(fill.premium);
+    const qty = Number(fill.qty);
+    if (!(premium > 0) || !(qty > 0)) continue;
+    out.push({ side: fill.side, premium, qty });
+  }
+  return out.slice(0, 8);
+}
+
+function loadStore(): SessionStore {
   const today = istClock().date;
-  const empty = emptyStore(today);
   try {
-    const parsed = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null") as Partial<Store> | null;
-    if (!parsed || typeof parsed !== "object") return empty;
-    const lots = parseLots(String(parsed.lots ?? "")) ?? N930.lotsDefault;
-    const legs = Array.isArray(parsed.legs) ? parsed.legs.map(readLeg).filter((leg): leg is Leg => leg != null) : [];
-    if (parsed.sessionDate !== today) {
-      return { ...empty, lots, legs: legs.filter((leg) => leg.status === "open") };
-    }
-    const logs = readLogs(parsed.logs);
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return emptyStore(today);
+    const parsed = JSON.parse(raw) as Partial<SessionStore>;
+    const params = readN930Params(parsed.params);
+    if (parsed.sessionDate !== today) return emptyStore(today, params);
+    const logs = Array.isArray(parsed.logs)
+      ? parsed.logs.filter(
+          (row): row is N930Log =>
+            !!row && typeof row === "object" && typeof row.id === "number" && typeof row.text === "string",
+        )
+      : [];
     return {
       sessionDate: today,
-      lots,
-      legs,
-      logs,
+      params,
+      legs: readLegs(parsed.legs),
+      fills: readFills(parsed.fills),
+      realized: Number(parsed.realized) || 0,
+      entered: parsed.entered === true,
+      squared: parsed.squared === true,
+      armed: parsed.armed === true,
+      live: parsed.live === true,
+      logs: logs.slice(0, 80),
       logId: logs.reduce((max, row) => Math.max(max, row.id), 0) + 1,
-      started: parsed.started === true,
-      dayBlocked: parsed.dayBlocked === true,
-      retryCe: Number(parsed.retryCe) > 0 ? Number(parsed.retryCe) : 0,
-      retryPe: Number(parsed.retryPe) > 0 ? Number(parsed.retryPe) : 0,
     };
   } catch {
-    return empty;
+    return emptyStore(today);
   }
 }
 
-function quotePx(iid: number): number | null {
-  const px = peekTouchPx(iid);
-  if (px == null || !Number.isFinite(px) || !(px > 0)) return null;
-  return px;
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <label className="cd-field">
+      <span className="cd-field__label">{label}</span>
+      {children}
+    </label>
+  );
 }
 
-function chainQuotes(chain: ChainResolved, side: FlipSide): PremiumQuote[] {
-  const out: PremiumQuote[] = [];
+function FyersPx({ iid }: { iid: number }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useLayoutEffect(() => {
+    const paint = () => {
+      const node = ref.current;
+      if (!node) return;
+      const px = goodPremium(peekFyersWsLtp(iid));
+      node.textContent = px == null ? "—" : px.toFixed(2);
+    };
+    paint();
+    return subscribeLiveLtp(iid, paint);
+  }, [iid]);
+  return <span ref={ref} className="tabular-nums" />;
+}
+
+function chainMatches(chain: ChainResolved, pick: N930ExpiryPick): boolean {
+  if (String(chain.expiryApi || "") === pick.api) return true;
+  const want = expiryDayKey(pick.label);
+  const ui = expiryDayKey(String(chain.expiryUi || ""));
+  const api = expiryDayKey(String(chain.expiryApi || ""));
+  return want != null && (ui === want || api === want);
+}
+
+function livePremium(iid: number): number | null {
+  return goodPremium(peekFyersWsLtp(iid)) ?? goodPremium(peekLiveLtp(iid));
+}
+
+function quotesFor(chain: ChainResolved, side: N930Side): Quote[] {
+  const out: Quote[] = [];
   for (const [key, row] of Object.entries(chain.instrumentMap || {})) {
     const strike = Number(key);
+    if (!Number.isFinite(strike) || strike <= 0 || strike % N930.strikeStep !== 0) continue;
     const iid = side === "CE" ? row?.ce : row?.pe;
-    if (!Number.isFinite(strike) || strike <= 0 || typeof iid !== "number" || !(iid > 0)) continue;
-    const premium = quotePx(iid);
-    if (premium == null) continue;
-    out.push({ strike, premium, iid });
+    if (typeof iid !== "number" || !(iid > 0)) continue;
+    const ltp = livePremium(iid);
+    if (ltp == null) continue;
+    out.push({ strike, iid, ltp });
   }
   return out;
 }
 
-function legTitle(leg: Leg): string {
-  const expiry = leg.expiry ? ` ${leg.expiry}` : "";
-  return `${leg.index}${expiry} ${Math.round(leg.strike).toLocaleString("en-IN")} ${leg.side}`;
-}
-
-function rememberShort(leg: Leg) {
-  setLocalShortPosition({
-    exchangeInstrumentID: leg.iid,
-    exchangeSegment: leg.segment,
-    qty: leg.qty,
-    fillPx: leg.fill,
-    tradingSymbol: legTitle(leg),
-    productType: "NRML",
-  });
-}
-
-function bookView(legs: Leg[]): { mtm: number; lots: number } | null {
-  const mtmLegs: MtmLeg[] = [];
-  const bookLegs: BookLeg[] = [];
-  for (const leg of legs) {
-    const open = leg.status === "open";
-    const mark = open ? liveMark(leg.fill, quotePx(leg.iid)) : leg.mark;
-    if (mark == null) return null;
-    mtmLegs.push({ sold: leg.fill, mark, qty: leg.qty, open });
-    bookLegs.push({ side: leg.side, qty: leg.qty, lotSize: leg.lotSize, open, openedAt: leg.openedAt });
-  }
-  const mtm = dayMtm(mtmLegs);
-  if (mtm == null) return null;
-  return { mtm, lots: bookLots(bookLegs) };
-}
-
-function loss125(legs: Leg[], side: FlipSide): boolean {
-  return legs.some((leg) => leg.side === side && leg.status === "closed" && leg.closeReason === "LOSS125");
-}
-
-function sideBlocked(legs: Leg[], side: FlipSide): boolean {
-  return legs.some((leg) => leg.side === side && leg.status === "closed" && closeBlocksResell(leg.closeReason));
-}
-
-function openLeg(legs: Leg[], side: FlipSide): Leg | null {
-  return legs.find((leg) => leg.side === side && leg.status === "open") ?? null;
-}
-
-function reasonLabel(reason: CloseReason): string {
-  if (reason === "DAY") return "DAY BOOK";
-  if (reason === "LOSS125") return "125%";
-  if (reason === "STOP15") return "15% STOP";
-  if (reason === "TRAIL") return "TRAIL";
-  return "STOP";
-}
-
-/** NRML limit that trades like a market order. EOS stays on the order. */
-function n930Pricing(side: "BUY" | "SELL", ltp: number | null, bid?: number | null, ask?: number | null) {
-  if (side === "SELL") return { ...cdSellPricing(ltp, bid), timeInForce: "EOS" as const };
-  const live = typeof ltp === "number" && Number.isFinite(ltp) && ltp > 0 ? ltp : 0;
-  const askN = typeof ask === "number" && Number.isFinite(ask) && ask > 0 ? ask : 0;
-  const ref = askN > 0 && live > 0 ? Math.max(askN, live) : askN || live;
+function snapOf(leg: BookLeg): N930LegSnap {
   return {
-    orderType: "LIMIT" as const,
-    timeInForce: "EOS" as const,
-    limitPrice: ref > 0 ? marketableLimitPrice("BUY", ref) : 0,
-    ...(ref > 0 ? { ltp: ref } : {}),
+    side: leg.side,
+    open: leg.open,
+    sold: leg.sold,
+    qty: leg.qty,
+    ltp: leg.open ? goodPremium(peekFyersWsLtp(leg.iid)) : null,
+    slPx: leg.slPx,
+    slOn: leg.open && leg.slOn,
+    lockArmed: leg.lockArmed,
+    lockPct: leg.lockPct,
+    closedBy: leg.closedBy,
   };
 }
 
-export default function NineThirtyPanel({ index, active }: { index: IndexName; active: boolean }) {
-  const boot = useMemo(() => loadStore(), []);
-  const [lotsText, setLotsText] = useState(String(boot.lots));
-  const [legs, setLegs] = useState<Leg[]>(boot.legs);
-  const [logs, setLogs] = useState<LogRow[]>(boot.logs);
-  const [started, setStarted] = useState(boot.started);
-  const [dayBlocked, setDayBlocked] = useState(boot.dayBlocked);
-  const [retryCe, setRetryCe] = useState(boot.retryCe);
-  const [retryPe, setRetryPe] = useState(boot.retryPe);
-  const [chain, setChain] = useState<ChainResolved | null>(null);
-  const [pick, setPick] = useState<CdExpiryPick | null>(null);
-  const [expiryState, setExpiryState] = useState<ExpiryState>("idle");
-  const [busy, setBusy] = useState(false);
-  const [nowMs, setNowMs] = useState(() => Date.now());
+function withSavedSl(legs: BookLeg[], params: N930Params): BookLeg[] {
+  const open = legs.filter((leg) => leg.open);
+  if (open.length < 2) return legs;
+  return legs.map((leg) => (leg.open ? { ...leg, slPx: slPrice(leg.sold, params.slPct), slOn: true } : leg));
+}
 
-  const ltps = useLiveLtp();
-  const activeRef = useRef(active);
-  const indexRef = useRef(index);
+export default function NineThirtyPanel({ index, active }: { index: IndexName; active: boolean }) {
+  const boot = useRef<SessionStore | null>(null);
+  if (!boot.current) boot.current = loadStore();
+  const initial = boot.current;
+
+  const [params, setParams] = useState<N930Params>(initial.params);
+  const [draft, setDraft] = useState<N930Draft>(() => draftFromParams(initial.params));
+  const [legs, setLegs] = useState<BookLeg[]>(initial.legs);
+  const [fills, setFills] = useState<N930Fill[]>(initial.fills);
+  const [realized, setRealized] = useState(initial.realized);
+  const [entered, setEntered] = useState(initial.entered);
+  const [squared, setSquared] = useState(initial.squared);
+  const [armed, setArmed] = useState(initial.armed);
+  const [live, setLive] = useState(initial.live);
+  const [logs, setLogs] = useState<N930Log[]>(initial.logs);
+  const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState<{ date: string; pick: WeekPick; trade: ChainResolved; other: ChainResolved | null } | null>(null);
+  const [chainNote, setChainNote] = useState("");
+  const [markTick, setMarkTick] = useState(0);
+  const [focusMinute, setFocusMinute] = useState(() => clockMinutes(istClock()));
+
+  const paramsRef = useRef(params);
   const legsRef = useRef(legs);
-  const startedRef = useRef(started);
-  const dayBlockedRef = useRef(dayBlocked);
-  const retryRef = useRef({ CE: boot.retryCe, PE: boot.retryPe });
-  const chainRef = useRef<ChainResolved | null>(null);
-  const pickRef = useRef<CdExpiryPick | null>(null);
-  const expiryStateRef = useRef<ExpiryState>("idle");
-  const lotsTextRef = useRef(lotsText);
+  const fillsRef = useRef(fills);
+  const realizedRef = useRef(realized);
+  const enteredRef = useRef(entered);
+  const squaredRef = useRef(squared);
+  const armedRef = useRef(armed);
+  const liveRef = useRef(live);
+  const loadedRef = useRef(loaded);
+  const indexRef = useRef(index);
+  const activeRef = useRef(active);
   const busyRef = useRef(false);
   const tickingRef = useRef(false);
-  const logIdRef = useRef(boot.logId);
-  const sessionDateRef = useRef(boot.sessionDate);
-  const notedRef = useRef<Record<string, string>>({});
-  const restoredRef = useRef(false);
-  const runRef = useRef<() => Promise<void>>(async () => {});
-
-  activeRef.current = active;
-  indexRef.current = index;
+  const nakedRef = useRef<NakedLeg[]>([]);
+  const backoffRef = useRef(0);
+  const notedRef = useRef(new Map<string, string>());
+  const logIdRef = useRef(initial.logId);
+  const sessionDateRef = useRef(initial.sessionDate);
+  const shownRef = useRef(0);
+  paramsRef.current = params;
   legsRef.current = legs;
-  startedRef.current = started;
-  dayBlockedRef.current = dayBlocked;
-  retryRef.current = { CE: retryCe, PE: retryPe };
-  chainRef.current = chain;
-  pickRef.current = pick;
-  expiryStateRef.current = expiryState;
-  lotsTextRef.current = lotsText;
-
-  const istDate = istClock(new Date(nowMs)).date;
-  const lotSize = lotSizeForIndex(index);
-  const lotsNow = parseLots(lotsText);
-  const qtyNow = lotsNow == null ? null : sellQty(lotSize, lotsNow);
+  fillsRef.current = fills;
+  realizedRef.current = realized;
+  enteredRef.current = entered;
+  squaredRef.current = squared;
+  armedRef.current = armed;
+  liveRef.current = live;
+  loadedRef.current = loaded;
+  indexRef.current = index;
+  activeRef.current = active;
 
   const pushLog = useCallback((text: string, kind: LogKind) => {
-    const id = logIdRef.current++;
-    setLogs((prev) => [{ id, ts: Date.now(), text, kind }, ...prev].slice(0, 80));
+    const row: N930Log = { id: logIdRef.current++, ts: Date.now(), text, kind };
+    setLogs((prev) => [row, ...prev].slice(0, 80));
   }, []);
 
-  const noteOnce = useCallback(
+  const note = useCallback(
     (key: string, text: string, kind: LogKind) => {
-      if (notedRef.current[key] === text) return;
-      notedRef.current[key] = text;
+      if (notedRef.current.get(key) === text) return;
+      notedRef.current.set(key, text);
       pushLog(text, kind);
     },
     [pushLog],
   );
 
-  const commitLegs = useCallback((next: Leg[]) => {
+  const commitLegs = useCallback((next: BookLeg[]) => {
     legsRef.current = next;
     setLegs(next);
   }, []);
 
-  const markRetry = useCallback((side: FlipSide, at: number) => {
-    retryRef.current = { ...retryRef.current, [side]: at };
-    if (side === "CE") setRetryCe(at);
-    else setRetryPe(at);
-  }, []);
-
   useEffect(() => {
-    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    if (restoredRef.current) return;
-    restoredRef.current = true;
-    for (const leg of legsRef.current) {
-      if (leg.status === "open") rememberShort(leg);
-    }
-  }, []);
-
-  useEffect(() => {
-    const store: Store = {
+    const store: SessionStore = {
       sessionDate: sessionDateRef.current,
-      lots: parseLots(lotsText) ?? N930.lotsDefault,
+      params,
       legs,
+      fills,
+      realized,
+      entered,
+      squared,
+      armed,
+      live,
       logs,
       logId: logIdRef.current,
-      started,
-      dayBlocked,
-      retryCe,
-      retryPe,
     };
     try {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify(store));
     } catch {
       /* ignore quota */
     }
-  }, [lotsText, legs, logs, started, dayBlocked, retryCe, retryPe]);
+  }, [params, legs, fills, realized, entered, squared, armed, live, logs]);
 
   useEffect(() => {
-    if (!active && !startedRef.current && !legsRef.current.some((leg) => leg.status === "open")) return;
+    if (index !== "NIFTY") return;
     let cancelled = false;
-    const want = index;
-    const logOnce = (text: string, kind: LogKind) => {
-      if (notedRef.current.expiry === text) return;
-      notedRef.current.expiry = text;
-      pushLog(text, kind);
-    };
-    const run = async () => {
-      if (!chainRef.current) setExpiryState((prev) => (prev === "ready" ? prev : "loading"));
-      let raw: ChainExpiriesResponse;
+    const load = async () => {
+      const clock = istClock();
+      const rules = paramsRef.current;
+      const mins = clockMinutes(clock);
+      const open = legsRef.current.some((leg) => leg.open) || nakedRef.current.length > 0;
+      const watching = activeRef.current || warmupDue(mins, rules) || open || enteredRef.current;
+      if (!watching) return;
+      const have = loadedRef.current;
+      if (have && have.date === clock.date) return;
       try {
-        raw = (await apiFetch("/api/chain/expiries", {
+        const exp = (await apiFetch("/api/chain/expiries", {
           method: "POST",
-          body: JSON.stringify({ index: want }),
+          body: JSON.stringify({ index: "NIFTY" }),
         })) as ChainExpiriesResponse;
+        if (cancelled || indexRef.current !== "NIFTY") return;
+        if (!exp.ok || !exp.expiries?.length) {
+          setChainNote(exp.ok === false ? exp.error || "Expiry list failed." : "Expiry list failed.");
+          return;
+        }
+        const pick = pickNiftyWeek(exp.expiries, clock);
+        if (!pick) {
+          setChainNote("No weekly expiry from today. No strikes.");
+          return;
+        }
+        const resolveOne = async (row: N930ExpiryPick, wings: number) =>
+          (await apiFetch("/api/chain/resolve", {
+            method: "POST",
+            body: JSON.stringify({ index: "NIFTY", expiry: row.api, wings, skipNotify: true }),
+          })) as ChainResolveResponse;
+        const tradeRaw = await resolveOne(pick.trade, WINGS);
+        if (cancelled || indexRef.current !== "NIFTY") return;
+        if (!tradeRaw.ok) {
+          setChainNote(tradeRaw.error || "Weekly chain failed. No strikes yet.");
+          return;
+        }
+        const otherPick = pick.trade.api === pick.thisWeek.api ? pick.nextWeek : pick.thisWeek;
+        const first = { date: clock.date, pick, trade: tradeRaw, other: null as ChainResolved | null };
+        loadedRef.current = first;
+        setLoaded(first);
+        setChainNote("");
+        notedRef.current.delete("chain");
+        if (otherPick.api === pick.trade.api) return;
+        const otherRaw = await resolveOne(otherPick, 8);
+        if (cancelled || indexRef.current !== "NIFTY" || !otherRaw.ok) return;
+        const both = { date: clock.date, pick, trade: tradeRaw, other: otherRaw };
+        loadedRef.current = both;
+        setLoaded(both);
       } catch (err: unknown) {
-        if (cancelled || indexRef.current !== want) return;
-        setPick(null);
-        setChain(null);
-        setExpiryState("error");
-        logOnce(err instanceof Error ? err.message : "Expiry list failed. No entry.", "error");
-        return;
+        if (!cancelled) setChainNote(err instanceof Error ? err.message : String(err));
       }
-      if (cancelled || indexRef.current !== want) return;
-      if (!raw.ok) {
-        setPick(null);
-        setChain(null);
-        setExpiryState("error");
-        logOnce(raw.error || "Expiry list failed. No entry.", "error");
-        return;
-      }
-      const nextPick = pickNearestExpiry(raw.expiries ?? []);
-      if (!nextPick) {
-        setPick(null);
-        setChain(null);
-        setExpiryState("none");
-        logOnce(N930_NO_EXPIRY, "info");
-        return;
-      }
-      setPick(nextPick);
-      const held = chainRef.current;
-      if (held && chainIndex(held) === want && cdChainIsPick(String(held.expiryApi || ""), String(held.expiryUi || ""), nextPick)) {
-        setExpiryState("ready");
-        if (notedRef.current.expiry === N930_NO_EXPIRY) notedRef.current.expiry = "";
-        return;
-      }
-      setExpiryState("loading");
-      let resolved: ChainResolveResponse;
-      try {
-        resolved = (await apiFetch("/api/chain/resolve", {
-          method: "POST",
-          body: JSON.stringify({ index: want, expiry: nextPick.api, wings: N930.wings, skipNotify: true }),
-        })) as ChainResolveResponse;
-      } catch (err: unknown) {
-        if (cancelled || indexRef.current !== want) return;
-        setChain(null);
-        setExpiryState("error");
-        logOnce(err instanceof Error ? err.message : "Nearest expiry chain failed. No entry.", "error");
-        return;
-      }
-      if (cancelled || indexRef.current !== want) return;
-      if (!resolved.ok || chainIndex(resolved) !== want || !cdChainIsPick(String(resolved.expiryApi || ""), String(resolved.expiryUi || ""), nextPick)) {
-        setChain(null);
-        setExpiryState("error");
-        logOnce(!resolved.ok ? resolved.error || "Nearest expiry chain failed. No entry." : "Nearest expiry chain failed. No entry.", "error");
-        return;
-      }
-      setChain(resolved);
-      seedChainSpotFromResolve(resolved);
-      setExpiryState("ready");
-      notedRef.current.expiry = "";
-      pushLog(`Nearest expiry ${nextPick.label}.`, "info");
     };
-    void run();
+    void load();
+    const id = window.setInterval(() => void load(), CHAIN_MS);
     return () => {
       cancelled = true;
+      window.clearInterval(id);
     };
-  }, [index, active, istDate, pushLog]);
+  }, [index, active]);
 
   useEffect(() => {
     const instruments: { exchangeSegment: number; exchangeInstrumentID: number }[] = [];
     const seen = new Set<number>();
-    const add = (segment: number, iid: number | undefined) => {
-      if (!(segment > 0) || typeof iid !== "number" || !(iid > 0) || seen.has(iid)) return;
+    const add = (segment: number, iid: number) => {
+      if (!(segment > 0) || !(iid > 0) || seen.has(iid)) return;
       seen.add(iid);
       instruments.push({ exchangeSegment: segment, exchangeInstrumentID: iid });
     };
-    const watching = active || started || legs.some((leg) => leg.status === "open");
-    if (watching && chain && chain.optionSegment > 0 && chainIndex(chain) === index) {
-      for (const row of Object.values(chain.instrumentMap || {})) {
-        add(chain.optionSegment, row?.ce);
-        add(chain.optionSegment, row?.pe);
+    const addChain = (chain: ChainResolved, count: number) => {
+      const strikes = Object.keys(chain.instrumentMap || {})
+        .map(Number)
+        .filter((strike) => strike > 0 && strike % N930.strikeStep === 0)
+        .sort((a, b) => Math.abs(a - chain.atmStrike) - Math.abs(b - chain.atmStrike));
+      for (const strike of strikes.slice(0, count)) {
+        const row = chain.instrumentMap[String(strike)];
+        if (!row) continue;
+        add(chain.optionSegment, row.ce);
+        add(chain.optionSegment, row.pe);
       }
+    };
+    const book = loaded;
+    const keepChains =
+      active ||
+      warmupDue(focusMinute, params) ||
+      entryWindow(focusMinute, params) ||
+      legs.some((leg) => leg.open) ||
+      nakedRef.current.length > 0;
+    if (index === "NIFTY" && book && keepChains) {
+      addChain(book.trade, TRADE_STRIKES);
+      if (book.other) addChain(book.other, OTHER_STRIKES);
     }
-    for (const leg of legs) {
-      if (leg.status === "open") add(leg.segment, leg.iid);
-    }
+    for (const leg of legs) add(leg.segment, leg.iid);
+    for (const naked of nakedRef.current) add(naked.segment, naked.iid);
     let cancelled = false;
     if (instruments.length) void subscribeMdTouchline(instruments, () => cancelled);
     setHotFocus("930", instruments);
@@ -501,7 +459,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       cancelled = true;
       setHotFocus("930", []);
     };
-  }, [active, started, chain, legs, index]);
+  }, [index, active, loaded, legs, params, focusMinute]);
 
   const sendOrder = useCallback(
     async (
@@ -509,390 +467,535 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       instrumentId: number,
       orderQuantity: number,
       segment: number,
-    ): Promise<{ ok: true; filledQty: number; fillPx: number } | { ok: false; error: string }> => {
-      const tick = peekLiveTick(instrumentId);
-      const ltp = peekTouchPx(instrumentId);
-      const priced = n930Pricing(orderSide, ltp, tick?.bid, tick?.ask);
-      if (!(priced.limitPrice > 0)) return { ok: false, error: "No live premium. Order not sent." };
+    ): Promise<{ filledQty: number; fillPx: number | null; error: string | null }> => {
+      const ltp = goodPremium(peekFyersWsLtp(instrumentId));
+      if (ltp == null) return { filledQty: 0, fillPx: null, error: "No Fyers print. Order not sent." };
+      if (orderSide === "SELL" && ltp < paramsRef.current.minPremium) {
+        return { filledQty: 0, fillPx: null, error: "Quote under min. Order not sent." };
+      }
       let response: { ok?: boolean; error?: string; raw?: unknown } | null = null;
       try {
         response = (await apiFetch("/api/ix/place_order", {
           method: "POST",
           body: JSON.stringify({
             ...XTS_IX_ORDER_BASE,
-            ...priced,
+            ...ixOrderPricing(orderSide, ltp),
             exchangeSegment: segment,
             exchangeInstrumentID: instrumentId,
             orderSide,
             orderQuantity,
-            productType: "NRML",
             bookOnlyIfFilled: true,
           }),
         })) as { ok?: boolean; error?: string; raw?: unknown };
       } catch (err: unknown) {
         bumpPositionsRefresh();
-        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+        return { filledQty: 0, fillPx: null, error: err instanceof Error ? err.message : String(err) };
       }
       bumpPositionsRefresh();
       const raw = response?.raw ?? response;
-      const filledQty = orderTradedQty(raw, orderQuantity);
-      if (!orderLooksFilled(raw) || filledQty <= 0) {
-        const rejected = ixOrderRejectedMessage(raw) || ixOrderRejectedMessage(response);
-        return { ok: false, error: rejected || "Order not filled" };
+      const filledQty = orderLooksFilled(raw) ? orderTradedQty(raw, orderQuantity) : 0;
+      const fillPx = filledQty > 0 ? xtsOrderFillPx(raw) : null;
+      if (!(filledQty > 0) || fillPx == null) {
+        const rejected = ixOrderRejectedMessage(raw) || ixOrderRejectedMessage(response) || response?.error;
+        return {
+          filledQty,
+          fillPx: null,
+          error: rejected || (filledQty > 0 ? "No average traded price. Not booked." : "Order not filled"),
+        };
       }
-      const fillPx = xtsOrderFillPx(raw);
-      if (fillPx == null) return { ok: false, error: "Order traded, but XTS sent no average traded price." };
-      return { ok: true, filledQty, fillPx };
+      return { filledQty, fillPx, error: null };
     },
     [],
   );
 
-  const coverLeg = useCallback(
-    async (leg: Leg, reason: CloseReason): Promise<"flat" | "open" | "failed"> => {
-      if (busyRef.current) return "failed";
-      const open = legsRef.current.find((row) => row.key === leg.key && row.status === "open");
-      if (!open) return "flat";
-      busyRef.current = true;
-      setBusy(true);
-      try {
-        const sent = await sendOrder("BUY", open.iid, open.qty, open.segment);
-        if (!sent.ok) {
-          pushLog(`${reasonLabel(reason)} cover failed. ${open.side} still open. ${sent.error}`, "error");
-          return "failed";
+  const remember = useCallback((leg: BookLeg, expiry: string) => {
+    setLocalShortPosition({
+      exchangeInstrumentID: leg.iid,
+      exchangeSegment: leg.segment,
+      qty: leg.qty,
+      fillPx: leg.sold,
+      tradingSymbol: `NIFTY ${Math.round(leg.strike)} ${leg.side} ${expiry}`.trim(),
+    });
+  }, []);
+
+  const coverLegs = useCallback(
+    async (targets: BookLeg[], reason: string, kind: ClosedBy) => {
+      const results = await Promise.all(
+        targets.map(async (leg) => ({ leg, sent: await sendOrder("BUY", leg.iid, leg.qty, leg.segment) })),
+      );
+      let next = legsRef.current.slice();
+      let realizedNow = realizedRef.current;
+      const fillRows = fillsRef.current.slice();
+      let failed = false;
+      for (const { leg, sent } of results) {
+        if (!(sent.filledQty > 0) || sent.fillPx == null) {
+          failed = true;
+          note(`cover-${leg.iid}`, `${reason} ${leg.side} ${leg.strike} not covered. ${sent.error || "No fill."}`, "error");
+          continue;
         }
-        const closedQty = Math.min(sent.filledQty, open.qty);
-        const latest = legsRef.current.find((row) => row.key === open.key) ?? open;
-        if (closedQty < latest.qty) {
-          const left: Leg = { ...latest, qty: latest.qty - closedQty };
-          commitLegs(legsRef.current.map((row) => (row.key === left.key ? left : row)));
-          rememberShort(left);
-          pushLog(
-            `${reasonLabel(reason)}: BUY ${legTitle(open)} × ${fmtQty(closedQty)} of ${fmtQty(open.qty)} @ ${fmtPrice(sent.fillPx)}. Left ${fmtQty(left.qty)}.`,
-            "exit",
-          );
-          return "open";
+        const qty = Math.min(sent.filledQty, leg.qty);
+        const booked = (leg.sold - sent.fillPx) * qty;
+        const left = leg.qty - qty;
+        realizedNow += booked;
+        fillRows.push({ side: "BUY", premium: sent.fillPx, qty });
+        if (left <= 0) clearLocalPosition(leg.iid, booked);
+        else {
+          setLocalShortPosition({
+            exchangeInstrumentID: leg.iid,
+            exchangeSegment: leg.segment,
+            qty: left,
+            fillPx: leg.sold,
+            tradingSymbol: `NIFTY ${Math.round(leg.strike)} ${leg.side}`,
+          });
         }
-        const booked = shortMtm(latest.fill, sent.fillPx, closedQty);
-        const closed: Leg = {
-          ...latest,
-          qty: closedQty,
-          status: "closed",
-          mark: px2(sent.fillPx),
-          closeReason: reason,
-        };
-        commitLegs(legsRef.current.map((row) => (row.key === closed.key ? closed : row)));
-        clearLocalPosition(open.iid, booked);
+        next = next.map((row) =>
+          row.iid === leg.iid
+            ? {
+                ...row,
+                open: left > 0,
+                qty: left > 0 ? left : row.qty,
+                slOn: left > 0,
+                closedBy: left > 0 ? row.closedBy : kind,
+                coverPx: sent.fillPx,
+              }
+            : row,
+        );
         pushLog(
-          `${reasonLabel(reason)}: BUY ${legTitle(open)} × ${fmtQty(closedQty)} @ ${fmtPrice(sent.fillPx)} · sold ${fmtPrice(latest.fill)} · MTM ${fmtPnl(booked)}`,
+          `${reason}: BUY ${leg.strike} ${leg.side} × ${fmtQty(qty)} @ ${fmtPrice(sent.fillPx)} · sold ${fmtPrice(leg.sold)}`,
           "exit",
         );
-        toast({
-          title: `9:30 ${reasonLabel(reason)}`,
-          description: `${legTitle(open)} @ ${fmtPrice(sent.fillPx)}`,
-          variant: reason === "LOSS125" || reason === "STOP15" || reason === "STOP" ? "destructive" : "default",
-        });
-        return "flat";
-      } finally {
-        busyRef.current = false;
-        setBusy(false);
       }
+      realizedRef.current = realizedNow;
+      setRealized(realizedNow);
+      fillsRef.current = fillRows;
+      setFills(fillRows);
+      commitLegs(next);
+      if (!next.some((leg) => leg.open)) {
+        squaredRef.current = true;
+        setSquared(true);
+        enteredRef.current = true;
+        setEntered(true);
+      }
+      if (failed) backoffRef.current = Date.now() + EXIT_BACKOFF_MS;
+      return !failed;
     },
-    [commitLegs, pushLog, sendOrder],
+    [commitLegs, note, pushLog, sendOrder],
   );
 
-  const sellSide = useCallback(
-    async (side: FlipSide): Promise<void> => {
-      if (busyRef.current || !startedRef.current || dayBlockedRef.current) return;
-      if (Date.now() < retryRef.current[side]) return;
-      const book = legsRef.current;
-      if (openLeg(book, side)) return;
-      if (sideBlocked(book, side)) {
-        noteOnce(`block:${side}`, `${side} is booked today. Not sold again.`, "info");
-        return;
-      }
-      if (book.some((leg) => leg.status === "open" && leg.index !== indexRef.current)) {
-        noteOnce("index", "Top bar index changed. No new entry while a leg is open.", "info");
-        return;
-      }
-      const lots = parseLots(lotsTextRef.current);
-      const qty = lots == null ? null : sellQty(lotSizeForIndex(indexRef.current), lots);
-      if (lots == null || qty == null) {
-        noteOnce("lots", "Lots must be a whole number from 1 to 50.", "error");
-        return;
-      }
-      notedRef.current.lots = "";
-      const chosen = pickRef.current;
-      if (!chosen) {
-        if (expiryStateRef.current === "none") noteOnce("expiry", N930_NO_EXPIRY, "info");
-        return;
-      }
-      const current = chainRef.current;
-      if (!current || chainIndex(current) !== indexRef.current || !cdChainIsPick(String(current.expiryApi || ""), String(current.expiryUi || ""), chosen)) {
-        return;
-      }
-      const quotes = chainQuotes(current, side);
-      if (!quotes.length) return;
-      const choice = pickSellStrike(quotes);
-      if (!choice) {
-        noteOnce(`hunt:${side}`, `${side} has no premium at or above 100.`, "info");
-        return;
-      }
-      notedRef.current[`hunt:${side}`] = "";
-      const segment = current.optionSegment;
-      if (!(segment > 0)) {
-        noteOnce("segment", "Missing option segment. Order not sent.", "error");
-        return;
-      }
-      busyRef.current = true;
-      setBusy(true);
-      try {
-        const sent = await sendOrder("SELL", choice.iid, qty, segment);
-        if (!sent.ok) {
-          markRetry(side, Date.now() + N930.sellRetryMs);
-          pushLog(`${side} sell failed. Next try in 3s. ${sent.error}`, "error");
-          return;
-        }
-        const leg: Leg = {
-          key: `open:${choice.iid}:${Date.now()}`,
-          index: indexRef.current,
-          side,
-          strike: Math.round(choice.strike),
-          qty: sent.filledQty,
-          fill: px2(sent.fillPx),
-          iid: choice.iid,
-          segment,
-          expiry: current.expiryUi || chosen.label,
-          lotSize: lotSizeForIndex(indexRef.current),
-          status: "open",
-          mark: null,
-          closeReason: null,
-          trailArmed: false,
-          trailLow: null,
-          openedAt: Date.now(),
-        };
-        commitLegs([leg, ...legsRef.current.filter((row) => row.key !== leg.key)]);
-        rememberShort(leg);
-        const strikeText = Math.round(choice.strike).toLocaleString("en-IN");
-        pushLog(
-          `SELL ${side} ${strikeText} × ${fmtQty(sent.filledQty)} of ${fmtQty(qty)} @ ${fmtPrice(sent.fillPx)} · ${chosen.label}`,
-          "entry",
-        );
-        toast({
-          title: `9:30 SELL ${side}`,
-          description: `${strikeText} @ ${fmtPrice(sent.fillPx)} · ${fmtQty(sent.filledQty)}`,
-        });
-      } finally {
-        busyRef.current = false;
-        setBusy(false);
-      }
-    },
-    [commitLegs, markRetry, noteOnce, pushLog, sendOrder],
-  );
-
-  const maybeDayBook = useCallback(async (): Promise<boolean> => {
-    if (dayBlockedRef.current) return false;
-    const view = bookView(legsRef.current);
-    if (!view) return false;
-    const hit = dayBookHit(view.mtm, view.lots);
-    if (!hit) return false;
-    dayBlockedRef.current = true;
-    setDayBlocked(true);
-    startedRef.current = false;
-    setStarted(false);
-    const line = (hit === "win" ? N930.dayWinPerLot : N930.dayLossPerLot) * view.lots;
-    pushLog(
-      `Day book ${hit === "win" ? "+" : "−"}${inr(line)}. Covering open legs. No new entry today.`,
-      "info",
-    );
-    const opens = legsRef.current.filter((leg) => leg.status === "open");
-    for (const leg of opens) await coverLeg(leg, "DAY");
-    return true;
-  }, [coverLeg, pushLog]);
-
-  const maybeSingleLeg = useCallback(async () => {
-    const before = legsRef.current;
-    const queued: Leg[] = [];
-    for (const leg of before) {
-      if (leg.status !== "open") continue;
-      const other: FlipSide = leg.side === "CE" ? "PE" : "CE";
-      if (loss125(before, other)) continue;
-      const ltp = liveMark(leg.fill, quotePx(leg.iid));
-      if (ltp == null || !loserHit(leg.fill, ltp)) continue;
-      queued.push(leg);
-    }
-    for (const leg of queued) await coverLeg(leg, "LOSS125");
-
-    for (const leg of legsRef.current) {
-      if (leg.status !== "open") continue;
-      const other: FlipSide = leg.side === "CE" ? "PE" : "CE";
-      if (!loss125(legsRef.current, other)) continue;
-      const ltp = liveMark(leg.fill, quotePx(leg.iid));
-      if (ltp == null) continue;
-      if (maxStopHit(leg.fill, ltp)) {
-        await coverLeg(leg, "STOP15");
-        continue;
-      }
-      const step = trailStep(leg.fill, ltp, leg.trailArmed, leg.trailLow);
-      if (step.armed !== leg.trailArmed || step.low !== leg.trailLow) {
-        const next: Leg = { ...leg, trailArmed: step.armed, trailLow: step.low };
-        commitLegs(legsRef.current.map((row) => (row.key === next.key ? next : row)));
-        if (step.justArmed && step.low != null) {
-          pushLog(`${leg.side} trail armed at ${fmtPrice(step.low)}. Cover at ${fmtPrice(trailCoverPx(step.low))}.`, "info");
-        }
-      }
-      if (step.cover) await coverLeg(leg, "TRAIL");
-    }
-  }, [commitLegs, coverLeg, pushLog]);
-
-  const runGuard = useCallback(async () => {
+  const engineRef = useRef<() => Promise<void>>(async () => {});
+  engineRef.current = async () => {
     if (tickingRef.current || busyRef.current) return;
+    if (indexRef.current !== "NIFTY") return;
+    const clock: IstClock = istClock();
+    const minsNow = clockMinutes(clock);
+    if (minsNow !== focusMinute) setFocusMinute(minsNow);
+    if (sessionDateRef.current !== clock.date) {
+      sessionDateRef.current = clock.date;
+      enteredRef.current = false;
+      squaredRef.current = false;
+      armedRef.current = false;
+      liveRef.current = false;
+      legsRef.current = [];
+      fillsRef.current = [];
+      realizedRef.current = 0;
+      nakedRef.current = [];
+      setEntered(false);
+      setSquared(false);
+      setArmed(false);
+      setLive(false);
+      commitLegs([]);
+      setFills([]);
+      setRealized(0);
+      loadedRef.current = null;
+      setLoaded(null);
+      pushLog("New session. 9:30 is disarmed.", "info");
+      return;
+    }
+
     tickingRef.current = true;
     try {
-      const today = istClock().date;
-      if (sessionDateRef.current !== today) {
-        sessionDateRef.current = today;
-        const kept = legsRef.current.filter((leg) => leg.status === "open");
-        commitLegs(kept);
-        dayBlockedRef.current = false;
-        setDayBlocked(false);
-        startedRef.current = false;
-        setStarted(false);
-        retryRef.current = { CE: 0, PE: 0 };
-        setRetryCe(0);
-        setRetryPe(0);
-        notedRef.current = {};
-        pushLog(kept.length ? "New session. Open legs are still managed." : "New session.", "info");
+      const rules = paramsRef.current;
+      const mins = clockMinutes(clock);
+      const book = loadedRef.current;
+      if (nakedRef.current.length) {
+        if (Date.now() < backoffRef.current) return;
+        if (!(armedRef.current && liveRef.current)) {
+          note("naked", "A one-sided fill still needs a cover. ARM and LIVE are off. No order.", "error");
+          return;
+        }
+        busyRef.current = true;
+        setBusy(true);
+        const left: NakedLeg[] = [];
+        for (const naked of nakedRef.current) {
+          const sent = await sendOrder("BUY", naked.iid, naked.qty, naked.segment);
+          if (sent.filledQty > 0 && sent.fillPx != null) {
+            clearLocalPosition(naked.iid);
+            pushLog(`Unwound one-sided ${naked.side} ${naked.strike} @ ${fmtPrice(sent.fillPx)}. Pair was not booked.`, "exit");
+          } else {
+            left.push(naked);
+            note("naked", `Unwind ${naked.side} failed. ${sent.error || "No fill."}`, "error");
+          }
+        }
+        nakedRef.current = left;
+        if (left.length) backoffRef.current = Date.now() + EXIT_BACKOFF_MS;
         return;
       }
-      if (await maybeDayBook()) return;
-      await maybeSingleLeg();
-      if (await maybeDayBook()) return;
-      if (!startedRef.current || dayBlockedRef.current) return;
-      for (const side of SIDES) await sellSide(side);
+
+      let working = withSavedSl(legsRef.current, rules);
+      if (working.some((leg, i) => leg.slPx !== legsRef.current[i]?.slPx)) commitLegs(working);
+      const snaps = working.map(snapOf);
+      const actions = tickActions({
+        entered: enteredRef.current,
+        squared: squaredRef.current,
+        inWindow: entryWindow(mins, rules),
+        eod: eodDue(mins, rules),
+        legs: snaps,
+        dayPlus: dayLine(rules.dayPlusPerLot, rules.lots),
+        dayMinus: dayLine(rules.dayMinusPerLot, rules.lots),
+        partnerPct: rules.partnerPct,
+        realized: realizedRef.current,
+      });
+      const locals = actions.filter((row): row is Extract<N930Action, { type: "PARTNER" | "ARM_LOCK" }> => row.type === "PARTNER" || row.type === "ARM_LOCK");
+      if (locals.length) {
+        working = working.map((leg) => {
+          let next = leg;
+          for (const row of locals) {
+            if (row.side !== leg.side || !leg.open) continue;
+            if (row.type === "PARTNER") next = { ...next, slPx: row.slPx };
+            else next = { ...next, lockArmed: true, lockPct: row.lockPct };
+          }
+          return next;
+        });
+        commitLegs(working);
+        for (const row of locals) {
+          if (row.type === "PARTNER") note(`partner-${row.side}`, `Partner ${rules.partnerPct}%. ${row.side} SL is ${fmtPrice(row.slPx)}.`, "info");
+          else note(`lock-${row.side}-${row.lockPct}`, `Leftover lock ${row.lockPct}% on ${row.side}.`, "info");
+        }
+      }
+      const orders = actions.filter((row) => row.type !== "PARTNER" && row.type !== "ARM_LOCK");
+      const punch = armedRef.current && liveRef.current;
+
+      if (!orders.length) return;
+      const first = orders[0]!;
+      if (first.type === "ENTER") {
+        if (!book) {
+          note("chain", chainNote || "Weekly chain is not ready.", "info");
+          return;
+        }
+        const ce = pickCheapest(quotesFor(book.trade, "CE"), rules.minPremium);
+        const pe = pickCheapest(quotesFor(book.trade, "PE"), rules.minPremium);
+        if (!ce || !pe) {
+          note("pick", `No ${rules.minPremium} premium on both sides of ${book.pick.trade.label}. No order.`, "info");
+          return;
+        }
+        const ceNow = goodPremium(peekFyersWsLtp(ce.iid));
+        const peNow = goodPremium(peekFyersWsLtp(pe.iid));
+        if (ceNow == null || peNow == null || ceNow < rules.minPremium || peNow < rules.minPremium) {
+          note("pick", "Quote fell under min before send. Pair not sent.", "info");
+          return;
+        }
+        if (!punch) {
+          note(
+            "dry-entry",
+            `DRY-RUN SELL ${book.pick.trade.label} CE ${ce.strike} @ ${fmtPrice(ceNow)} and PE ${pe.strike} @ ${fmtPrice(peNow)}. No order.`,
+            "info",
+          );
+          return;
+        }
+        if (Date.now() < backoffRef.current) return;
+        busyRef.current = true;
+        setBusy(true);
+        const qty = orderQty(rules.lots);
+        const segment = book.trade.optionSegment;
+        const [ceSent, peSent] = await Promise.all([
+          sendOrder("SELL", ce.iid, qty, segment),
+          sendOrder("SELL", pe.iid, qty, segment),
+        ]);
+        const plan = pairFillPlan(ceSent, peSent);
+        if (plan.type === "book") {
+          const expiry = book.trade.expiryUi || book.pick.trade.label;
+          const booked: BookLeg[] = [
+            {
+              side: "CE",
+              strike: ce.strike,
+              iid: ce.iid,
+              segment,
+              qty: plan.ceQty,
+              sold: plan.cePx,
+              slPx: slPrice(plan.cePx, rules.slPct),
+              slOn: true,
+              lockArmed: false,
+              lockPct: 0,
+              open: true,
+              closedBy: null,
+              coverPx: null,
+            },
+            {
+              side: "PE",
+              strike: pe.strike,
+              iid: pe.iid,
+              segment,
+              qty: plan.peQty,
+              sold: plan.pePx,
+              slPx: slPrice(plan.pePx, rules.slPct),
+              slOn: true,
+              lockArmed: false,
+              lockPct: 0,
+              open: true,
+              closedBy: null,
+              coverPx: null,
+            },
+          ];
+          const nextFills: N930Fill[] = [
+            ...fillsRef.current,
+            { side: "SELL", premium: plan.cePx, qty: plan.ceQty },
+            { side: "SELL", premium: plan.pePx, qty: plan.peQty },
+          ];
+          fillsRef.current = nextFills;
+          setFills(nextFills);
+          enteredRef.current = true;
+          setEntered(true);
+          commitLegs(booked);
+          for (const leg of booked) remember(leg, expiry);
+          pushLog(
+            `SELL ${expiry} CE ${ce.strike} @ ${fmtPrice(plan.cePx)} and PE ${pe.strike} @ ${fmtPrice(plan.pePx)}. SL from the fill.`,
+            "entry",
+          );
+          toast({ title: "9:30 sold", description: `CE ${ce.strike} and PE ${pe.strike}` });
+          return;
+        }
+        const unwind = async (side: N930Side, iid: number, strike: number, qtyFilled: number) => {
+          const sent = await sendOrder("BUY", iid, qtyFilled, segment);
+          if (sent.filledQty > 0 && sent.fillPx != null) {
+            clearLocalPosition(iid);
+            pushLog(`Unwound one-sided ${side} ${strike} @ ${fmtPrice(sent.fillPx)}. Pair was not booked.`, "exit");
+            return true;
+          }
+          nakedRef.current = [...nakedRef.current, { side, strike, iid, segment, qty: qtyFilled }];
+          setLocalShortPosition({
+            exchangeInstrumentID: iid,
+            exchangeSegment: segment,
+            qty: qtyFilled,
+            fillPx: side === "CE" ? ceSent.fillPx || ceNow : peSent.fillPx || peNow,
+            tradingSymbol: `NIFTY ${strike} ${side}`,
+          });
+          note("naked", `One-sided ${side} fill. Unwind failed. ${sent.error || "No fill."}`, "error");
+          return false;
+        };
+        if (plan.type === "unwind" && plan.side === "CE" && ceSent.filledQty > 0) await unwind("CE", ce.iid, ce.strike, ceSent.filledQty);
+        else if (plan.type === "unwind" && plan.side === "PE" && peSent.filledQty > 0) await unwind("PE", pe.iid, pe.strike, peSent.filledQty);
+        else if (plan.type === "unwind-both") {
+          if (ceSent.filledQty > 0) await unwind("CE", ce.iid, ce.strike, ceSent.filledQty);
+          if (peSent.filledQty > 0) await unwind("PE", pe.iid, pe.strike, peSent.filledQty);
+        } else {
+          backoffRef.current = Date.now() + ENTRY_BACKOFF_MS;
+          note("entry-fail", `Pair not filled. ${ceSent.error || peSent.error || "Rejected."} Next try in 15s.`, "error");
+        }
+        return;
+      }
+
+      const openLegs = working.filter((leg) => leg.open);
+      const targets =
+        first.type === "SQUARE"
+          ? openLegs
+          : openLegs.filter((leg) => orders.some((row) => (row.type === "SL" || row.type === "LEFTOVER") && row.side === leg.side));
+      if (!targets.length) return;
+      const reason =
+        first.type === "SQUARE"
+          ? first.reason === "EOD"
+            ? `EOD ${formatHm(rules.eodMin)}`
+            : first.reason === "DAY_MINUS"
+              ? "Day −"
+              : "Day +"
+          : first.type === "SL"
+            ? `SL ${rules.slPct}%`
+            : "Leftover";
+      const kind: ClosedBy = first.type === "SL" ? "sl" : first.type === "LEFTOVER" ? "leftover" : "square";
+      if (!punch) {
+        note("dry-exit", `DRY-RUN ${reason}. No order.`, "info");
+        return;
+      }
+      if (Date.now() < backoffRef.current) return;
+      busyRef.current = true;
+      setBusy(true);
+      await coverLegs(targets, reason, kind);
     } finally {
       tickingRef.current = false;
+      if (busyRef.current) {
+        busyRef.current = false;
+        setBusy(false);
+      }
+      const now = Date.now();
+      const showing =
+        activeRef.current ||
+        legsRef.current.some((leg) => leg.open) ||
+        entryWindow(clockMinutes(istClock()), paramsRef.current);
+      if (showing && now - shownRef.current > 400) {
+        shownRef.current = now;
+        setMarkTick((n) => (n + 1) % 1_000_000);
+      }
     }
-  }, [commitLegs, maybeDayBook, maybeSingleLeg, pushLog, sellSide]);
-
-  runRef.current = runGuard;
+  };
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      void runRef.current();
-    }, GUARD_MS);
+    const id = window.setInterval(() => void engineRef.current(), GUARD_MS);
     return () => window.clearInterval(id);
   }, []);
 
-  const arm = useCallback(() => {
-    if (busyRef.current) return;
-    if (startedRef.current) {
-      startedRef.current = false;
-      setStarted(false);
-      pushLog("START off. No new sell.", "info");
-      toast({ title: "9:30", description: "START is off. No new sell." });
+  const saveParameters = () => {
+    const parsed = parseN930Params(draft);
+    if (!parsed.ok) {
+      toast({ title: "9:30 parameters", description: parsed.error, variant: "destructive" });
       return;
     }
-    if (dayBlockedRef.current) {
-      pushLog("Day book exit. No new entry today.", "info");
-      toast({ title: "9:30", description: "Day book exit. No new entry today.", variant: "destructive" });
-      return;
-    }
-    startedRef.current = true;
-    setStarted(true);
-    pushLog("START. Selling both sides now.", "info");
-    toast({ title: "9:30 START", description: "Selling CE and PE on the nearest expiry." });
-    void runRef.current();
-  }, [pushLog]);
-
-  const stopAll = useCallback(async () => {
-    if (busyRef.current) return;
-    startedRef.current = false;
-    setStarted(false);
-    const opens = legsRef.current.filter((leg) => leg.status === "open");
-    if (!opens.length) {
-      pushLog("STOP. Flat. START is off.", "info");
-      toast({ title: "9:30", description: "Flat. START is off." });
-      return;
-    }
-    pushLog("STOP. Covering open legs.", "info");
-    for (const leg of opens) await coverLeg(leg, "STOP");
-  }, [coverLeg, pushLog]);
-
-  const ready =
-    !!chain &&
-    !!pick &&
-    chainIndex(chain) === index &&
-    cdChainIsPick(String(chain.expiryApi || ""), String(chain.expiryUi || ""), pick);
-  const cePick = ready && chain ? pickSellStrike(chainQuotes(chain, "CE")) : null;
-  const pePick = ready && chain ? pickSellStrike(chainQuotes(chain, "PE")) : null;
-  const view = bookView(legs);
-  const winLine = view && view.lots > 0 ? N930.dayWinPerLot * view.lots : null;
-  const lossLine = view && view.lots > 0 ? N930.dayLossPerLot * view.lots : null;
-  const foreign = legs.some((leg) => leg.status === "open" && leg.index !== index);
-  const retryLeft = (side: FlipSide) => Math.max(0, Math.ceil(((side === "CE" ? retryCe : retryPe) - nowMs) / 1000));
-  const ceWait = !openLeg(legs, "CE") && !sideBlocked(legs, "CE") ? retryLeft("CE") : 0;
-  const peWait = !openLeg(legs, "PE") && !sideBlocked(legs, "PE") ? retryLeft("PE") : 0;
-  const retryWait = Math.max(ceWait, peWait);
-
-  const status = dayBlocked
-    ? "Day book exit. No new entry today."
-    : expiryState === "none"
-      ? N930_NO_EXPIRY
-      : expiryState === "error"
-        ? "Nearest expiry chain failed. No entry."
-        : !ready
-          ? pick
-            ? `Loading ${pick.label}.`
-            : "Loading the nearest expiry."
-          : foreign
-            ? "Top bar index changed. Open legs still exit. No new entry."
-            : lotsNow == null
-              ? "Lots must be a whole number from 1 to 50."
-              : !started
-                ? "Press START. Both sides sell immediately."
-                : retryWait > 0
-                  ? `Failed sell. Next try in ${retryWait}s.`
-                  : "START is on. Selling the cheapest premium at or above 100.";
-
-  const showPx = (iid: number): number | null => {
-    const px = peekTouchPx(iid, ltps);
-    return px != null && px > 0 ? px : null;
+    paramsRef.current = parsed.params;
+    setParams(parsed.params);
+    pushLog(
+      `Parameters saved. ${formatHm(parsed.params.startMin)}–${formatHm(parsed.params.cutoffMin)}, EOD ${formatHm(parsed.params.eodMin)}, ${parsed.params.lots} lots, min ${parsed.params.minPremium}.`,
+      "info",
+    );
+    toast({ title: "9:30 parameters", description: "Saved. The live card uses this save." });
   };
+
+  const arm = () => {
+    if (busyRef.current) return;
+    const next = !armedRef.current;
+    armedRef.current = next;
+    setArmed(next);
+    pushLog(next ? "9:30 armed. Orders still need LIVE." : "9:30 disarmed. No new order.", "info");
+  };
+
+  const toggleLive = () => {
+    if (busyRef.current) return;
+    const next = !liveRef.current;
+    liveRef.current = next;
+    setLive(next);
+    pushLog(next ? "LIVE on for 9:30 only." : "LIVE off. 9:30 will not send an order.", "info");
+  };
+
+  const stop = async () => {
+    if (busyRef.current) return;
+    armedRef.current = false;
+    setArmed(false);
+    const open = legsRef.current.filter((leg) => leg.open);
+    if (!open.length) {
+      pushLog("STOP. Flat. 9:30 is disarmed.", "info");
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      await coverLegs(open, "STOP", "square");
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  const rules = params;
+  const qty = orderQty(rules.lots);
+  const snaps = legs.map(snapOf);
+  void markTick;
+  const ceOpen = legs.find((leg) => leg.side === "CE" && leg.open) ?? null;
+  const peOpen = legs.find((leg) => leg.side === "PE" && leg.open) ?? null;
+  const ceWatch = !ceOpen && loaded ? pickCheapest(quotesFor(loaded.trade, "CE"), rules.minPremium) : null;
+  const peWatch = !peOpen && loaded ? pickCheapest(quotesFor(loaded.trade, "PE"), rules.minPremium) : null;
+  const deskMode = armed && live ? "LIVE" : "DRY";
+  const deskState = !armed ? "Disarmed" : live ? "Armed" : "Armed · dry-run";
+  const mark = dayMtm(snaps, realized);
+  const gross = mark.mtm;
+  const money = netPnl(gross, fills);
+  const charges = chargeBreakup(fills).total;
+  const draftDirty =
+    draft.start !== formatHm(rules.startMin) ||
+    draft.cutoff !== formatHm(rules.cutoffMin) ||
+    draft.eod !== formatHm(rules.eodMin) ||
+    draft.lots !== String(rules.lots) ||
+    draft.minPremium !== String(rules.minPremium) ||
+    draft.slPct !== String(rules.slPct) ||
+    draft.partnerPct !== String(rules.partnerPct) ||
+    draft.dayPlusPerLot !== String(rules.dayPlusPerLot) ||
+    draft.dayMinusPerLot !== String(rules.dayMinusPerLot);
+  const clock = istClock();
+  const mins = clockMinutes(clock);
+  const status =
+    index !== "NIFTY"
+      ? "Select NIFTY. This desk does not trade another index."
+      : !armed
+        ? "Disarmed. No order until 9:30 is armed and LIVE is on."
+        : !live
+          ? "Armed. LIVE is off, so this is a dry-run."
+          : squared
+            ? "Done for today. No resell."
+            : legs.some((leg) => leg.open)
+              ? "Pair is open. The card is display-only."
+              : !warmupDue(mins, rules)
+                ? `Warmup starts at ${formatHm(rules.startMin - N930.warmupMin)}.`
+                : !loaded
+                  ? chainNote || "Subscribing this week and next week."
+                  : !entryWindow(mins, rules)
+                    ? `Waiting for ${formatHm(rules.startMin)}. Cutoff ${formatHm(rules.cutoffMin)}.`
+                    : `${loaded.pick.trade.label} CE and PE sell together on the next good tick.`;
 
   return (
     <div className="flex flex-1 min-h-0 min-w-0 flex-col overflow-hidden text-[13px] ramsetu-glass-panel">
       <div className="shrink-0 ramsetu-glass-toolbar">
-        <div className="nv-stats">
-          <div className="nv-stat">
-            <div className="nv-kicker">Index</div>
-            <div className="nv-value">{index}</div>
-            <div className="nv-sub">lot {lotSize}</div>
-          </div>
-          <div className="nv-stat">
-            <div className="nv-kicker">Expiry</div>
-            <div className="nv-value">{pick?.label || "—"}</div>
-            <div className="nv-sub">nearest on or after today</div>
-          </div>
-          <div className="nv-stat">
-            <div className="nv-kicker">CE</div>
-            <div className="nv-value">{cePick ? fmtPrice(cePick.premium) : "—"}</div>
-            <div className="nv-sub">{cePick ? Math.round(cePick.strike).toLocaleString("en-IN") : "premium ≥ 100"}</div>
-          </div>
-          <div className="nv-stat">
-            <div className="nv-kicker">PE</div>
-            <div className="nv-value">{pePick ? fmtPrice(pePick.premium) : "—"}</div>
-            <div className="nv-sub">{pePick ? Math.round(pePick.strike).toLocaleString("en-IN") : "premium ≥ 100"}</div>
-          </div>
-          <div className="nv-stat">
-            <div className="nv-kicker">Day MTM</div>
-            <div className={`nv-value ${view && view.mtm >= 0 ? "text-cd-green" : view ? "text-cd-red" : ""}`}>
-              {view ? fmtPnl(view.mtm) : "—"}
+        <div className="n930-tape">
+          <div className="n930-cell">
+            <div className="n930-kicker">Window</div>
+            <div className="n930-px">
+              {formatHm(rules.startMin)}–{formatHm(rules.cutoffMin)}
             </div>
-            <div className="nv-sub">
-              {winLine != null && lossLine != null
-                ? `+${inr(winLine)} / −${inr(lossLine)}`
-                : "+500 / −700 per lot"}
+            <div className="n930-meta">
+              EOD {formatHm(rules.eodMin)} · {deskMode}
             </div>
+          </div>
+          <div className="n930-cell">
+            <div className="n930-kicker">CE</div>
+            <div className="n930-px n930-px--ce">
+              {ceOpen ? <FyersPx iid={ceOpen.iid} /> : ceWatch ? fmtPrice(ceWatch.ltp) : "—"}
+            </div>
+            <div className="n930-meta">
+              {ceOpen
+                ? `${Math.round(ceOpen.strike).toLocaleString("en-IN")} · SL ${fmtPrice(ceOpen.slPx)}`
+                : ceWatch
+                  ? `${Math.round(ceWatch.strike).toLocaleString("en-IN")} · cheapest ≥ min`
+                  : chainNote || (loaded ? "waiting for LTP" : "—")}
+            </div>
+          </div>
+          <div className="n930-cell">
+            <div className="n930-kicker">PE</div>
+            <div className="n930-px n930-px--pe">
+              {peOpen ? <FyersPx iid={peOpen.iid} /> : peWatch ? fmtPrice(peWatch.ltp) : "—"}
+            </div>
+            <div className="n930-meta">
+              {peOpen
+                ? `${Math.round(peOpen.strike).toLocaleString("en-IN")} · SL ${fmtPrice(peOpen.slPx)}`
+                : peWatch
+                  ? `${Math.round(peWatch.strike).toLocaleString("en-IN")} · cheapest ≥ min`
+                  : chainNote || (loaded ? "waiting for LTP" : "—")}
+            </div>
+          </div>
+          <div className="n930-cell">
+            <div className="n930-kicker">Day MTM</div>
+            <div className={`n930-px ${gross > 0 ? "n930-px--up" : gross < 0 ? "n930-px--down" : ""}`}>{fmtPnl(gross)}</div>
+            <div className="n930-meta">
+              net {fmtPnl(money.net)} · charges {fmtPrice(charges)}
+              {!mark.dayPlusReady ? " · mark incomplete" : ""}
+            </div>
+          </div>
+          <div className="n930-cell">
+            <div className="n930-kicker">Nifty</div>
+            <div className="n930-px">{loaded?.pick.trade.label ?? (chainNote ? "—" : "…")}</div>
+            <div className="n930-meta">
+              {rules.lots} × {N930.lotSize} = {fmtQty(qty)}
+              {chainNote ? ` · ${chainNote}` : ""}
+            </div>
+          </div>
+          <div className="n930-cell">
+            <div className="n930-kicker">XTS</div>
+            <div className="n930-px">{deskMode}</div>
+            <div className="n930-meta">{deskState}</div>
           </div>
         </div>
 
@@ -900,9 +1003,12 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           <p className="cd-trade__status">{status}</p>
           <div className="cd-trade__actions">
             <button type="button" disabled={busy} onClick={arm} className="ramsetu-glass-exec">
-              {started ? "ARMED" : "START"}
+              {armed ? "ARMED" : "START"}
             </button>
-            <button type="button" disabled={busy} onClick={() => void stopAll()} className="ramsetu-glass-stop nv-stop">
+            <button type="button" disabled={busy} onClick={toggleLive} className="ramsetu-glass-exec">
+              {live ? "LIVE ON" : "LIVE"}
+            </button>
+            <button type="button" disabled={busy} onClick={() => void stop()} className="ramsetu-glass-stop nv-stop">
               STOP
             </button>
           </div>
@@ -910,92 +1016,73 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
 
         <div className="cd-params">
           <div className="cd-params__grid">
-            <label className="cd-field">
-              <span className="cd-field__label">Lots</span>
-              <input
-                aria-label="Lots"
-                inputMode="numeric"
-                autoComplete="off"
-                value={lotsText}
-                onChange={(e) => setLotsText(e.target.value.replace(/[^\d]/g, "").slice(0, 2))}
-                className="ramsetu-glass-select cd-field__control"
-              />
-            </label>
+            <Field label="Start">
+              <input aria-label="Start" value={draft.start} onChange={(e) => setDraft((row) => ({ ...row, start: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Cutoff">
+              <input aria-label="Cutoff" value={draft.cutoff} onChange={(e) => setDraft((row) => ({ ...row, cutoff: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Square-off">
+              <input aria-label="Square-off" value={draft.eod} onChange={(e) => setDraft((row) => ({ ...row, eod: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Lots">
+              <input aria-label="Lots" inputMode="numeric" value={draft.lots} onChange={(e) => setDraft((row) => ({ ...row, lots: e.target.value.replace(/[^\d]/g, "").slice(0, 2) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Min premium">
+              <input aria-label="Min premium" inputMode="decimal" value={draft.minPremium} onChange={(e) => setDraft((row) => ({ ...row, minPremium: e.target.value.replace(/[^\d.]/g, "").slice(0, 6) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="SL %">
+              <input aria-label="SL %" inputMode="decimal" value={draft.slPct} onChange={(e) => setDraft((row) => ({ ...row, slPct: e.target.value.replace(/[^\d.]/g, "").slice(0, 6) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Partner %">
+              <input aria-label="Partner %" inputMode="decimal" value={draft.partnerPct} onChange={(e) => setDraft((row) => ({ ...row, partnerPct: e.target.value.replace(/[^\d.]/g, "").slice(0, 6) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Day + ₹/lot">
+              <input aria-label="Day + ₹/lot" inputMode="decimal" value={draft.dayPlusPerLot} onChange={(e) => setDraft((row) => ({ ...row, dayPlusPerLot: e.target.value.replace(/[^\d.]/g, "").slice(0, 8) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Day − ₹/lot">
+              <input aria-label="Day − ₹/lot" inputMode="decimal" value={draft.dayMinusPerLot} onChange={(e) => setDraft((row) => ({ ...row, dayMinusPerLot: e.target.value.replace(/[^\d.]/g, "").slice(0, 8) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
           </div>
           <div className="cd-params__bar">
             <span className="cd-params__qty">
-              Order qty {lotsNow ?? "—"} × {lotSize} = {qtyNow == null ? "—" : fmtQty(qtyNow)}
+              Order qty {rules.lots} × {N930.lotSize} = {fmtQty(qty)}
             </span>
-            <span className="cd-params__note">One short CE and one short PE. START sells both now.</span>
+            <span className="cd-params__note">
+              {draftDirty ? "Not saved. The desk still uses the last save." : "Saved. The live card does not take edits."}
+            </span>
+            <button type="button" onClick={saveParameters} className="ramsetu-glass-exec">
+              Save parameters
+            </button>
           </div>
         </div>
       </div>
 
       <div className="ramsetu-glass-table-wrap flex min-h-0 flex-1 flex-col gap-3">
-        <div className="grid gap-3 md:grid-cols-2">
-          {SIDES.map((side) => {
-            const rows = legs.filter((leg) => leg.side === side);
-            const other: FlipSide = side === "CE" ? "PE" : "CE";
-            const otherBooked = loss125(legs, other);
-            return (
-              <div key={side} className="ramsetu-glass-card">
-                <div className="ramsetu-glass-card__badge">{side}</div>
-                {!rows.length ? (
-                  <div className="nv-flat mt-1">Flat</div>
-                ) : (
-                  <div className="mt-2 flex flex-col gap-3">
-                    {rows.map((leg) => {
-                      const live = leg.status === "open" ? liveMark(leg.fill, showPx(leg.iid)) : leg.mark;
-                      const mtm = live != null ? shortMtm(leg.fill, live, leg.qty) : null;
-                      const trail = leg.trailLow != null ? trailCoverPx(leg.trailLow) : null;
-                      return (
-                        <div key={leg.key} className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3">
-                          <div>
-                            <div className="ramsetu-glass-toolbar__label">Strike</div>
-                            <div className={`text-[14px] font-extrabold tabular-nums ${side === "PE" ? "ramsetu-glass-table__strike--pe" : "text-cd-green"}`}>
-                              {legTitle(leg)}
-                            </div>
-                          </div>
-                          <div>
-                            <div className="ramsetu-glass-toolbar__label">Qty</div>
-                            <div className="text-[14px] font-extrabold tabular-nums">{fmtQty(leg.qty)}</div>
-                          </div>
-                          <div>
-                            <div className="ramsetu-glass-toolbar__label">Sold</div>
-                            <div className="text-[14px] font-extrabold tabular-nums">{fmtPrice(leg.fill)}</div>
-                          </div>
-                          <div>
-                            <div className="ramsetu-glass-toolbar__label">{leg.status === "open" ? "LTP" : "Cover"}</div>
-                            {leg.status === "open" ? (
-                              <FastLtp iid={leg.iid} as="div" className="text-[14px] font-extrabold tabular-nums" />
-                            ) : (
-                              <div className="text-[14px] font-extrabold tabular-nums">{fmtPrice(leg.mark)}</div>
-                            )}
-                          </div>
-                          <div>
-                            <div className="ramsetu-glass-toolbar__label">MTM</div>
-                            <div className={`text-[14px] font-extrabold tabular-nums ${mtm != null && mtm >= 0 ? "text-cd-green" : mtm != null ? "text-cd-red" : ""}`}>
-                              {fmtPnl(mtm)}
-                            </div>
-                          </div>
-                          <div>
-                            <div className="ramsetu-glass-toolbar__label">{leg.status === "open" ? "Exit" : "Booked"}</div>
-                            <div className="text-[14px] font-extrabold tabular-nums">
-                              {leg.status === "closed"
-                                ? reasonLabel(leg.closeReason || "STOP")
-                                : otherBooked
-                                  ? `15% ${fmtPrice(maxStopPx(leg.fill))}${leg.trailArmed && trail != null ? ` · trail ${fmtPrice(trail)}` : ` · arm ${fmtPrice(trailArmPx(leg.fill))}`}`
-                                  : `125% ${fmtPrice(loserPx(leg.fill))}`}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
+        <div className="ramsetu-glass-card">
+          <div className="ramsetu-glass-card__badge">Live card</div>
+          <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-2">
+            {(["CE", "PE"] as const).map((side) => {
+              const leg = legs.find((row) => row.side === side);
+              const quote = side === "CE" ? ceWatch : peWatch;
+              const strike = leg?.strike ?? quote?.strike;
+              return (
+                <div key={side}>
+                  <div className="ramsetu-glass-toolbar__label">{side}</div>
+                  <div className={`text-[14px] font-extrabold tabular-nums ${side === "PE" ? "ramsetu-glass-table__strike--pe" : "text-cd-green"}`}>
+                    {strike != null ? strike.toLocaleString("en-IN") : "—"}
+                    {leg ? (leg.open ? " short" : ` ${leg.closedBy || "closed"}`) : quote ? " watch" : ""}
                   </div>
-                )}
-              </div>
-            );
-          })}
+                  <div className="text-[12px] tabular-nums text-muted-foreground">
+                    LTP {leg ? <FyersPx iid={leg.iid} /> : quote ? fmtPrice(quote.ltp) : "—"}
+                    {" · "}SL {leg ? fmtPrice(leg.slPx) : "—"}
+                    {leg?.lockArmed ? ` · lock ${leg.lockPct}%` : ""}
+                    {leg ? ` · sold ${fmtPrice(leg.sold)}` : ""}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col">
@@ -1008,16 +1095,11 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                START sells one CE and one PE on the nearest broker expiry on or after today. The same day counts.
-                The top bar picks the index. A later top-bar expiry is not the contract. Each side sells the cheapest
-                live premium at or above 100. 99.99 is not a sell. The same premium sells the lower strike. A side
-                with no such premium stays in the hunt while START is on. A failed sell waits 3 seconds. Day MTM is
-                the rupee sum of every open and closed leg. At +500 per lot, or −700 per lot, every open leg is
-                covered and this tab sends no new entry today. Before that, a leg covers at 125% of the sold premium
-                and is not sold again. The remaining leg then stops at 15% above the sold premium. When that premium
-                is 60% of the sold price the trail arms, and it covers 15% above the lowest premium after the arm.
-                Sold 100 covers at 125, then the other leg covers at 115. The trail arms at 60. A low of 50 covers at
-                57.50. STOP covers the open legs and does not block a new START.
+                NIFTY weekly, lot 65, step 50. Wed–Fri sell the nearest Tuesday. Mon–Tue skip that Tuesday and sell the next one.
+                Both legs use that expiry. Each side is the cheapest Fyers print at or above the saved min. A print under the min is skipped.
+                CE and PE sell together. One fill is unwound. After a stop that strike is done. Both open legs keep the saved SL and no trail.
+                After one stop, the other stop tightens to the partner percent and the leftover ladder can lock. Day + and Day − use the saved
+                rupees per lot. Orders go out only when this desk is armed and LIVE is on.
               </p>
             ) : (
               <ul className="space-y-1.5">
