@@ -1,8 +1,8 @@
 /**
  * 9:30 NIFTY weekly short strangle.
- * Clocks, lots, min, SL%, partner%, Day +, and Day − come from saved parameters.
- * Prices are this contract's live premium. Blank, 0, and index-scale junk are not prices.
- * ALLOW_RESELL is false: one pair, and a strike is done after its own SL.
+ * Clocks, lots, min, SL%, partner%, Day +, and Day − come from Save.
+ * Prices are this contract's live premium. Blank, 0, and a print at or above 1000 are not prices.
+ * One sell per START. A strike is finished after its own stop.
  */
 
 export const N930 = {
@@ -13,6 +13,7 @@ export const N930 = {
   warmupMin: 1,
   lotsMin: 1,
   lotsMax: 50,
+  entrySpanMin: 5,
   brokeragePerOrder: 20,
   sttSell: 0.0015,
   stampBuy: 0.00003,
@@ -185,6 +186,14 @@ function parseClock(text: string): number | null {
   return hour * 60 + minute;
 }
 
+/** Cutoff is this many minutes after a finished HH:MM start. An unfinished start leaves cutoff alone. */
+export function cutoffFromStart(startText: string, spanMin = N930.entrySpanMin): string | null {
+  const startMin = parseClock(startText);
+  if (startMin == null) return null;
+  const span = Math.max(1, Math.trunc(spanMin));
+  return formatHm(Math.min(startMin + span, 23 * 60 + 59));
+}
+
 function parsePositive(text: string, max: number): number | null {
   const raw = text.trim();
   if (!/^\d+(\.\d+)?$/.test(raw)) return null;
@@ -268,8 +277,9 @@ export function favPct(sold: number, ltp: number): number {
 }
 
 /**
- * Leftover lock percent once favorable percent is on a rung.
- * 20% favorable is not a lock. After 45%, each extra 1% favorable adds 1% lock.
+ * Leftover lock from favorable percent. Under 25, no lock.
+ * 25 locks the sell price. 30 locks 5. 35 locks 10. 40 locks 25. 45 locks 30.
+ * After 45, the lock is 30 plus each extra 1 point of favorable move. The lock only tightens.
  */
 export function leftoverLockPct(fav: number): number | null {
   if (!(fav >= 25)) return null;
@@ -284,13 +294,13 @@ export function lockCoverPx(sold: number, lockPct: number): number {
   return sold * (1 - lockPct / 100);
 }
 
-/** Cheapest live premium that is still at or above min. A print under min is skipped. */
+/** Cheapest live premium at or above min. A print under min is skipped. Equal rates keep the lower strike. */
 export function pickCheapest<T extends PremiumQuote>(quotes: readonly T[], minPremium: number): T | null {
   let best: T | null = null;
   for (const quote of quotes) {
     const ltp = goodPremium(quote.ltp);
     if (ltp == null || ltp < minPremium) continue;
-    if (!best || ltp < best.ltp - 1e-9 || (Math.abs(ltp - best.ltp) <= 1e-9 && quote.strike > best.strike)) {
+    if (!best || ltp < best.ltp - 1e-9 || (Math.abs(ltp - best.ltp) <= 1e-9 && quote.strike < best.strike)) {
       best = { ...quote, ltp };
     }
   }
@@ -338,33 +348,34 @@ export type WeekPick = {
 };
 
 /**
- * Tue weekly only.
- * Wed–Fri trade the nearest Tuesday. Mon–Tue skip that nearby Tuesday and trade the next one.
- * Both weeks are subscribed. Both legs use the trade expiry.
+ * Tuesday labels only, on or after today. The top bar expiry is not used.
+ * Wed–Fri sell the nearest Tuesday. Mon–Tue skip that nearby Tuesday and sell the next one.
+ * If no Tuesday remains, there is no entry.
  */
 export function pickNiftyWeek(rows: readonly N930ExpiryPick[], clock: Pick<IstClock, "year" | "month" | "day">): WeekPick | null {
   const today = civilKey(clock.year, clock.month, clock.day);
   if (today == null) return null;
   const weekday = new Date(Date.UTC(clock.year, clock.month - 1, clock.day)).getUTCDay();
   if (weekday === 0 || weekday === 6) return null;
-  const dated: { key: number; pick: N930ExpiryPick; tuesday: boolean }[] = [];
+  const tuesdays: { key: number; pick: N930ExpiryPick }[] = [];
   for (const row of rows) {
     const label = String(row?.label || "").trim();
     const api = String(row?.api || "").trim();
-    const key = expiryDayKey(label) ?? expiryDayKey(api);
-    if (!label || !api || key == null || key < today) continue;
-    dated.push({ key, pick: { label, api }, tuesday: weekdayOfKey(key) === 2 });
+    if (!EXPIRY_LABEL.test(label.replace(/[\s\-_/]/g, ""))) continue;
+    const key = expiryDayKey(label);
+    if (!label || !api || key == null || key < today || weekdayOfKey(key) !== 2) continue;
+    tuesdays.push({ key, pick: { label, api } });
   }
-  dated.sort((a, b) => a.key - b.key);
-  const tuesdays = dated.filter((row) => row.tuesday);
-  const book = tuesdays.length >= 2 ? tuesdays : dated;
-  if (!book.length) return null;
-  const nearby = book[0]!;
-  const following = book[1] ?? book[0]!;
-  const skipNearby = (weekday === 1 || weekday === 2) && book.length >= 2;
-  return skipNearby
-    ? { trade: following.pick, thisWeek: nearby.pick, nextWeek: following.pick }
-    : { trade: nearby.pick, thisWeek: nearby.pick, nextWeek: following.pick };
+  tuesdays.sort((a, b) => a.key - b.key);
+  if (!tuesdays.length) return null;
+  const skipNearby = weekday === 1 || weekday === 2;
+  if (skipNearby) {
+    if (tuesdays.length < 2) return null;
+    return { trade: tuesdays[1]!.pick, thisWeek: tuesdays[0]!.pick, nextWeek: tuesdays[1]!.pick };
+  }
+  const nearby = tuesdays[0]!;
+  const following = tuesdays[1] ?? nearby;
+  return { trade: nearby.pick, thisWeek: nearby.pick, nextWeek: following.pick };
 }
 
 export type DayMark = { mtm: number; dayPlusReady: boolean };
@@ -446,30 +457,33 @@ export function tickActions(args: {
   return actions;
 }
 
-export type LegAck = { filledQty: number; fillPx: number | null };
+export type LegAck = { filledQty: number; fillPx: number | null; rate: number | null };
 
 export type PairPlan =
   | { type: "book"; ceQty: number; cePx: number; peQty: number; pePx: number }
   | { type: "unwind"; side: N930Side }
-  | { type: "unwind-both" }
   | { type: "none" };
 
-/** A missing average traded price is not a fill. One filled leg is unwound. sold = 0 is never booked. */
+/** This order's fill counts only within max(1 point, 25 percent) of that strike's live rate. */
+export function fillCounts(fillPx: number | null | undefined, rate: number | null | undefined): boolean {
+  if (typeof fillPx !== "number" || !Number.isFinite(fillPx) || !(fillPx > 0)) return false;
+  const live = goodPremium(rate);
+  if (live == null) return false;
+  const band = Math.max(1, live * 0.25);
+  return Math.abs(fillPx - live) <= band + 1e-9;
+}
+
+/** A price from another contract is not a fill. One leg at its own rate is bought back. Neither is not a position. */
 export function pairFillPlan(ce: LegAck, pe: LegAck): PairPlan {
-  const state = (ack: LegAck): "book" | "naked" | "none" => {
-    if (!(ack.filledQty > 0)) return "none";
-    if (ack.fillPx != null && ack.fillPx > 0) return "book";
-    return "naked";
-  };
-  const ceState = state(ce);
-  const peState = state(pe);
-  if (ceState === "book" && peState === "book") {
+  const own = (ack: LegAck) => ack.filledQty > 0 && fillCounts(ack.fillPx, ack.rate);
+  const ceOwn = own(ce);
+  const peOwn = own(pe);
+  if (ceOwn && peOwn) {
     return { type: "book", ceQty: ce.filledQty, cePx: ce.fillPx!, peQty: pe.filledQty, pePx: pe.fillPx! };
   }
-  if (ceState === "none" && peState === "none") return { type: "none" };
-  if (peState === "none" && ceState !== "none") return { type: "unwind", side: "CE" };
-  if (ceState === "none" && peState !== "none") return { type: "unwind", side: "PE" };
-  return { type: "unwind-both" };
+  if (ceOwn) return { type: "unwind", side: "CE" };
+  if (peOwn) return { type: "unwind", side: "PE" };
+  return { type: "none" };
 }
 
 /** ROUND_HALF_UP to a paise, then the caller sums. */
@@ -531,6 +545,10 @@ export function assertNineThirtyRules(): void {
     throw new Error("junk is not a price");
   }
   if (goodPremium(100) !== 100) throw new Error("100 is a price");
+  if (cutoffFromStart("10:55") !== "11:00" || cutoffFromStart("09:36") !== "09:41") {
+    throw new Error("cutoff is 5 minutes after start");
+  }
+  if (cutoffFromStart("10") !== null) throw new Error("an unfinished start does not move cutoff");
 
   const book = [
     { strike: 24000, ltp: 87 },
@@ -540,6 +558,14 @@ export function assertNineThirtyRules(): void {
   const picked = pickCheapest(book, 100);
   if (!picked || picked.strike !== 23950 || picked.ltp !== 100) throw new Error("87 is skipped; cheapest at min is 100");
   if (pickCheapest([{ strike: 1, ltp: 0 }], 100) !== null) throw new Error("blank is not zero and is not a sell");
+  const tied = pickCheapest(
+    [
+      { strike: 25700, ltp: 108 },
+      { strike: 25650, ltp: 108 },
+    ],
+    100,
+  );
+  if (tied?.strike !== 25650) throw new Error("equal rates keep the lower strike");
 
   near(slPrice(100, 25), 125, "SL is sold × 1.25");
   near(partnerSl(125, 100, 15), 115, "partner tightens to sold × 1.15");
@@ -650,15 +676,67 @@ export function assertNineThirtyRules(): void {
     { year: 2026, month: 11, day: 10 },
   );
   if (tuesday?.trade.label !== "17Nov2026") throw new Error("Tuesday does not sell the same-day weekly");
+  const wednesday = pickNiftyWeek(
+    [
+      { label: "13Nov2026", api: "13" },
+      { label: "17Nov2026", api: "17" },
+      { label: "24Nov2026", api: "24" },
+    ],
+    { year: 2026, month: 11, day: 11 },
+  );
+  if (wednesday?.trade.label !== "17Nov2026") throw new Error("Wednesday 11 Nov 2026 selects 17Nov2026");
+  const mondayLater = pickNiftyWeek(
+    [
+      { label: "17Nov2026", api: "17" },
+      { label: "24Nov2026", api: "24" },
+    ],
+    { year: 2026, month: 11, day: 16 },
+  );
+  if (mondayLater?.trade.label !== "24Nov2026") throw new Error("Monday 16 Nov 2026 skips 17Nov2026");
+  const expiryDay = pickNiftyWeek(
+    [
+      { label: "17Nov2026", api: "17" },
+      { label: "24Nov2026", api: "24" },
+    ],
+    { year: 2026, month: 11, day: 17 },
+  );
+  if (expiryDay?.trade.label !== "24Nov2026") throw new Error("Tuesday 17 Nov 2026 skips 17Nov2026");
+  if (pickNiftyWeek([{ label: "17Nov2026", api: "17" }], { year: 2026, month: 11, day: 17 }) !== null) {
+    throw new Error("no Tuesday after today means no entry");
+  }
+  if (pickNiftyWeek([{ label: "13Nov2026", api: "13" }], { year: 2026, month: 11, day: 11 }) !== null) {
+    throw new Error("a Friday label is not the Tuesday");
+  }
 
-  const plan = pairFillPlan({ filledQty: 650, fillPx: 98 }, { filledQty: 650, fillPx: 101 });
+  if (fillCounts(4.55, 108) || fillCounts(4.05, 108)) throw new Error("4.55 against 108 is not a fill");
+  if (!fillCounts(108.4, 108) || !fillCounts(81, 108) || fillCounts(80, 108)) {
+    throw new Error("fill must sit within max(1, 25 percent) of the live rate");
+  }
+  const plan = pairFillPlan(
+    { filledQty: 650, fillPx: 98, rate: 100 },
+    { filledQty: 650, fillPx: 101, rate: 100 },
+  );
   if (plan.type !== "book" || plan.cePx !== 98) throw new Error("a fill under min stays the sold price");
-  if (pairFillPlan({ filledQty: 650, fillPx: 100 }, { filledQty: 0, fillPx: null }).type !== "unwind") {
-    throw new Error("one side unwinds");
-  }
-  if (pairFillPlan({ filledQty: 650, fillPx: null }, { filledQty: 650, fillPx: 100 }).type !== "unwind-both") {
-    throw new Error("no average price is not a booked fill");
-  }
+  const oneSide = pairFillPlan(
+    { filledQty: 650, fillPx: 100, rate: 100 },
+    { filledQty: 0, fillPx: null, rate: 100 },
+  );
+  if (oneSide.type !== "unwind" || oneSide.side !== "CE") throw new Error("one side at its own rate is bought back");
+  const missingPx = pairFillPlan(
+    { filledQty: 650, fillPx: null, rate: 100 },
+    { filledQty: 650, fillPx: 100, rate: 100 },
+  );
+  if (missingPx.type !== "unwind" || missingPx.side !== "PE") throw new Error("no average price is not a booked fill");
+  const sensex = pairFillPlan(
+    { filledQty: 650, fillPx: 4.55, rate: 108 },
+    { filledQty: 650, fillPx: 4.05, rate: 108 },
+  );
+  if (sensex.type !== "none") throw new Error("a SENSEX fill is not booked and is not bought back");
+  const mixed = pairFillPlan(
+    { filledQty: 650, fillPx: 108.4, rate: 108 },
+    { filledQty: 650, fillPx: 4.55, rate: 102 },
+  );
+  if (mixed.type !== "unwind" || mixed.side !== "CE") throw new Error("only the leg at its own rate is bought back");
 
   const round = netPnl(1300, [
     { side: "SELL", premium: 100, qty: 65 },

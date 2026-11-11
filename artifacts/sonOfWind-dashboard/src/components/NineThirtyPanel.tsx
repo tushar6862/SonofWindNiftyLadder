@@ -10,8 +10,7 @@ import {
   ixOrderPricing,
   ixOrderRejectedMessage,
   orderLooksFilled,
-  orderTradedQty,
-  xtsOrderFillPx,
+  xtsOwnOrderFill,
   XTS_IX_ORDER_BASE,
 } from "@/lib/xtsOrder";
 import { toast } from "@/hooks/use-toast";
@@ -19,6 +18,7 @@ import type { IndexName } from "@/pages/Dashboard";
 import {
   chargeBreakup,
   clockMinutes,
+  cutoffFromStart,
   dayLine,
   dayMtm,
   defaultN930Params,
@@ -26,6 +26,7 @@ import {
   entryWindow,
   eodDue,
   expiryDayKey,
+  fillCounts,
   formatHm,
   goodPremium,
   istClock,
@@ -84,6 +85,15 @@ type NakedLeg = { side: N930Side; strike: number; iid: number; segment: number; 
 
 type Quote = { strike: number; iid: number; ltp: number };
 
+type OrderSent = {
+  filledQty: number;
+  fillPx: number | null;
+  rate: number | null;
+  counted: boolean;
+  foreign: boolean;
+  error: string | null;
+};
+
 type SessionStore = {
   sessionDate: string;
   params: N930Params;
@@ -92,8 +102,7 @@ type SessionStore = {
   realized: number;
   entered: boolean;
   squared: boolean;
-  armed: boolean;
-  live: boolean;
+  started: boolean;
   logs: N930Log[];
   logId: number;
 };
@@ -107,11 +116,14 @@ function emptyStore(today: string, params = defaultN930Params()): SessionStore {
     realized: 0,
     entered: false,
     squared: false,
-    armed: false,
-    live: false,
+    started: false,
     logs: [],
     logId: 1,
   };
+}
+
+function fmtStrike(strike: number): string {
+  return Math.round(strike).toLocaleString("en-IN");
 }
 
 function readLegs(raw: unknown): BookLeg[] {
@@ -170,6 +182,8 @@ function loadStore(): SessionStore {
     const parsed = JSON.parse(raw) as Partial<SessionStore>;
     const params = readN930Params(parsed.params);
     if (parsed.sessionDate !== today) return emptyStore(today, params);
+    const legacy = parsed as Partial<SessionStore> & { armed?: boolean; live?: boolean };
+    const started = legacy.started === true || (legacy.started == null && legacy.armed === true && legacy.live === true);
     const logs = Array.isArray(parsed.logs)
       ? parsed.logs.filter(
           (row): row is N930Log =>
@@ -184,8 +198,7 @@ function loadStore(): SessionStore {
       realized: Number(parsed.realized) || 0,
       entered: parsed.entered === true,
       squared: parsed.squared === true,
-      armed: parsed.armed === true,
-      live: parsed.live === true,
+      started,
       logs: logs.slice(0, 80),
       logId: logs.reduce((max, row) => Math.max(max, row.id), 0) + 1,
     };
@@ -209,7 +222,7 @@ function FyersPx({ iid }: { iid: number }) {
     const paint = () => {
       const node = ref.current;
       if (!node) return;
-      const px = goodPremium(peekFyersWsLtp(iid));
+      const px = livePremium(iid);
       node.textContent = px == null ? "—" : px.toFixed(2);
     };
     paint();
@@ -250,7 +263,7 @@ function snapOf(leg: BookLeg): N930LegSnap {
     open: leg.open,
     sold: leg.sold,
     qty: leg.qty,
-    ltp: leg.open ? goodPremium(peekFyersWsLtp(leg.iid)) : null,
+    ltp: leg.open ? livePremium(leg.iid) : null,
     slPx: leg.slPx,
     slOn: leg.open && leg.slOn,
     lockArmed: leg.lockArmed,
@@ -277,8 +290,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   const [realized, setRealized] = useState(initial.realized);
   const [entered, setEntered] = useState(initial.entered);
   const [squared, setSquared] = useState(initial.squared);
-  const [armed, setArmed] = useState(initial.armed);
-  const [live, setLive] = useState(initial.live);
+  const [started, setStarted] = useState(initial.started);
   const [logs, setLogs] = useState<N930Log[]>(initial.logs);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState<{ date: string; pick: WeekPick; trade: ChainResolved; other: ChainResolved | null } | null>(null);
@@ -292,8 +304,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   const realizedRef = useRef(realized);
   const enteredRef = useRef(entered);
   const squaredRef = useRef(squared);
-  const armedRef = useRef(armed);
-  const liveRef = useRef(live);
+  const startedRef = useRef(started);
   const loadedRef = useRef(loaded);
   const indexRef = useRef(index);
   const activeRef = useRef(active);
@@ -311,8 +322,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   realizedRef.current = realized;
   enteredRef.current = entered;
   squaredRef.current = squared;
-  armedRef.current = armed;
-  liveRef.current = live;
+  startedRef.current = started;
   loadedRef.current = loaded;
   indexRef.current = index;
   activeRef.current = active;
@@ -345,8 +355,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       realized,
       entered,
       squared,
-      armed,
-      live,
+      started,
       logs,
       logId: logIdRef.current,
     };
@@ -355,7 +364,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     } catch {
       /* ignore quota */
     }
-  }, [params, legs, fills, realized, entered, squared, armed, live, logs]);
+  }, [params, legs, fills, realized, entered, squared, started, logs]);
 
   useEffect(() => {
     if (index !== "NIFTY") return;
@@ -365,7 +374,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       const rules = paramsRef.current;
       const mins = clockMinutes(clock);
       const open = legsRef.current.some((leg) => leg.open) || nakedRef.current.length > 0;
-      const watching = activeRef.current || warmupDue(mins, rules) || open || enteredRef.current;
+      const watching = activeRef.current || startedRef.current || warmupDue(mins, rules) || open || enteredRef.current;
       if (!watching) return;
       const have = loadedRef.current;
       if (have && have.date === clock.date) return;
@@ -381,7 +390,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         }
         const pick = pickNiftyWeek(exp.expiries, clock);
         if (!pick) {
-          setChainNote("No weekly expiry from today. No strikes.");
+          setChainNote("No Tuesday remains. No entry.");
           return;
         }
         const resolveOne = async (row: N930ExpiryPick, wings: number) =>
@@ -442,6 +451,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     const book = loaded;
     const keepChains =
       active ||
+      started ||
       warmupDue(focusMinute, params) ||
       entryWindow(focusMinute, params) ||
       legs.some((leg) => leg.open) ||
@@ -459,7 +469,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       cancelled = true;
       setHotFocus("930", []);
     };
-  }, [index, active, loaded, legs, params, focusMinute]);
+  }, [index, active, started, loaded, legs, params, focusMinute]);
 
   const sendOrder = useCallback(
     async (
@@ -467,19 +477,25 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       instrumentId: number,
       orderQuantity: number,
       segment: number,
-    ): Promise<{ filledQty: number; fillPx: number | null; error: string | null }> => {
-      const ltp = goodPremium(peekFyersWsLtp(instrumentId));
-      if (ltp == null) return { filledQty: 0, fillPx: null, error: "No Fyers print. Order not sent." };
-      if (orderSide === "SELL" && ltp < paramsRef.current.minPremium) {
-        return { filledQty: 0, fillPx: null, error: "Quote under min. Order not sent." };
-      }
+    ): Promise<OrderSent> => {
+      const rate = livePremium(instrumentId);
+      const blank = (error: string): OrderSent => ({
+        filledQty: 0,
+        fillPx: null,
+        rate,
+        counted: false,
+        foreign: false,
+        error,
+      });
+      if (rate == null) return blank("No tick. Order not sent.");
+      if (orderSide === "SELL" && rate < paramsRef.current.minPremium) return blank("Quote under min. Order not sent.");
       let response: { ok?: boolean; error?: string; raw?: unknown } | null = null;
       try {
         response = (await apiFetch("/api/ix/place_order", {
           method: "POST",
           body: JSON.stringify({
             ...XTS_IX_ORDER_BASE,
-            ...ixOrderPricing(orderSide, ltp),
+            ...ixOrderPricing(orderSide, rate),
             exchangeSegment: segment,
             exchangeInstrumentID: instrumentId,
             orderSide,
@@ -489,21 +505,24 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         })) as { ok?: boolean; error?: string; raw?: unknown };
       } catch (err: unknown) {
         bumpPositionsRefresh();
-        return { filledQty: 0, fillPx: null, error: err instanceof Error ? err.message : String(err) };
+        return blank(err instanceof Error ? err.message : String(err));
       }
       bumpPositionsRefresh();
       const raw = response?.raw ?? response;
-      const filledQty = orderLooksFilled(raw) ? orderTradedQty(raw, orderQuantity) : 0;
-      const fillPx = filledQty > 0 ? xtsOrderFillPx(raw) : null;
-      if (!(filledQty > 0) || fillPx == null) {
-        const rejected = ixOrderRejectedMessage(raw) || ixOrderRejectedMessage(response) || response?.error;
-        return {
-          filledQty,
-          fillPx: null,
-          error: rejected || (filledQty > 0 ? "No average traded price. Not booked." : "Order not filled"),
-        };
+      const own = xtsOwnOrderFill(raw, instrumentId);
+      const rejected = ixOrderRejectedMessage(raw) || ixOrderRejectedMessage(response) || response?.error || null;
+      if (own && fillCounts(own.px, rate)) {
+        return { filledQty: own.qty, fillPx: own.px, rate, counted: true, foreign: false, error: null };
       }
-      return { filledQty, fillPx, error: null };
+      const foreign = (own != null && !fillCounts(own.px, rate)) || (own == null && orderLooksFilled(raw) && !rejected);
+      return {
+        filledQty: 0,
+        fillPx: own?.px ?? null,
+        rate,
+        counted: false,
+        foreign,
+        error: rejected || (foreign ? "Not booked" : "Order not filled"),
+      };
     },
     [],
   );
@@ -528,9 +547,13 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       const fillRows = fillsRef.current.slice();
       let failed = false;
       for (const { leg, sent } of results) {
-        if (!(sent.filledQty > 0) || sent.fillPx == null) {
+        const rate = sent.rate ?? livePremium(leg.iid);
+        if (!sent.counted || sent.fillPx == null) {
           failed = true;
-          note(`cover-${leg.iid}`, `${reason} ${leg.side} ${leg.strike} not covered. ${sent.error || "No fill."}`, "error");
+          pushLog(
+            `Not booked. ${leg.side} ${fmtStrike(leg.strike)} rate ${rate == null ? "—" : fmtPrice(rate)}.`,
+            "error",
+          );
           continue;
         }
         const qty = Math.min(sent.filledQty, leg.qty);
@@ -560,10 +583,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
               }
             : row,
         );
-        pushLog(
-          `${reason}: BUY ${leg.strike} ${leg.side} × ${fmtQty(qty)} @ ${fmtPrice(sent.fillPx)} · sold ${fmtPrice(leg.sold)}`,
-          "exit",
-        );
+        pushLog(`${reason} BUY ${leg.side} ${fmtStrike(leg.strike)} rate ${fmtPrice(rate ?? sent.fillPx)}`, "exit");
       }
       realizedRef.current = realizedNow;
       setRealized(realizedNow);
@@ -579,7 +599,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       if (failed) backoffRef.current = Date.now() + EXIT_BACKOFF_MS;
       return !failed;
     },
-    [commitLegs, note, pushLog, sendOrder],
+    [commitLegs, pushLog, sendOrder],
   );
 
   const engineRef = useRef<() => Promise<void>>(async () => {});
@@ -593,22 +613,20 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       sessionDateRef.current = clock.date;
       enteredRef.current = false;
       squaredRef.current = false;
-      armedRef.current = false;
-      liveRef.current = false;
+      startedRef.current = false;
       legsRef.current = [];
       fillsRef.current = [];
       realizedRef.current = 0;
       nakedRef.current = [];
       setEntered(false);
       setSquared(false);
-      setArmed(false);
-      setLive(false);
+      setStarted(false);
       commitLegs([]);
       setFills([]);
       setRealized(0);
       loadedRef.current = null;
       setLoaded(null);
-      pushLog("New session. 9:30 is disarmed.", "info");
+      pushLog("New session. START is off.", "info");
       return;
     }
 
@@ -617,23 +635,47 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       const rules = paramsRef.current;
       const mins = clockMinutes(clock);
       const book = loadedRef.current;
+      if (!startedRef.current) {
+        const open = legsRef.current.filter((leg) => leg.open);
+        if (!open.length && !nakedRef.current.length) return;
+        if (Date.now() < backoffRef.current) return;
+        busyRef.current = true;
+        setBusy(true);
+        if (open.length) await coverLegs(open, "STOP", "square");
+        const left: NakedLeg[] = [];
+        for (const naked of nakedRef.current) {
+          const sent = await sendOrder("BUY", naked.iid, naked.qty, naked.segment);
+          if (sent.counted && sent.fillPx != null) {
+            clearLocalPosition(naked.iid);
+            pushLog(`STOP BUY ${naked.side} ${fmtStrike(naked.strike)} rate ${fmtPrice(sent.rate ?? sent.fillPx)}`, "exit");
+          } else {
+            left.push(naked);
+            pushLog(
+              `Not booked. ${naked.side} ${fmtStrike(naked.strike)} rate ${sent.rate == null ? "—" : fmtPrice(sent.rate)}.`,
+              "error",
+            );
+          }
+        }
+        nakedRef.current = left;
+        if (left.length || legsRef.current.some((leg) => leg.open)) backoffRef.current = Date.now() + EXIT_BACKOFF_MS;
+        return;
+      }
       if (nakedRef.current.length) {
         if (Date.now() < backoffRef.current) return;
-        if (!(armedRef.current && liveRef.current)) {
-          note("naked", "A one-sided fill still needs a cover. ARM and LIVE are off. No order.", "error");
-          return;
-        }
         busyRef.current = true;
         setBusy(true);
         const left: NakedLeg[] = [];
         for (const naked of nakedRef.current) {
           const sent = await sendOrder("BUY", naked.iid, naked.qty, naked.segment);
-          if (sent.filledQty > 0 && sent.fillPx != null) {
+          if (sent.counted && sent.fillPx != null) {
             clearLocalPosition(naked.iid);
-            pushLog(`Unwound one-sided ${naked.side} ${naked.strike} @ ${fmtPrice(sent.fillPx)}. Pair was not booked.`, "exit");
+            pushLog(`BUY ${naked.side} ${fmtStrike(naked.strike)} rate ${fmtPrice(sent.rate ?? sent.fillPx)}`, "exit");
           } else {
             left.push(naked);
-            note("naked", `Unwind ${naked.side} failed. ${sent.error || "No fill."}`, "error");
+            pushLog(
+              `Not booked. ${naked.side} ${fmtStrike(naked.strike)} rate ${sent.rate == null ? "—" : fmtPrice(sent.rate)}.`,
+              "error",
+            );
           }
         }
         nakedRef.current = left;
@@ -673,7 +715,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         }
       }
       const orders = actions.filter((row) => row.type !== "PARTNER" && row.type !== "ARM_LOCK");
-      const punch = armedRef.current && liveRef.current;
 
       if (!orders.length) return;
       const first = orders[0]!;
@@ -688,18 +729,10 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           note("pick", `No ${rules.minPremium} premium on both sides of ${book.pick.trade.label}. No order.`, "info");
           return;
         }
-        const ceNow = goodPremium(peekFyersWsLtp(ce.iid));
-        const peNow = goodPremium(peekFyersWsLtp(pe.iid));
+        const ceNow = livePremium(ce.iid);
+        const peNow = livePremium(pe.iid);
         if (ceNow == null || peNow == null || ceNow < rules.minPremium || peNow < rules.minPremium) {
           note("pick", "Quote fell under min before send. Pair not sent.", "info");
-          return;
-        }
-        if (!punch) {
-          note(
-            "dry-entry",
-            `DRY-RUN SELL ${book.pick.trade.label} CE ${ce.strike} @ ${fmtPrice(ceNow)} and PE ${pe.strike} @ ${fmtPrice(peNow)}. No order.`,
-            "info",
-          );
           return;
         }
         if (Date.now() < backoffRef.current) return;
@@ -711,7 +744,15 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           sendOrder("SELL", ce.iid, qty, segment),
           sendOrder("SELL", pe.iid, qty, segment),
         ]);
-        const plan = pairFillPlan(ceSent, peSent);
+        const plan = pairFillPlan(
+          { filledQty: ceSent.counted ? ceSent.filledQty : 0, fillPx: ceSent.counted ? ceSent.fillPx : null, rate: ceSent.rate ?? ceNow },
+          { filledQty: peSent.counted ? peSent.filledQty : 0, fillPx: peSent.counted ? peSent.fillPx : null, rate: peSent.rate ?? peNow },
+        );
+        if (ceSent.foreign || peSent.foreign) {
+          pushLog(`Not booked. CE ${fmtStrike(ce.strike)} rate ${fmtPrice(ceNow)}. PE ${fmtStrike(pe.strike)} rate ${fmtPrice(peNow)}.`, "error");
+          backoffRef.current = Date.now() + ENTRY_BACKOFF_MS;
+          if (plan.type === "none") return;
+        }
         if (plan.type === "book") {
           const expiry = book.trade.expiryUi || book.pick.trade.label;
           const booked: BookLeg[] = [
@@ -757,39 +798,39 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           setEntered(true);
           commitLegs(booked);
           for (const leg of booked) remember(leg, expiry);
-          pushLog(
-            `SELL ${expiry} CE ${ce.strike} @ ${fmtPrice(plan.cePx)} and PE ${pe.strike} @ ${fmtPrice(plan.pePx)}. SL from the fill.`,
-            "entry",
-          );
+          pushLog(`SELL CE ${fmtStrike(ce.strike)} rate ${fmtPrice(ceNow)}`, "entry");
+          pushLog(`SELL PE ${fmtStrike(pe.strike)} rate ${fmtPrice(peNow)}`, "entry");
           toast({ title: "9:30 sold", description: `CE ${ce.strike} and PE ${pe.strike}` });
           return;
         }
-        const unwind = async (side: N930Side, iid: number, strike: number, qtyFilled: number) => {
+        const unwind = async (side: N930Side, iid: number, strike: number, qtyFilled: number, sold: number, rate: number) => {
+          pushLog(`SELL ${side} ${fmtStrike(strike)} rate ${fmtPrice(rate)}`, "entry");
           const sent = await sendOrder("BUY", iid, qtyFilled, segment);
-          if (sent.filledQty > 0 && sent.fillPx != null) {
+          if (sent.counted && sent.fillPx != null) {
             clearLocalPosition(iid);
-            pushLog(`Unwound one-sided ${side} ${strike} @ ${fmtPrice(sent.fillPx)}. Pair was not booked.`, "exit");
-            return true;
+            pushLog(`BUY ${side} ${fmtStrike(strike)} rate ${fmtPrice(sent.rate ?? rate)}`, "exit");
+            return;
           }
           nakedRef.current = [...nakedRef.current, { side, strike, iid, segment, qty: qtyFilled }];
           setLocalShortPosition({
             exchangeInstrumentID: iid,
             exchangeSegment: segment,
             qty: qtyFilled,
-            fillPx: side === "CE" ? ceSent.fillPx || ceNow : peSent.fillPx || peNow,
+            fillPx: sold,
             tradingSymbol: `NIFTY ${strike} ${side}`,
           });
-          note("naked", `One-sided ${side} fill. Unwind failed. ${sent.error || "No fill."}`, "error");
-          return false;
+          pushLog(`Not booked. ${side} ${fmtStrike(strike)} rate ${sent.rate == null ? fmtPrice(rate) : fmtPrice(sent.rate)}.`, "error");
         };
-        if (plan.type === "unwind" && plan.side === "CE" && ceSent.filledQty > 0) await unwind("CE", ce.iid, ce.strike, ceSent.filledQty);
-        else if (plan.type === "unwind" && plan.side === "PE" && peSent.filledQty > 0) await unwind("PE", pe.iid, pe.strike, peSent.filledQty);
-        else if (plan.type === "unwind-both") {
-          if (ceSent.filledQty > 0) await unwind("CE", ce.iid, ce.strike, ceSent.filledQty);
-          if (peSent.filledQty > 0) await unwind("PE", pe.iid, pe.strike, peSent.filledQty);
-        } else {
+        if (plan.type === "unwind" && plan.side === "CE" && ceSent.counted && ceSent.fillPx != null) {
+          await unwind("CE", ce.iid, ce.strike, ceSent.filledQty, ceSent.fillPx, ceNow);
+          backoffRef.current = Date.now() + (nakedRef.current.length ? EXIT_BACKOFF_MS : ENTRY_BACKOFF_MS);
+        } else if (plan.type === "unwind" && plan.side === "PE" && peSent.counted && peSent.fillPx != null) {
+          await unwind("PE", pe.iid, pe.strike, peSent.filledQty, peSent.fillPx, peNow);
+          backoffRef.current = Date.now() + (nakedRef.current.length ? EXIT_BACKOFF_MS : ENTRY_BACKOFF_MS);
+        } else if (!ceSent.foreign && !peSent.foreign) {
           backoffRef.current = Date.now() + ENTRY_BACKOFF_MS;
-          note("entry-fail", `Pair not filled. ${ceSent.error || peSent.error || "Rejected."} Next try in 15s.`, "error");
+          const why = ceSent.error || peSent.error || "Rejected.";
+          pushLog(`${why} Not a position.`, "error");
         }
         return;
       }
@@ -811,10 +852,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
             ? `SL ${rules.slPct}%`
             : "Leftover";
       const kind: ClosedBy = first.type === "SL" ? "sl" : first.type === "LEFTOVER" ? "leftover" : "square";
-      if (!punch) {
-        note("dry-exit", `DRY-RUN ${reason}. No order.`, "info");
-        return;
-      }
       if (Date.now() < backoffRef.current) return;
       busyRef.current = true;
       setBusy(true);
@@ -857,35 +894,80 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     toast({ title: "9:30 parameters", description: "Saved. The live card uses this save." });
   };
 
-  const arm = () => {
-    if (busyRef.current) return;
-    const next = !armedRef.current;
-    armedRef.current = next;
-    setArmed(next);
-    pushLog(next ? "9:30 armed. Orders still need LIVE." : "9:30 disarmed. No new order.", "info");
+  const bookIsFlat = () => !legsRef.current.some((leg) => leg.open) && nakedRef.current.length === 0;
+  const bookWasUsed = () =>
+    enteredRef.current || squaredRef.current || legsRef.current.length > 0 || fillsRef.current.length > 0;
+
+  const clearBook = () => {
+    enteredRef.current = false;
+    squaredRef.current = false;
+    legsRef.current = [];
+    fillsRef.current = [];
+    realizedRef.current = 0;
+    nakedRef.current = [];
+    setEntered(false);
+    setSquared(false);
+    commitLegs([]);
+    setFills([]);
+    setRealized(0);
   };
 
-  const toggleLive = () => {
+  const startDesk = () => {
     if (busyRef.current) return;
-    const next = !liveRef.current;
-    liveRef.current = next;
-    setLive(next);
-    pushLog(next ? "LIVE on for 9:30 only." : "LIVE off. 9:30 will not send an order.", "info");
+    if (!bookIsFlat()) {
+      if (!startedRef.current) {
+        startedRef.current = true;
+        setStarted(true);
+        pushLog("START. The open short stays. No second sell.", "info");
+      }
+      return;
+    }
+    const cleared = bookWasUsed();
+    if (cleared) clearBook();
+    const was = startedRef.current;
+    startedRef.current = true;
+    setStarted(true);
+    if (was && !cleared) return;
+    const mins = clockMinutes(istClock());
+    const rules = paramsRef.current;
+    const when =
+      mins < rules.startMin
+        ? `Waiting for ${formatHm(rules.startMin)}.`
+        : entryWindow(mins, rules)
+          ? "Selling on the next tick."
+          : `Past ${formatHm(rules.cutoffMin)}. No new sell.`;
+    pushLog(cleared ? `START. Old book cleared. ${when}` : `START. ${when}`, "info");
   };
 
   const stop = async () => {
     if (busyRef.current) return;
-    armedRef.current = false;
-    setArmed(false);
+    startedRef.current = false;
+    setStarted(false);
     const open = legsRef.current.filter((leg) => leg.open);
-    if (!open.length) {
-      pushLog("STOP. Flat. 9:30 is disarmed.", "info");
+    const naked = nakedRef.current.slice();
+    if (!open.length && !naked.length) {
+      pushLog("STOP. No new sell.", "info");
       return;
     }
     busyRef.current = true;
     setBusy(true);
     try {
-      await coverLegs(open, "STOP", "square");
+      if (open.length) await coverLegs(open, "STOP", "square");
+      const left: NakedLeg[] = [];
+      for (const row of nakedRef.current) {
+        const sent = await sendOrder("BUY", row.iid, row.qty, row.segment);
+        if (sent.counted && sent.fillPx != null) {
+          clearLocalPosition(row.iid);
+          pushLog(`STOP BUY ${row.side} ${fmtStrike(row.strike)} rate ${fmtPrice(sent.rate ?? sent.fillPx)}`, "exit");
+        } else {
+          left.push(row);
+          pushLog(
+            `Not booked. ${row.side} ${fmtStrike(row.strike)} rate ${sent.rate == null ? "—" : fmtPrice(sent.rate)}.`,
+            "error",
+          );
+        }
+      }
+      nakedRef.current = left;
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -900,8 +982,8 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   const peOpen = legs.find((leg) => leg.side === "PE" && leg.open) ?? null;
   const ceWatch = !ceOpen && loaded ? pickCheapest(quotesFor(loaded.trade, "CE"), rules.minPremium) : null;
   const peWatch = !peOpen && loaded ? pickCheapest(quotesFor(loaded.trade, "PE"), rules.minPremium) : null;
-  const deskMode = armed && live ? "LIVE" : "DRY";
-  const deskState = !armed ? "Disarmed" : live ? "Armed" : "Armed · dry-run";
+  const deskMode = started ? "START" : "STOP";
+  const deskState = started ? "One sell at the saved time" : "No new sell";
   const mark = dayMtm(snaps, realized);
   const gross = mark.mtm;
   const money = netPnl(gross, fills);
@@ -921,21 +1003,19 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   const status =
     index !== "NIFTY"
       ? "Select NIFTY. This desk does not trade another index."
-      : !armed
-        ? "Disarmed. No order until 9:30 is armed and LIVE is on."
-        : !live
-          ? "Armed. LIVE is off, so this is a dry-run."
-          : squared
-            ? "Done for today. No resell."
-            : legs.some((leg) => leg.open)
-              ? "Pair is open. The card is display-only."
-              : !warmupDue(mins, rules)
-                ? `Warmup starts at ${formatHm(rules.startMin - N930.warmupMin)}.`
-                : !loaded
-                  ? chainNote || "Subscribing this week and next week."
-                  : !entryWindow(mins, rules)
-                    ? `Waiting for ${formatHm(rules.startMin)}. Cutoff ${formatHm(rules.cutoffMin)}.`
-                    : `${loaded.pick.trade.label} CE and PE sell together on the next good tick.`;
+      : !started
+        ? "Stopped. No new sell."
+        : legs.some((leg) => leg.open)
+          ? "Short is open. STOP buys both legs back."
+          : entered || squared
+            ? "This START is used. Press START to clear the old book."
+            : !loaded
+              ? chainNote || "Resolving the Tuesday chain."
+              : !entryWindow(mins, rules)
+                ? mins < rules.startMin
+                  ? `Waiting for ${formatHm(rules.startMin)}. Cutoff ${formatHm(rules.cutoffMin)}.`
+                  : `Past ${formatHm(rules.cutoffMin)}. No new sell.`
+                : `${loaded.pick.trade.label} CE and PE sell together on the next tick.`;
 
   return (
     <div className="flex flex-1 min-h-0 min-w-0 flex-col overflow-hidden text-[13px] ramsetu-glass-panel">
@@ -1002,11 +1082,8 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         <div className="cd-trade">
           <p className="cd-trade__status">{status}</p>
           <div className="cd-trade__actions">
-            <button type="button" disabled={busy} onClick={arm} className="ramsetu-glass-exec">
-              {armed ? "ARMED" : "START"}
-            </button>
-            <button type="button" disabled={busy} onClick={toggleLive} className="ramsetu-glass-exec">
-              {live ? "LIVE ON" : "LIVE"}
+            <button type="button" disabled={busy} onClick={startDesk} className="ramsetu-glass-exec" aria-pressed={started}>
+              START
             </button>
             <button type="button" disabled={busy} onClick={() => void stop()} className="ramsetu-glass-stop nv-stop">
               STOP
@@ -1017,13 +1094,22 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         <div className="cd-params">
           <div className="cd-params__grid">
             <Field label="Start">
-              <input aria-label="Start" value={draft.start} onChange={(e) => setDraft((row) => ({ ...row, start: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
+              <input
+                aria-label="Start"
+                value={draft.start}
+                onChange={(e) => {
+                  const start = e.target.value;
+                  const cutoff = cutoffFromStart(start);
+                  setDraft((row) => ({ ...row, start, ...(cutoff ? { cutoff } : {}) }));
+                }}
+                className="ramsetu-glass-select cd-field__control"
+              />
             </Field>
             <Field label="Cutoff">
               <input aria-label="Cutoff" value={draft.cutoff} onChange={(e) => setDraft((row) => ({ ...row, cutoff: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
             </Field>
-            <Field label="Square-off">
-              <input aria-label="Square-off" value={draft.eod} onChange={(e) => setDraft((row) => ({ ...row, eod: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
+            <Field label="EOD">
+              <input aria-label="EOD" value={draft.eod} onChange={(e) => setDraft((row) => ({ ...row, eod: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
             </Field>
             <Field label="Lots">
               <input aria-label="Lots" inputMode="numeric" value={draft.lots} onChange={(e) => setDraft((row) => ({ ...row, lots: e.target.value.replace(/[^\d]/g, "").slice(0, 2) }))} className="ramsetu-glass-select cd-field__control" />
@@ -1095,11 +1181,11 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                NIFTY weekly, lot 65, step 50. Wed–Fri sell the nearest Tuesday. Mon–Tue skip that Tuesday and sell the next one.
-                Both legs use that expiry. Each side is the cheapest Fyers print at or above the saved min. A print under the min is skipped.
-                CE and PE sell together. One fill is unwound. After a stop that strike is done. Both open legs keep the saved SL and no trail.
-                After one stop, the other stop tightens to the partner percent and the leftover ladder can lock. Day + and Day − use the saved
-                rupees per lot. Orders go out only when this desk is armed and LIVE is on.
+                NIFTY weekly, lot 65, step 50. START and STOP only. Wed–Fri sell the nearest Tuesday. Mon–Tue skip that Tuesday and sell the next one.
+                Both legs use that expiry. Each side is the cheapest tick at or above the saved min. Equal rates keep the lower strike.
+                CE and PE sell together. A fill counts only when it is this strike's own price. One real leg is bought back. After a stop that
+                strike is done. Both open legs keep the saved SL. After one stop, the other stop tightens and the leftover ladder can lock.
+                Day + and Day − use the saved rupees per lot. Orders go out only while START is on.
               </p>
             ) : (
               <ul className="space-y-1.5">

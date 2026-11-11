@@ -245,3 +245,34 @@ export function xtsOrderFillPx(raw: unknown): number | null {
   }
   return null;
 }
+
+function rowInstrumentId(row: Record<string, unknown>): number | null {
+  const raw =
+    row.ExchangeInstrumentID ?? row.ExchangeInstrumentId ?? row.exchangeInstrumentID ?? row.exchangeInstrumentId;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+}
+
+/**
+ * Fill from this order's own row for this ExchangeInstrumentID.
+ * Another row in the book, including a different contract, is not this fill.
+ * A single place-ack with no instrument id is this order. Several untagged rows are not.
+ */
+export function xtsOwnOrderFill(raw: unknown, instrumentId: number): { qty: number; px: number } | null {
+  if (!(instrumentId > 0)) return null;
+  const rows = orderRowsFromPlaceRaw(raw);
+  if (!rows.length) return null;
+  const ids = rows.map(rowInstrumentId);
+  const tagged = ids.some((id) => id != null);
+  const mine = tagged
+    ? rows.filter((_, i) => ids[i] === instrumentId)
+    : rows.length === 1
+      ? rows
+      : [];
+  if (!mine.length) return null;
+  const wrapped = { result: mine.length === 1 ? mine[0] : mine };
+  const qty = orderTradedQty(wrapped);
+  const px = xtsOrderFillPx(wrapped);
+  if (!(qty > 0) || px == null || !(px > 0)) return null;
+  return { qty, px };
+}
