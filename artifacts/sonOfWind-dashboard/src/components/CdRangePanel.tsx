@@ -25,6 +25,7 @@ import {
   CD_TIMEFRAMES,
   addScore,
   breakSide,
+  cdEntrySide,
   dayStopHit,
   decideCdAction,
   CD_NO_THURSDAY,
@@ -39,6 +40,7 @@ import {
   orderQty,
   parseCdParams,
   pickCdThursdayExpiry,
+  readCdMode,
   readCdParams,
   syncTrailCtc,
   scoreClose,
@@ -51,6 +53,7 @@ import {
   trailCtcPx,
   trailStopPx,
   type CdCloseKind,
+  type CdMode,
   type CdTrailStage,
   type CdExpiryPick,
   type CdParamDraft,
@@ -112,6 +115,7 @@ type SessionStore = {
   insideSeen: boolean;
   sellRetryAt: number;
   started: boolean;
+  direction: CdMode;
 };
 
 const EXPIRY_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -134,7 +138,7 @@ function chainIndexOf(chain: ChainResolved | null): IndexName | null {
   return null;
 }
 
-function emptyStore(today: string, params: CdParams = defaultCdParams()): SessionStore {
+function emptyStore(today: string, params: CdParams = defaultCdParams(), direction: CdMode = "normal"): SessionStore {
   return {
     sessionDate: today,
     lots: params.lots,
@@ -148,6 +152,7 @@ function emptyStore(today: string, params: CdParams = defaultCdParams()): Sessio
     insideSeen: false,
     sellRetryAt: 0,
     started: false,
+    direction,
   };
 }
 
@@ -203,7 +208,8 @@ function loadStore(): SessionStore {
     if (!raw) return emptyStore(today);
     const parsed = JSON.parse(raw) as Partial<SessionStore>;
     const params = readCdParams(parsed.params, parsed.lots);
-    if (parsed.sessionDate !== today) return emptyStore(today, params);
+    const direction = readCdMode(parsed.direction);
+    if (parsed.sessionDate !== today) return emptyStore(today, params, direction);
     const logs = readLogs(parsed.logs);
     const logId = logs.reduce((max, row) => Math.max(max, row.id), 0) + 1;
     const score = Number(parsed.score);
@@ -220,6 +226,7 @@ function loadStore(): SessionStore {
       insideSeen: parsed.insideSeen === true,
       sellRetryAt: Number(parsed.sellRetryAt) > 0 ? Number(parsed.sellRetryAt) : 0,
       started: parsed.started === true,
+      direction,
     };
   } catch {
     return emptyStore(today);
@@ -292,6 +299,7 @@ export default function CdRangePanel({
   const [insideSeen, setInsideSeen] = useState(boot.insideSeen);
   const [sellRetryAt, setSellRetryAt] = useState(boot.sellRetryAt);
   const [started, setStarted] = useState(boot.started);
+  const [direction, setDirection] = useState<CdMode>(boot.direction);
   const [cdChain, setCdChain] = useState<ChainResolved | null>(null);
   const [cdPick, setCdPick] = useState<CdExpiryPick | null>(null);
   const [expiryState, setExpiryState] = useState<"idle" | "loading" | "ready" | "none" | "error">("idle");
@@ -317,6 +325,7 @@ export default function CdRangePanel({
   const insideSeenRef = useRef(insideSeen);
   const sellRetryRef = useRef(sellRetryAt);
   const startedRef = useRef(started);
+  const directionRef = useRef<CdMode>(boot.direction);
   const rangeKeyRef = useRef("");
   const liveSpotRef = useRef<number | null>(null);
   const liveFutureRef = useRef<number | null>(null);
@@ -343,6 +352,7 @@ export default function CdRangePanel({
   insideSeenRef.current = insideSeen;
   sellRetryRef.current = sellRetryAt;
   startedRef.current = started;
+  directionRef.current = direction;
 
   const sensexChain = cdChain != null && chainIndexOf(cdChain) === "SENSEX" ? cdChain : null;
   const qty = orderQty(saved.lots);
@@ -378,7 +388,9 @@ export default function CdRangePanel({
   const contractLabel = (quote?.futureSymbol || "").replace(/^(NSE|BSE):/, "") || "Future";
   const entryFrom = firstEntryClock(saved.candles, saved.barMinutes);
   const side: FlipSide | null =
-    futurePx != null && high != null && low != null ? breakSide(futurePx, high, low, saved.extraBreak) : null;
+    futurePx != null && high != null && low != null
+      ? cdEntrySide(futurePx, high, low, saved.extraBreak, direction)
+      : null;
   const istDate = istClock(new Date(nowMs)).date;
   const stopped = dayStopHit(score);
   const windowOpen = entryWindowOpen(new Date(nowMs), entryFrom);
@@ -606,13 +618,14 @@ export default function CdRangePanel({
       insideSeen,
       sellRetryAt,
       started,
+      direction,
     };
     try {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify(store));
     } catch {
       /* ignore quota */
     }
-  }, [saved, position, logs, score, squared, needInside, insideSeen, sellRetryAt, started]);
+  }, [saved, position, logs, score, squared, needInside, insideSeen, sellRetryAt, started, direction]);
 
   useEffect(() => {
     if (high == null || low == null) return;
@@ -889,6 +902,7 @@ export default function CdRangePanel({
               trailArmPct: rules.trailArmPct,
               trailCtcPct: rules.trailCtcPct,
               trailLockPct: rules.trailLockPct,
+              mode: directionRef.current,
             });
             if (!action) return;
             if (action.type === "ARM_CTC" || action.type === "ARM_LOCK") {
@@ -993,11 +1007,13 @@ export default function CdRangePanel({
           if (!entryPick || !cdChainIsPick(String(chainNow.expiryApi || ""), String(chainNow.expiryUi || ""), entryPick)) return;
           if (needInsideRef.current && !insideSeenRef.current) return;
           if (Date.now() < sellRetryRef.current) return;
-          const want = breakSide(future, rangeHigh, rangeLow, rules.extraBreak);
-          if (!want) return;
+          const broke = breakSide(future, rangeHigh, rangeLow, rules.extraBreak);
+          const want = cdEntrySide(future, rangeHigh, rangeLow, rules.extraBreak, directionRef.current);
+          if (!broke || !want) return;
+          const aboveHigh = broke === "PE";
           await sellRef.current(
             want,
-            `${fmtPrice(px2(future))} ${want === "PE" ? "above HIGH" : "below LOW"} ${fmtPrice(want === "PE" ? rangeHigh : rangeLow)}`,
+            `${fmtPrice(px2(future))} ${aboveHigh ? "above HIGH" : "below LOW"} ${fmtPrice(aboveHigh ? rangeHigh : rangeLow)}`,
           );
         } finally {
           tickingRef.current = false;
@@ -1257,6 +1273,34 @@ export default function CdRangePanel({
 
         {fetchError && <p className="mt-2 text-[13px] font-semibold text-amber-500">{fetchError}</p>}
 
+        <div className="cd-mode">
+          <CdField label="Mode">
+            <select
+              aria-label="Mode"
+              value={direction}
+              onChange={(e) => {
+                const next: CdMode = e.target.value === "reverse" ? "reverse" : "normal";
+                setDirection(next);
+                pushLog(
+                  next === "reverse"
+                    ? "Mode Reverse. LOW break sells PE. HIGH break sells CE."
+                    : "Mode Normal. LOW break sells CE. HIGH break sells PE.",
+                  "info",
+                );
+              }}
+              className="ramsetu-glass-select cd-field__control"
+            >
+              <option value="normal">Normal</option>
+              <option value="reverse">Reverse</option>
+            </select>
+          </CdField>
+          <p className="cd-mode__note">
+            {direction === "reverse"
+              ? "LOW break sells PE. HIGH break sells CE."
+              : "LOW break sells CE. HIGH break sells PE."}
+          </p>
+        </div>
+
         <div className="cd-params">
           <div className="cd-params__grid">
             <CdField label="Lots">
@@ -1514,8 +1558,11 @@ export default function CdRangePanel({
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                HIGH and LOW come from the active monthly SENSEX future. After that expiry the next month's future takes over. Entry is that future's live print, not the candle close. The option strike still follows Sensex spot. Orders use the next Thursday after today. The top bar expiry is not the CD contract. The break sell goes through the live bid and trades. The booked price is the fill. Cover, target, and stop stay on the tight limit. The forming bar does not move HIGH or LOW. A minute with no trades does not move them either. Trail arm moves the stop to CTC once that profit is open. If TRAIL CTC is higher, reaching it locks TRAIL CTC minus Trail arm, so arm 4 and CTC 6 first put the stop at cost, then lock 2% profit. If TRAIL CTC is not above Trail arm, the stop stays at CTC. An opposite HIGH break
-                while short the CE covers and sells the ATM PE. A LOW break while short the PE covers and sells the ATM CE. Flips run until 14:30.
+                HIGH and LOW come from the active monthly SENSEX future. After that expiry the next month's future takes over. Entry is that future's live print, not the candle close. The option strike still follows Sensex spot. Orders use the next Thursday after today. The top bar expiry is not the CD contract. The break sell goes through the live bid and trades. The booked price is the fill. Cover, target, and stop stay on the tight limit. The forming bar does not move HIGH or LOW. A minute with no trades does not move them either. Trail arm moves the stop to CTC once that profit is open. If TRAIL CTC is higher, reaching it locks TRAIL CTC minus Trail arm, so arm 4 and CTC 6 first put the stop at cost, then lock 2% profit. If TRAIL CTC is not above Trail arm, the stop stays at CTC.{" "}
+                {direction === "reverse"
+                  ? "An opposite HIGH break while short the PE covers and sells the ATM CE. A LOW break while short the CE covers and sells the ATM PE."
+                  : "An opposite HIGH break while short the CE covers and sells the ATM PE. A LOW break while short the PE covers and sells the ATM CE."}{" "}
+                Flips run until 14:30.
                 A failed sell waits 60 seconds. A target scores +1 only when the cover fill reached 10%, with one point of slack. Sold 772.32 covered
                 766.10 scores 0. A trail scores 0. A losing opposite break scores −0.5. Any other losing exit scores −1.
               </p>

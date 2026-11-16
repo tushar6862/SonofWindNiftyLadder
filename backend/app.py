@@ -4580,9 +4580,14 @@ def api_ix_place_order():
             "apiOrderSource": api_src,
         }
         try:
-            payload = _coerce_algo_limit_order(
-                payload, body=body, side=side, iid=iid, seg=seg, username=username
-            )
+            if body.get("keepMarket") is True:
+                payload["orderType"] = "MARKET"
+                payload["limitPrice"] = 0
+                payload["stopPrice"] = 0
+            else:
+                payload = _coerce_algo_limit_order(
+                    payload, body=body, side=side, iid=iid, seg=seg, username=username
+                )
         except ValueError as ve:
             return _json_no_store({"ok": False, "error": str(ve)}, status=400)
 

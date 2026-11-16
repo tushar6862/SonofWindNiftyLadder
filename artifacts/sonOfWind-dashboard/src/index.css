@@ -3810,6 +3810,26 @@ body.sow-has-dashboard-bg {
   letter-spacing: 0.04em;
 }
 
+.cd-mode {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 16px;
+}
+
+.cd-mode .cd-field {
+  width: min(100%, 220px);
+}
+
+.cd-mode__note {
+  margin: 0;
+  padding-bottom: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: hsl(var(--foreground) / 0.7);
+}
+
 .cd-params {
   margin-top: 12px;
   display: flex;

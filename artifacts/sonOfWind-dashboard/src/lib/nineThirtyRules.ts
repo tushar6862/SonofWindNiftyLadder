@@ -1,19 +1,19 @@
 /**
  * 9:30 NIFTY weekly short strangle.
- * Clocks, lots, min, SL%, partner%, Day +, and Day − come from Save.
- * Prices are this contract's live premium. Blank, 0, and a print at or above 1000 are not prices.
- * One sell per START. A strike is finished after its own stop.
+ * Lots, Min, SL%, Partner%, Day +, and Day − come from Save.
+ * Day + and Day − are rupees per lot, then × lots. The live minimum is ₹100.
+ * Start, cutoff, and square-off are stored. The live card is immediate, so those clocks do not block.
+ * Orders are MARKET, price 0. One sell per START. A leg stop does not sell again.
  */
 
 export const N930 = {
   lotSize: 65,
   strikeStep: 50,
+  liveMin: 100,
   premiumJunkAt: 1000,
   allowResell: false,
-  warmupMin: 1,
   lotsMin: 1,
   lotsMax: 50,
-  entrySpanMin: 5,
   brokeragePerOrder: 20,
   sttSell: 0.0015,
   stampBuy: 0.00003,
@@ -23,57 +23,67 @@ export const N930 = {
   gst: 0.18,
 } as const;
 
+export const N930_MIDDAY = {
+  lots: 1,
+  dayPlusPerLot: 600,
+  dayMinusPerLot: 700,
+  from: { hour: 12, minute: 45 },
+  until: { hour: 13, minute: 0 },
+} as const;
+
 export type N930Side = "CE" | "PE";
 
+export type N930Clock = { hour: number; minute: number };
+
 export type N930Params = {
-  startMin: number;
-  cutoffMin: number;
-  eodMin: number;
   lots: number;
   minPremium: number;
   slPct: number;
   partnerPct: number;
   dayPlusPerLot: number;
   dayMinusPerLot: number;
+  start: N930Clock;
+  cutoff: N930Clock;
+  squareOff: N930Clock;
 };
 
-/** XTS book saved 9 Nov 2026. Fyers / Upstox is a different save, not this default. */
+/** Built-in save before the user saves. The live card still sells at ₹100 on the live tick. */
 export function defaultN930Params(): N930Params {
   return {
-    startMin: 9 * 60 + 36,
-    cutoffMin: 10 * 60 + 30,
-    eodMin: 15 * 60 + 14,
     lots: 10,
     minPremium: 100,
     slPct: 25,
     partnerPct: 15,
     dayPlusPerLot: 600,
     dayMinusPerLot: 700,
+    start: { hour: 9, minute: 36 },
+    cutoff: { hour: 10, minute: 30 },
+    squareOff: { hour: 15, minute: 14 },
   };
 }
 
 export const N930_FYERS_PARAMS: N930Params = {
-  startMin: 9 * 60 + 31,
-  cutoffMin: 9 * 60 + 36,
-  eodMin: 15 * 60 + 14,
   lots: 1,
   minPremium: 100,
   slPct: 25,
   partnerPct: 15,
   dayPlusPerLot: 700,
   dayMinusPerLot: 700,
+  start: { hour: 9, minute: 36 },
+  cutoff: { hour: 10, minute: 30 },
+  squareOff: { hour: 15, minute: 14 },
 };
 
 export type N930Draft = {
-  start: string;
-  cutoff: string;
-  eod: string;
   lots: string;
   minPremium: string;
   slPct: string;
   partnerPct: string;
   dayPlusPerLot: string;
   dayMinusPerLot: string;
+  start: string;
+  cutoff: string;
+  squareOff: string;
 };
 
 export type IstClock = {
@@ -97,6 +107,7 @@ export type N930LegSnap = {
   ltp: number | null;
   slPx: number;
   slOn: boolean;
+  lowPx: number | null;
   lockArmed: boolean;
   lockPct: number;
   closedBy: "sl" | "leftover" | "square" | null;
@@ -104,9 +115,10 @@ export type N930LegSnap = {
 
 export type N930Action =
   | { type: "ENTER" }
-  | { type: "SQUARE"; reason: "EOD" | "DAY_MINUS" | "DAY_PLUS" }
-  | { type: "SL"; side: N930Side }
+  | { type: "SQUARE"; reason: "DAY_MINUS" | "DAY_PLUS" }
+  | { type: "SL"; side: N930Side; via?: "partner" }
   | { type: "PARTNER"; side: N930Side; slPx: number }
+  | { type: "MARK_LOW"; side: N930Side; lowPx: number }
   | { type: "ARM_LOCK"; side: N930Side; lockPct: number }
   | { type: "LEFTOVER"; side: N930Side };
 
@@ -152,46 +164,40 @@ export function istClock(now = new Date()): IstClock {
   };
 }
 
-export function clockMinutes(clock: Pick<IstClock, "hour" | "minute">): number {
-  return clock.hour * 60 + clock.minute;
-}
-
-export function formatHm(mins: number): string {
-  const clamped = Math.max(0, Math.min(23 * 60 + 59, Math.trunc(mins)));
-  const hour = Math.floor(clamped / 60);
-  const minute = clamped % 60;
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+export function formatClock(clock: N930Clock): string {
+  return `${String(clock.hour).padStart(2, "0")}:${String(clock.minute).padStart(2, "0")}`;
 }
 
 export function draftFromParams(params: N930Params): N930Draft {
   return {
-    start: formatHm(params.startMin),
-    cutoff: formatHm(params.cutoffMin),
-    eod: formatHm(params.eodMin),
     lots: String(params.lots),
     minPremium: String(params.minPremium),
     slPct: String(params.slPct),
     partnerPct: String(params.partnerPct),
     dayPlusPerLot: String(params.dayPlusPerLot),
     dayMinusPerLot: String(params.dayMinusPerLot),
+    start: formatClock(params.start),
+    cutoff: formatClock(params.cutoff),
+    squareOff: formatClock(params.squareOff),
   };
 }
 
-function parseClock(text: string): number | null {
+function parseClock(text: string): N930Clock | null {
   const match = /^(\d{1,2}):(\d{2})$/.exec(text.trim());
   if (!match) return null;
   const hour = Number(match[1]);
   const minute = Number(match[2]);
   if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour > 23 || minute > 59) return null;
-  return hour * 60 + minute;
+  return { hour, minute };
 }
 
-/** Cutoff is this many minutes after a finished HH:MM start. An unfinished start leaves cutoff alone. */
-export function cutoffFromStart(startText: string, spanMin = N930.entrySpanMin): string | null {
-  const startMin = parseClock(startText);
-  if (startMin == null) return null;
-  const span = Math.max(1, Math.trunc(spanMin));
-  return formatHm(Math.min(startMin + span, 23 * 60 + 59));
+function clockMinute(clock: N930Clock): number {
+  return clock.hour * 60 + clock.minute;
+}
+
+/** Stored clocks do not block. The live card is immediate. */
+export function clocksBlockEntry(): boolean {
+  return false;
 }
 
 function parsePositive(text: string, max: number): number | null {
@@ -203,12 +209,6 @@ function parsePositive(text: string, max: number): number | null {
 }
 
 export function parseN930Params(draft: N930Draft): { ok: true; params: N930Params } | { ok: false; error: string } {
-  const startMin = parseClock(draft.start);
-  const cutoffMin = parseClock(draft.cutoff);
-  const eodMin = parseClock(draft.eod);
-  if (startMin == null || cutoffMin == null || eodMin == null) return { ok: false, error: "Clocks must be HH:MM." };
-  if (startMin >= cutoffMin) return { ok: false, error: "Start must be before Cutoff." };
-  if (eodMin < cutoffMin) return { ok: false, error: "Square-off must be at or after Cutoff." };
   if (!/^\d+$/.test(draft.lots.trim())) return { ok: false, error: "Lots must be a whole number." };
   const lots = Number(draft.lots);
   if (!Number.isInteger(lots) || lots < N930.lotsMin || lots > N930.lotsMax) {
@@ -223,9 +223,15 @@ export function parseN930Params(draft: N930Draft): { ok: true; params: N930Param
   const dayPlusPerLot = parsePositive(draft.dayPlusPerLot, 1_000_000);
   const dayMinusPerLot = parsePositive(draft.dayMinusPerLot, 1_000_000);
   if (dayPlusPerLot == null || dayMinusPerLot == null) return { ok: false, error: "Day + and Day − must be rupees per lot." };
+  const start = parseClock(draft.start);
+  const cutoff = parseClock(draft.cutoff);
+  const squareOff = parseClock(draft.squareOff);
+  if (!start || !cutoff || !squareOff) return { ok: false, error: "Start, cutoff, and square-off must be HH:MM." };
+  if (clockMinute(start) >= clockMinute(cutoff)) return { ok: false, error: "Start must be before cutoff." };
+  if (clockMinute(squareOff) < clockMinute(cutoff)) return { ok: false, error: "Square-off must be at or after cutoff." };
   return {
     ok: true,
-    params: { startMin, cutoffMin, eodMin, lots, minPremium, slPct, partnerPct, dayPlusPerLot, dayMinusPerLot },
+    params: { lots, minPremium, slPct, partnerPct, dayPlusPerLot, dayMinusPerLot, start, cutoff, squareOff },
   };
 }
 
@@ -233,16 +239,19 @@ export function readN930Params(raw: unknown): N930Params {
   const base = defaultN930Params();
   if (!raw || typeof raw !== "object") return base;
   const row = raw as Partial<N930Params>;
+  const rawStart = row.start ?? base.start;
+  const rawCutoff = row.cutoff ?? base.cutoff;
+  const rawSquare = row.squareOff ?? base.squareOff;
   const draft: N930Draft = {
-    start: formatHm(typeof row.startMin === "number" ? row.startMin : base.startMin),
-    cutoff: formatHm(typeof row.cutoffMin === "number" ? row.cutoffMin : base.cutoffMin),
-    eod: formatHm(typeof row.eodMin === "number" ? row.eodMin : base.eodMin),
     lots: String(row.lots ?? base.lots),
     minPremium: String(row.minPremium ?? base.minPremium),
     slPct: String(row.slPct ?? base.slPct),
     partnerPct: String(row.partnerPct ?? base.partnerPct),
     dayPlusPerLot: String(row.dayPlusPerLot ?? base.dayPlusPerLot),
     dayMinusPerLot: String(row.dayMinusPerLot ?? base.dayMinusPerLot),
+    start: typeof rawStart === "string" ? rawStart : formatClock(rawStart),
+    cutoff: typeof rawCutoff === "string" ? rawCutoff : formatClock(rawCutoff),
+    squareOff: typeof rawSquare === "string" ? rawSquare : formatClock(rawSquare),
   };
   const parsed = parseN930Params(draft);
   return parsed.ok ? parsed.params : base;
@@ -252,35 +261,26 @@ export function orderQty(lots: number): number {
   return lots * N930.lotSize;
 }
 
+/** Saved rupees per lot × lots. One open leg keeps the same per-lot line. */
 export function dayLine(perLot: number, lots: number): number {
   return perLot * lots;
-}
-
-/** A live option premium. Blank, 0, and a print at or above ₹1000 are not prices. */
-export function goodPremium(px: number | null | undefined): number | null {
-  if (typeof px !== "number" || !Number.isFinite(px) || px <= 0 || px >= N930.premiumJunkAt) return null;
-  return px;
 }
 
 export function slPrice(sold: number, pct: number): number {
   return sold * (1 + pct / 100);
 }
 
-/** Partner stop never moves up. */
+/** Partner stop never loosens. */
 export function partnerSl(currentSl: number, sold: number, partnerPct: number): number {
   return Math.min(currentSl, slPrice(sold, partnerPct));
 }
 
-export function favPct(sold: number, ltp: number): number {
+export function favPct(sold: number, lowPx: number): number {
   if (!(sold > 0)) return 0;
-  return ((sold - ltp) / sold) * 100;
+  return ((sold - lowPx) / sold) * 100;
 }
 
-/**
- * Leftover lock from favorable percent. Under 25, no lock.
- * 25 locks the sell price. 30 locks 5. 35 locks 10. 40 locks 25. 45 locks 30.
- * After 45, the lock is 30 plus each extra 1 point of favorable move. The lock only tightens.
- */
+/** Best favorable fall. Under 25 there is no lock. The lock only tightens. */
 export function leftoverLockPct(fav: number): number | null {
   if (!(fav >= 25)) return null;
   if (fav >= 45) return 30 + Math.floor(fav - 45 + 1e-9);
@@ -294,6 +294,20 @@ export function lockCoverPx(sold: number, lockPct: number): number {
   return sold * (1 - lockPct / 100);
 }
 
+/** 12:45 inclusive through 12:59. 13:00 is outside. */
+export function middaySlot(clock: Pick<IstClock, "hour" | "minute">): boolean {
+  const mins = clock.hour * 60 + clock.minute;
+  const from = N930_MIDDAY.from.hour * 60 + N930_MIDDAY.from.minute;
+  const until = N930_MIDDAY.until.hour * 60 + N930_MIDDAY.until.minute;
+  return mins >= from && mins < until;
+}
+
+/** A live option premium. Blank, 0, and a print at or above ₹1000 are not prices. */
+export function goodPremium(px: number | null | undefined): number | null {
+  if (typeof px !== "number" || !Number.isFinite(px) || px <= 0 || px >= N930.premiumJunkAt) return null;
+  return px;
+}
+
 /** Cheapest live premium at or above min. A print under min is skipped. Equal rates keep the lower strike. */
 export function pickCheapest<T extends PremiumQuote>(quotes: readonly T[], minPremium: number): T | null {
   let best: T | null = null;
@@ -305,18 +319,6 @@ export function pickCheapest<T extends PremiumQuote>(quotes: readonly T[], minPr
     }
   }
   return best;
-}
-
-export function entryWindow(mins: number, params: N930Params): boolean {
-  return mins >= params.startMin && mins < params.cutoffMin;
-}
-
-export function warmupDue(mins: number, params: N930Params): boolean {
-  return mins >= params.startMin - N930.warmupMin && mins < params.cutoffMin;
-}
-
-export function eodDue(mins: number, params: N930Params): boolean {
-  return mins >= params.eodMin;
 }
 
 function civilKey(year: number, month: number, day: number): number | null {
@@ -348,110 +350,115 @@ export type WeekPick = {
 };
 
 /**
- * Tuesday labels only, on or after today. The top bar expiry is not used.
- * Wed–Fri sell the nearest Tuesday. Mon–Tue skip that nearby Tuesday and sell the next one.
- * If no Tuesday remains, there is no entry.
+ * Listed expiries on or after today. The top bar expiry is not used.
+ * Wed–Fri sell the nearest listed expiry. Mon–Tue skip that nearby expiry and sell the next one.
+ * Saturday and Sunday are not contracts. A Tuesday holiday is already the previous trading day
+ * in the broker list, so that date is the next expiry. If that expiry is not listed, there is no entry.
  */
 export function pickNiftyWeek(rows: readonly N930ExpiryPick[], clock: Pick<IstClock, "year" | "month" | "day">): WeekPick | null {
   const today = civilKey(clock.year, clock.month, clock.day);
   if (today == null) return null;
   const weekday = new Date(Date.UTC(clock.year, clock.month - 1, clock.day)).getUTCDay();
   if (weekday === 0 || weekday === 6) return null;
-  const tuesdays: { key: number; pick: N930ExpiryPick }[] = [];
+  const listed: { key: number; pick: N930ExpiryPick }[] = [];
   for (const row of rows) {
     const label = String(row?.label || "").trim();
     const api = String(row?.api || "").trim();
     if (!EXPIRY_LABEL.test(label.replace(/[\s\-_/]/g, ""))) continue;
     const key = expiryDayKey(label);
-    if (!label || !api || key == null || key < today || weekdayOfKey(key) !== 2) continue;
-    tuesdays.push({ key, pick: { label, api } });
+    if (!label || !api || key == null || key < today) continue;
+    const expiryWeekday = weekdayOfKey(key);
+    if (expiryWeekday === 0 || expiryWeekday === 6) continue;
+    listed.push({ key, pick: { label, api } });
   }
-  tuesdays.sort((a, b) => a.key - b.key);
-  if (!tuesdays.length) return null;
+  listed.sort((a, b) => a.key - b.key);
+  if (!listed.length) return null;
   const skipNearby = weekday === 1 || weekday === 2;
   if (skipNearby) {
-    if (tuesdays.length < 2) return null;
-    return { trade: tuesdays[1]!.pick, thisWeek: tuesdays[0]!.pick, nextWeek: tuesdays[1]!.pick };
+    if (listed.length < 2) return null;
+    return { trade: listed[1]!.pick, thisWeek: listed[0]!.pick, nextWeek: listed[1]!.pick };
   }
-  const nearby = tuesdays[0]!;
-  const following = tuesdays[1] ?? nearby;
+  const nearby = listed[0]!;
+  const following = listed[1] ?? nearby;
   return { trade: nearby.pick, thisWeek: nearby.pick, nextWeek: following.pick };
 }
 
-export type DayMark = { mtm: number; dayPlusReady: boolean };
+export type DayMark = { mtm: number | null; ready: boolean };
 
-/** Open mark is (sold − LTP) × qty. A blank leg is unmarked, not ₹0. */
+/** Open mark is (sold − LTP) × qty plus booked legs. A blank open leg makes the whole mark blank. */
 export function dayMtm(legs: readonly N930LegSnap[], realized: number): DayMark {
   let marked = 0;
-  let ready = true;
   let anyOpen = false;
   for (const leg of legs) {
     if (!leg.open) continue;
     anyOpen = true;
-    if (leg.ltp == null) {
-      ready = false;
-      continue;
-    }
+    if (leg.ltp == null) return { mtm: null, ready: false };
     marked += (leg.sold - leg.ltp) * leg.qty;
   }
-  if (!anyOpen) return { mtm: realized, dayPlusReady: true };
-  return { mtm: realized + marked, dayPlusReady: ready };
+  if (!anyOpen) return { mtm: realized, ready: true };
+  return { mtm: realized + marked, ready: true };
 }
 
 /**
- * Same-tick order: entry, EOD, Day −, Day +, per-leg SL, partner tighten, leftover.
- * Both-open has no trail and no leftover. Partner never raises the stop.
+ * Day −, then Day +, and only when every open leg has a live premium.
+ * A 25% stop does not run on the tick that squares the day.
+ * After one leg stop, the survivor uses the partner stop. Leftover cover does not
+ * fire on the same tick as that 25% stop or the partner stop.
  */
 export function tickActions(args: {
   entered: boolean;
   squared: boolean;
-  inWindow: boolean;
-  eod: boolean;
   legs: readonly N930LegSnap[];
   dayPlus: number;
   dayMinus: number;
+  slPct: number;
   partnerPct: number;
   realized: number;
 }): N930Action[] {
-  if (!args.entered && !args.squared && args.inWindow) return [{ type: "ENTER" }];
+  if (!args.entered && !args.squared) return [{ type: "ENTER" }];
   if (!args.entered || args.squared) return [];
   const open = args.legs.filter((leg) => leg.open);
   if (!open.length) return [];
-  if (args.eod) return [{ type: "SQUARE", reason: "EOD" }];
   const mark = dayMtm(args.legs, args.realized);
-  if (mark.mtm <= -args.dayMinus) return [{ type: "SQUARE", reason: "DAY_MINUS" }];
-  if (mark.dayPlusReady && mark.mtm >= args.dayPlus) return [{ type: "SQUARE", reason: "DAY_PLUS" }];
+  if (mark.ready && mark.mtm != null && mark.mtm <= -args.dayMinus) return [{ type: "SQUARE", reason: "DAY_MINUS" }];
+  if (mark.ready && mark.mtm != null && mark.mtm >= args.dayPlus) return [{ type: "SQUARE", reason: "DAY_PLUS" }];
 
-  const actions: N930Action[] = [];
-  const slSides = new Set<N930Side>();
-  for (const leg of open) {
-    if (!leg.slOn || leg.ltp == null) continue;
-    if (leg.ltp + 1e-6 >= leg.slPx) {
-      slSides.add(leg.side);
-      actions.push({ type: "SL", side: leg.side });
+  const siblingStopped = args.legs.some((leg) => !leg.open && leg.closedBy === "sl");
+  if (!siblingStopped) {
+    const stops: N930Action[] = [];
+    for (const leg of open) {
+      if (!leg.slOn || leg.ltp == null) continue;
+      if (leg.ltp + 1e-6 >= slPrice(leg.sold, args.slPct)) stops.push({ type: "SL", side: leg.side });
     }
+    return stops;
   }
-  const stillOpen = open.filter((leg) => !slSides.has(leg.side));
-  const slBooked =
-    slSides.size > 0 || args.legs.some((leg) => !leg.open && leg.closedBy === "sl");
-  if (!(slBooked && stillOpen.length === 1)) return actions;
-  const leg = stillOpen[0]!;
-  const tightened = partnerSl(leg.slPx, leg.sold, args.partnerPct);
-  let slPx = leg.slPx;
+  if (open.length !== 1) return [];
+  const leg = open[0]!;
+  const actions: N930Action[] = [];
+  const current = leg.slOn ? slPrice(leg.sold, args.slPct) : leg.slPx;
+  const tightened = partnerSl(current, leg.sold, args.partnerPct);
+  let slPx = current;
   if (tightened < slPx - 1e-9) {
     slPx = tightened;
     actions.push({ type: "PARTNER", side: leg.side, slPx });
   }
   if (leg.ltp == null) return actions;
-  const rung = leftoverLockPct(favPct(leg.sold, leg.ltp));
-  let lockArmed = leg.lockArmed;
-  let lockPct = leg.lockPct;
-  if (rung != null && (!lockArmed || rung > lockPct + 1e-9)) {
-    lockArmed = true;
-    lockPct = rung;
-    actions.push({ type: "ARM_LOCK", side: leg.side, lockPct });
+  if (leg.ltp + 1e-6 >= slPx) {
+    actions.push({ type: "SL", side: leg.side, via: "partner" });
+    return actions;
   }
-  if (lockArmed && leg.ltp + 1e-6 >= lockCoverPx(leg.sold, lockPct)) {
+  const low = leg.lowPx == null ? leg.ltp : Math.min(leg.lowPx, leg.ltp);
+  if (leg.lowPx == null || low < leg.lowPx - 1e-9) actions.push({ type: "MARK_LOW", side: leg.side, lowPx: low });
+  const rung = leftoverLockPct(favPct(leg.sold, low));
+  if (rung != null && (!leg.lockArmed || rung > leg.lockPct + 1e-9)) {
+    actions.push({ type: "ARM_LOCK", side: leg.side, lockPct: rung });
+  }
+  if (
+    leg.lockArmed &&
+    leg.lowPx != null &&
+    leg.ltp > leg.lowPx + 1e-9 &&
+    leg.ltp + 1e-6 >= lockCoverPx(leg.sold, leg.lockPct)
+  ) {
     actions.push({ type: "LEFTOVER", side: leg.side });
   }
   return actions;
@@ -471,6 +478,29 @@ export function fillCounts(fillPx: number | null | undefined, rate: number | nul
   if (live == null) return false;
   const band = Math.max(1, live * 0.25);
   return Math.abs(fillPx - live) <= band + 1e-9;
+}
+
+export type SellAck = LegAck & { rejected: boolean };
+
+export type EntryPlan =
+  | { type: "book"; ceQty: number; cePx: number; peQty: number; pePx: number }
+  | { type: "retry"; side: N930Side }
+  | { type: "keep"; side: N930Side; qty: number; px: number }
+  | { type: "none" };
+
+/** Both fills book. A confirmed reject retries once. No confirmation keeps the filled short. */
+export function entryPlan(ce: SellAck, pe: SellAck): EntryPlan {
+  const own = (ack: SellAck) => ack.filledQty > 0 && fillCounts(ack.fillPx, ack.rate);
+  const ceOwn = own(ce);
+  const peOwn = own(pe);
+  if (ceOwn && peOwn) {
+    return { type: "book", ceQty: ce.filledQty, cePx: ce.fillPx!, peQty: pe.filledQty, pePx: pe.fillPx! };
+  }
+  if (ceOwn && pe.rejected) return { type: "retry", side: "PE" };
+  if (peOwn && ce.rejected) return { type: "retry", side: "CE" };
+  if (ceOwn) return { type: "keep", side: "CE", qty: ce.filledQty, px: ce.fillPx! };
+  if (peOwn) return { type: "keep", side: "PE", qty: pe.filledQty, px: pe.fillPx! };
+  return { type: "none" };
 }
 
 /** A price from another contract is not a fill. One leg at its own rate is bought back. Neither is not a position. */
@@ -531,24 +561,25 @@ export function netPnl(gross: number, fills: readonly N930Fill[]): { gross: numb
   return { gross: booked, charges, net: roundHalfUpPaise(booked - charges) };
 }
 
-function near(actual: number, expected: number, label: string): void {
-  if (Math.abs(actual - expected) > 1e-6) throw new Error(`${label}: ${actual} vs ${expected}`);
-}
-
 export function assertNineThirtyRules(): void {
   const xts = defaultN930Params();
-  if (dayLine(xts.dayMinusPerLot, 10) !== 7000 || dayLine(xts.dayPlusPerLot, 10) !== 6000) {
-    throw new Error("10 lots use the saved per-lot lines");
+  if (dayLine(xts.dayPlusPerLot, 10) !== 6000 || dayLine(xts.dayMinusPerLot, 10) !== 7000 || dayLine(700, 1) !== 700) {
+    throw new Error("Day + and Day − are rupees per lot");
   }
-  if (dayLine(700, 1) !== 700 || orderQty(10) !== 650 || orderQty(1) !== 65) throw new Error("lot 65");
+  if (clocksBlockEntry()) throw new Error("stored clocks do not block the live card");
+  if (!middaySlot({ hour: 12, minute: 45 }) || middaySlot({ hour: 12, minute: 44 }) || middaySlot({ hour: 13, minute: 0 })) {
+    throw new Error("midday slot is 12:45 until 13:00");
+  }
+  const badPartner = parseN930Params({ ...draftFromParams(xts), partnerPct: "30", slPct: "25" });
+  if (badPartner.ok) throw new Error("partner cannot be above SL");
+  const badClock = parseN930Params({ ...draftFromParams(xts), start: "11:00", cutoff: "10:30" });
+  if (badClock.ok) throw new Error("start must be before cutoff");
+  if (xts.start.hour !== 9 || xts.start.minute !== 36 || xts.squareOff.hour !== 15) throw new Error("built-in clocks");
+  if (orderQty(10) !== 650 || orderQty(1) !== 65) throw new Error("lot 65");
   if (goodPremium(null) !== null || goodPremium(0) !== null || goodPremium(1000) !== null || goodPremium(24500) !== null) {
     throw new Error("junk is not a price");
   }
   if (goodPremium(100) !== 100) throw new Error("100 is a price");
-  if (cutoffFromStart("10:55") !== "11:00" || cutoffFromStart("09:36") !== "09:41") {
-    throw new Error("cutoff is 5 minutes after start");
-  }
-  if (cutoffFromStart("10") !== null) throw new Error("an unfinished start does not move cutoff");
 
   const book = [
     { strike: 24000, ltp: 87 },
@@ -567,15 +598,6 @@ export function assertNineThirtyRules(): void {
   );
   if (tied?.strike !== 25650) throw new Error("equal rates keep the lower strike");
 
-  near(slPrice(100, 25), 125, "SL is sold × 1.25");
-  near(partnerSl(125, 100, 15), 115, "partner tightens to sold × 1.15");
-  near(partnerSl(110, 100, 15), 110, "partner never raises");
-  if (leftoverLockPct(20) !== null) throw new Error("20% favorable is not a lock");
-  if (leftoverLockPct(25) !== 0 || leftoverLockPct(30) !== 5 || leftoverLockPct(35) !== 10) throw new Error("leftover rungs");
-  if (leftoverLockPct(40) !== 25 || leftoverLockPct(45) !== 30 || leftoverLockPct(46) !== 31) throw new Error("45% then +1");
-  near(lockCoverPx(100, 0), 100, "cost lock");
-  near(lockCoverPx(100, 5), 95, "5% lock");
-
   const both = (ce: number | null, pe: number | null, qty = 650, patch?: Partial<N930LegSnap>): N930LegSnap[] => [
     {
       side: "CE",
@@ -585,6 +607,7 @@ export function assertNineThirtyRules(): void {
       ltp: ce,
       slPx: 125,
       slOn: true,
+      lowPx: null,
       lockArmed: false,
       lockPct: 0,
       closedBy: null,
@@ -598,6 +621,7 @@ export function assertNineThirtyRules(): void {
       ltp: pe,
       slPx: 125,
       slOn: true,
+      lowPx: null,
       lockArmed: false,
       lockPct: 0,
       closedBy: null,
@@ -607,45 +631,92 @@ export function assertNineThirtyRules(): void {
     tickActions({
       entered: true,
       squared: false,
-      inWindow: false,
-      eod: false,
       legs,
       dayPlus: 6000,
       dayMinus: 7000,
+      slPct: 25,
       partnerPct: 15,
       realized: 0,
       ...patch,
     });
 
-  if (act(both(100, 100), { entered: false, inWindow: true })[0]?.type !== "ENTER") throw new Error("entry is first");
-  if (act(both(100, 100), { eod: true })[0]?.type !== "SQUARE") throw new Error("EOD squares before the stop");
+  if (act(both(100, 100), { entered: false })[0]?.type !== "ENTER") throw new Error("entry is first");
+  if (act(both(100, 100)).some((row) => row.type === "SQUARE")) throw new Error("no clock square");
   const down = act(both(120, 120));
   if (down.length !== 1 || down[0]?.type !== "SQUARE" || (down[0].type === "SQUARE" && down[0].reason !== "DAY_MINUS")) {
-    throw new Error("Day − is before the per-leg stop");
+    throw new Error("Day − books both legs");
   }
   const up = act(both(90, 90));
   if (up[0]?.type !== "SQUARE" || (up[0].type === "SQUARE" && up[0].reason !== "DAY_PLUS")) throw new Error("Day + squares the pair");
   if (act(both(90, null)).some((row) => row.type === "SQUARE")) throw new Error("Day + needs a good LTP on every open leg");
+  if (act(both(124, null)).length !== 0) throw new Error("a missing premium blocks the day square");
   const sl = act(both(125, 100, 65));
-  if (sl[0]?.type !== "SL" || (sl[0].type === "SL" && sl[0].side !== "CE")) throw new Error("25% stop while both are open");
-  if (!sl.some((row) => row.type === "PARTNER" && row.side === "PE")) throw new Error("the same tick tightens the survivor");
-  if (act(both(80, 100, 65)).length !== 0) throw new Error("both open: no leftover and no trail");
+  if (sl.length !== 1 || sl[0]?.type !== "SL" || (sl[0].type === "SL" && sl[0].via === "partner")) {
+    throw new Error("25% stop closes only that leg");
+  }
+  if (act(both(80, 100, 65)).length !== 0) throw new Error("both open: no leftover and no partner");
+  if (act(both(100, 100), { squared: true }).length !== 0) throw new Error("no resell after the day is done");
 
-  const afterSl = both(null, 80, 65);
+  const afterSl = both(null, 100, 65);
   afterSl[0] = { ...afterSl[0]!, open: false, ltp: null, slOn: false, closedBy: "sl" };
   const partner = act(afterSl);
   const tightened = partner.find((row) => row.type === "PARTNER" && row.side === "PE");
   if (!tightened || tightened.type !== "PARTNER" || Math.abs(tightened.slPx - 115) > 1e-6) {
     throw new Error("one SL tightens the other stop to 15%");
   }
-  if (partner.some((row) => row.type === "LEFTOVER")) throw new Error("20% favorable does not cover");
+  if (partner.some((row) => row.type === "LEFTOVER" || row.type === "SL")) throw new Error("the partner tick does not cover at cost");
 
-  const giveback = both(null, 95);
+  const partnerHit = both(null, 115, 65);
+  partnerHit[0] = { ...partnerHit[0]!, open: false, ltp: null, slOn: false, closedBy: "sl" };
+  const hit = act(partnerHit);
+  if (!hit.some((row) => row.type === "SL" && row.via === "partner")) throw new Error("partner stop covers at sold × 1.15");
+  if (hit.some((row) => row.type === "LEFTOVER")) throw new Error("partner stop does not also fire leftover");
+
+  const deep = both(null, 70, 65);
+  deep[0] = { ...deep[0]!, open: false, ltp: null, slOn: false, closedBy: "sl" };
+  const locked = act(deep);
+  const arm = locked.find((row) => row.type === "ARM_LOCK");
+  if (!arm || arm.type !== "ARM_LOCK" || arm.lockPct !== 5) throw new Error("30% favorable locks 5");
+  if (locked.some((row) => row.type === "LEFTOVER")) throw new Error("the new low does not cover");
+
+  const giveback = both(null, 95, 65);
   giveback[0] = { ...giveback[0]!, open: false, ltp: null, slOn: false, closedBy: "sl" };
-  giveback[1] = { ...giveback[1]!, lockArmed: true, lockPct: 5, slPx: 115 };
-  const cover = act(giveback);
-  if (!cover.some((row) => row.type === "LEFTOVER" && row.side === "PE")) throw new Error("giveback to the lock covers");
-  if (act(both(100, 100), { squared: true, inWindow: true }).length !== 0) throw new Error("no resell after the day is done");
+  giveback[1] = { ...giveback[1]!, slOn: false, slPx: 115, lowPx: 70, lockArmed: true, lockPct: 5 };
+  if (!act(giveback).some((row) => row.type === "LEFTOVER" && row.side === "PE")) throw new Error("price back to the lock covers");
+  if (leftoverLockPct(24) !== null || leftoverLockPct(25) !== 0 || leftoverLockPct(45) !== 30 || leftoverLockPct(46) !== 31) {
+    throw new Error("leftover rungs");
+  }
+
+  const kept = entryPlan(
+    { filledQty: 65, fillPx: 110, rate: 110, rejected: false },
+    { filledQty: 0, fillPx: null, rate: 108, rejected: false },
+  );
+  if (kept.type !== "keep" || kept.side !== "CE") throw new Error("an unconfirmed sell keeps the filled short");
+  const retry = entryPlan(
+    { filledQty: 65, fillPx: 110, rate: 110, rejected: false },
+    { filledQty: 0, fillPx: null, rate: 108, rejected: true },
+  );
+  if (retry.type !== "retry" || retry.side !== "PE") throw new Error("a confirmed reject retries the missing sell");
+
+  const underBook = act(both(110, 100, 130), { dayPlus: 1200, dayMinus: 1400 });
+  if (underBook.some((row) => row.type === "SQUARE")) throw new Error("−1300 does not book a 1400 combined loss");
+  const combinedLoss = act(both(111, 100, 130), { dayPlus: 1200, dayMinus: 1400 });
+  if (
+    combinedLoss.length !== 1 ||
+    combinedLoss[0]?.type !== "SQUARE" ||
+    (combinedLoss[0].type === "SQUARE" && combinedLoss[0].reason !== "DAY_MINUS")
+  ) {
+    throw new Error("−1430 books both legs at the 1400 combined loss");
+  }
+  const underProfit = act(both(91, 100, 130), { dayPlus: 1200, dayMinus: 1400 });
+  if (underProfit.some((row) => row.type === "SQUARE")) throw new Error("1170 does not book a 1200 combined profit");
+  const combinedProfit = act(both(90, 100, 130), { dayPlus: 1200, dayMinus: 1400 });
+  if (
+    combinedProfit[0]?.type !== "SQUARE" ||
+    (combinedProfit[0].type === "SQUARE" && combinedProfit[0].reason !== "DAY_PLUS")
+  ) {
+    throw new Error("1300 books both legs at the 1200 combined profit");
+  }
 
   const monday = pickNiftyWeek(
     [
@@ -678,7 +749,6 @@ export function assertNineThirtyRules(): void {
   if (tuesday?.trade.label !== "17Nov2026") throw new Error("Tuesday does not sell the same-day weekly");
   const wednesday = pickNiftyWeek(
     [
-      { label: "13Nov2026", api: "13" },
       { label: "17Nov2026", api: "17" },
       { label: "24Nov2026", api: "24" },
     ],
@@ -693,6 +763,17 @@ export function assertNineThirtyRules(): void {
     { year: 2026, month: 11, day: 16 },
   );
   if (mondayLater?.trade.label !== "24Nov2026") throw new Error("Monday 16 Nov 2026 skips 17Nov2026");
+  const holidayShift = pickNiftyWeek(
+    [
+      { label: "17Nov2026", api: "17" },
+      { label: "23Nov2026", api: "23" },
+      { label: "01Dec2026", api: "01" },
+    ],
+    { year: 2026, month: 11, day: 16 },
+  );
+  if (holidayShift?.trade.label !== "23Nov2026" || holidayShift.thisWeek.label !== "17Nov2026") {
+    throw new Error("Monday 16 Nov 2026 skips 17 Nov and takes 23 Nov, not 1 Dec");
+  }
   const expiryDay = pickNiftyWeek(
     [
       { label: "17Nov2026", api: "17" },
@@ -702,10 +783,12 @@ export function assertNineThirtyRules(): void {
   );
   if (expiryDay?.trade.label !== "24Nov2026") throw new Error("Tuesday 17 Nov 2026 skips 17Nov2026");
   if (pickNiftyWeek([{ label: "17Nov2026", api: "17" }], { year: 2026, month: 11, day: 17 }) !== null) {
-    throw new Error("no Tuesday after today means no entry");
+    throw new Error("no expiry after the nearby one means no entry");
   }
-  if (pickNiftyWeek([{ label: "13Nov2026", api: "13" }], { year: 2026, month: 11, day: 11 }) !== null) {
-    throw new Error("a Friday label is not the Tuesday");
+  const fridayListed = pickNiftyWeek([{ label: "13Nov2026", api: "13" }], { year: 2026, month: 11, day: 11 });
+  if (fridayListed?.trade.label !== "13Nov2026") throw new Error("a listed Friday expiry is the contract");
+  if (pickNiftyWeek([{ label: "14Nov2026", api: "14" }], { year: 2026, month: 11, day: 13 }) !== null) {
+    throw new Error("Saturday is not an expiry");
   }
 
   if (fillCounts(4.55, 108) || fillCounts(4.05, 108)) throw new Error("4.55 against 108 is not a fill");

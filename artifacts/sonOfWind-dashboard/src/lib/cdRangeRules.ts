@@ -378,6 +378,26 @@ export function breakSide(spot: number, high: number, low: number, extra: number
   return null;
 }
 
+/** Normal keeps the break side. Reverse sells the other option on the same break. */
+export type CdMode = "normal" | "reverse";
+
+export function readCdMode(raw: unknown): CdMode {
+  return raw === "reverse" ? "reverse" : "normal";
+}
+
+/** Normal: HIGH sells PE and LOW sells CE. Reverse swaps only that pair. */
+export function cdEntrySide(
+  spot: number,
+  high: number,
+  low: number,
+  extra: number = CD_RULES.extraBreak,
+  mode: CdMode = "normal",
+): FlipSide | null {
+  const side = breakSide(spot, high, low, extra);
+  if (side == null || mode !== "reverse") return side;
+  return side === "CE" ? "PE" : "CE";
+}
+
 /** A print on HIGH or LOW is inside. A break is the next print past the level. */
 export function insideRange(spot: number, high: number, low: number): boolean {
   return gte(spot, low) && lte(spot, high);
@@ -426,6 +446,7 @@ export function decideCdAction(input: {
   trailArmPct?: number;
   trailCtcPct?: number;
   trailLockPct?: number;
+  mode?: CdMode;
 }): CdAction | null {
   if (input.squareTime) return { type: "SQUARE" };
   const { spot, high, low, mid, sold, ltp } = input;
@@ -436,8 +457,13 @@ export function decideCdAction(input: {
   const trailCtcPct = input.trailCtcPct ?? trailArmPct;
   const trailLockPct = input.trailLockPct ?? CD_RULES.trailLockPct;
   if (spot != null && high != null && low != null) {
-    if (input.side === "CE" && gt(spot, high + extra)) return { type: "OPPOSITE", next: "PE" };
-    if (input.side === "PE" && lt(spot, low - extra)) return { type: "OPPOSITE", next: "CE" };
+    if (input.mode === "reverse") {
+      if (input.side === "PE" && gt(spot, high + extra)) return { type: "OPPOSITE", next: "CE" };
+      if (input.side === "CE" && lt(spot, low - extra)) return { type: "OPPOSITE", next: "PE" };
+    } else {
+      if (input.side === "CE" && gt(spot, high + extra)) return { type: "OPPOSITE", next: "PE" };
+      if (input.side === "PE" && lt(spot, low - extra)) return { type: "OPPOSITE", next: "CE" };
+    }
   }
   if (input.midOn && spot != null && mid != null) {
     if (input.side === "CE" && gte(spot, mid)) return { type: "MID" };
@@ -584,11 +610,13 @@ function assertCdRules(): void {
   if (!savedCtc.ok || savedCtc.params.trailCtcPct !== 6 || trailCtcLockPct(6, 4) !== 2) throw new Error("TRAIL CTC 6 locks 2");
   if (readCdParams({ trailArmPct: 4 }).trailCtcPct !== 4) throw new Error("TRAIL CTC defaults to trail arm");
   if (syncTrailCtc("8", "6") !== "8" || syncTrailCtc("4.2", "4") !== "5") throw new Error("TRAIL CTC stays at or above trail arm");
-  if (act({ spot: 111, high: 110, ltp: 80 })?.type !== "OPPOSITE") throw new Error("HIGH break while short CE flips");
+  const highFlip = act({ spot: 111, high: 110, ltp: 80 });
+  if (highFlip?.type !== "OPPOSITE" || highFlip.next !== "PE") throw new Error("HIGH break while short CE flips");
   if (act({ squareTime: true, spot: 111, high: 110 })?.type !== "SQUARE") throw new Error("15:14 is first");
   if (act({ spot: 100, mid: 100, midOn: false }) !== null) throw new Error("MID stop is off");
   if (act({ spot: 100, mid: 100, midOn: true })?.type !== "MID") throw new Error("CE covers at spot >= MID when MID is on");
-  if (act({ side: "PE", spot: 89, low: 90 })?.type !== "OPPOSITE") throw new Error("LOW break while short PE flips");
+  const lowFlip = act({ side: "PE", spot: 89, low: 90 });
+  if (lowFlip?.type !== "OPPOSITE" || lowFlip.next !== "CE") throw new Error("LOW break while short PE flips");
   if (act({ spot: 110, high: 110 }) !== null) throw new Error("a print on HIGH is not a break");
   if (scoreClose("TARGET", 772.32, 766.1) !== 0) throw new Error("772.32 covered 766.10 is 0");
   if (scoreClose("TARGET", 100, 90) !== 1 || scoreClose("TARGET", 100, 91) !== 1) throw new Error("target slack");
@@ -601,6 +629,19 @@ function assertCdRules(): void {
   if (breakSide(100, 100, 90) !== null || breakSide(100.01, 100, 90) !== "PE" || breakSide(89.99, 100, 90) !== "CE") {
     throw new Error("break");
   }
+  if (cdEntrySide(100.01, 100, 90) !== "PE" || cdEntrySide(89.99, 100, 90) !== "CE") throw new Error("normal entry");
+  if (cdEntrySide(100, 100, 90, 0, "reverse") !== null) throw new Error("reverse still needs a break");
+  if (cdEntrySide(100.01, 100, 90, 0, "reverse") !== "CE" || cdEntrySide(89.99, 100, 90, 0, "reverse") !== "PE") {
+    throw new Error("reverse entry");
+  }
+  const rev = (patch: Partial<typeof base>) => decideCdAction({ ...base, mode: "reverse", ...patch });
+  const revHigh = rev({ side: "PE", spot: 111, high: 110, ltp: 80 });
+  if (revHigh?.type !== "OPPOSITE" || revHigh.next !== "CE") throw new Error("reverse HIGH break while short PE flips to CE");
+  if (rev({ side: "CE", spot: 111, high: 110, ltp: 100 }) !== null) throw new Error("reverse HIGH while short CE stays");
+  const revLow = rev({ side: "CE", spot: 89, low: 90 });
+  if (revLow?.type !== "OPPOSITE" || revLow.next !== "PE") throw new Error("reverse LOW break while short CE flips to PE");
+  if (rev({ side: "PE", spot: 89, low: 90 }) !== null) throw new Error("reverse LOW while short PE stays");
+  if (readCdMode(undefined) !== "normal" || readCdMode("reverse") !== "reverse") throw new Error("mode default");
   if (!insideRange(90, 110, 90) || insideRange(89.9, 110, 90)) throw new Error("inside");
   const book: CdExpiryPick[] = [
     { label: "22Oct2026", api: "22" },

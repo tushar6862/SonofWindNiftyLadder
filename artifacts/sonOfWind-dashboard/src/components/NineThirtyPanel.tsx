@@ -7,40 +7,35 @@ import { apiFetch } from "@/lib/backend";
 import { bumpPositionsRefresh, clearLocalPosition, setLocalShortPosition } from "@/lib/ixPortfolio";
 import { subscribeMdTouchline } from "@/lib/mdRegistry";
 import {
-  ixOrderPricing,
   ixOrderRejectedMessage,
   orderLooksFilled,
   xtsOwnOrderFill,
-  XTS_IX_ORDER_BASE,
 } from "@/lib/xtsOrder";
 import { toast } from "@/hooks/use-toast";
 import type { IndexName } from "@/pages/Dashboard";
 import {
   chargeBreakup,
-  clockMinutes,
-  cutoffFromStart,
   dayLine,
   dayMtm,
   defaultN930Params,
   draftFromParams,
-  entryWindow,
-  eodDue,
+  entryPlan,
   expiryDayKey,
   fillCounts,
-  formatHm,
+  formatClock,
   goodPremium,
   istClock,
+  middaySlot,
   N930,
+  N930_MIDDAY,
   netPnl,
   orderQty,
-  pairFillPlan,
   parseN930Params,
   pickCheapest,
   pickNiftyWeek,
   readN930Params,
   slPrice,
   tickActions,
-  warmupDue,
   type IstClock,
   type N930Action,
   type N930Draft,
@@ -74,6 +69,7 @@ type BookLeg = {
   sold: number;
   slPx: number;
   slOn: boolean;
+  lowPx: number | null;
   lockArmed: boolean;
   lockPct: number;
   open: boolean;
@@ -90,6 +86,7 @@ type OrderSent = {
   fillPx: number | null;
   rate: number | null;
   counted: boolean;
+  rejected: boolean;
   foreign: boolean;
   error: string | null;
 };
@@ -103,6 +100,9 @@ type SessionStore = {
   entered: boolean;
   squared: boolean;
   started: boolean;
+  middayDone: boolean;
+  legStopped: boolean;
+  middayLines: boolean;
   logs: N930Log[];
   logId: number;
 };
@@ -117,6 +117,9 @@ function emptyStore(today: string, params = defaultN930Params()): SessionStore {
     entered: false,
     squared: false,
     started: false,
+    middayDone: false,
+    legStopped: false,
+    middayLines: false,
     logs: [],
     logId: 1,
   };
@@ -149,6 +152,7 @@ function readLegs(raw: unknown): BookLeg[] {
       sold,
       slPx,
       slOn: leg.slOn !== false && leg.open !== false,
+      lowPx: Number(leg.lowPx) > 0 ? Number(leg.lowPx) : null,
       lockArmed: leg.lockArmed === true,
       lockPct: Number(leg.lockPct) > 0 ? Number(leg.lockPct) : 0,
       open: leg.open !== false,
@@ -199,6 +203,9 @@ function loadStore(): SessionStore {
       entered: parsed.entered === true,
       squared: parsed.squared === true,
       started,
+      middayDone: parsed.middayDone === true,
+      legStopped: parsed.legStopped === true,
+      middayLines: parsed.middayLines === true,
       logs: logs.slice(0, 80),
       logId: logs.reduce((max, row) => Math.max(max, row.id), 0) + 1,
     };
@@ -247,7 +254,7 @@ function quotesFor(chain: ChainResolved, side: N930Side): Quote[] {
   const out: Quote[] = [];
   for (const [key, row] of Object.entries(chain.instrumentMap || {})) {
     const strike = Number(key);
-    if (!Number.isFinite(strike) || strike <= 0 || strike % N930.strikeStep !== 0) continue;
+    if (!Number.isFinite(strike) || strike <= 0) continue;
     const iid = side === "CE" ? row?.ce : row?.pe;
     if (typeof iid !== "number" || !(iid > 0)) continue;
     const ltp = livePremium(iid);
@@ -266,16 +273,11 @@ function snapOf(leg: BookLeg): N930LegSnap {
     ltp: leg.open ? livePremium(leg.iid) : null,
     slPx: leg.slPx,
     slOn: leg.open && leg.slOn,
+    lowPx: leg.lowPx,
     lockArmed: leg.lockArmed,
     lockPct: leg.lockPct,
     closedBy: leg.closedBy,
   };
-}
-
-function withSavedSl(legs: BookLeg[], params: N930Params): BookLeg[] {
-  const open = legs.filter((leg) => leg.open);
-  if (open.length < 2) return legs;
-  return legs.map((leg) => (leg.open ? { ...leg, slPx: slPrice(leg.sold, params.slPct), slOn: true } : leg));
 }
 
 export default function NineThirtyPanel({ index, active }: { index: IndexName; active: boolean }) {
@@ -291,12 +293,14 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   const [entered, setEntered] = useState(initial.entered);
   const [squared, setSquared] = useState(initial.squared);
   const [started, setStarted] = useState(initial.started);
+  const [middayDone, setMiddayDone] = useState(initial.middayDone);
+  const [legStopped, setLegStopped] = useState(initial.legStopped);
+  const [middayLines, setMiddayLines] = useState(initial.middayLines);
   const [logs, setLogs] = useState<N930Log[]>(initial.logs);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState<{ date: string; pick: WeekPick; trade: ChainResolved; other: ChainResolved | null } | null>(null);
   const [chainNote, setChainNote] = useState("");
   const [markTick, setMarkTick] = useState(0);
-  const [focusMinute, setFocusMinute] = useState(() => clockMinutes(istClock()));
 
   const paramsRef = useRef(params);
   const legsRef = useRef(legs);
@@ -305,6 +309,9 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   const enteredRef = useRef(entered);
   const squaredRef = useRef(squared);
   const startedRef = useRef(started);
+  const middayDoneRef = useRef(middayDone);
+  const legStoppedRef = useRef(legStopped);
+  const middayLinesRef = useRef(middayLines);
   const loadedRef = useRef(loaded);
   const indexRef = useRef(index);
   const activeRef = useRef(active);
@@ -323,6 +330,9 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   enteredRef.current = entered;
   squaredRef.current = squared;
   startedRef.current = started;
+  middayDoneRef.current = middayDone;
+  legStoppedRef.current = legStopped;
+  middayLinesRef.current = middayLines;
   loadedRef.current = loaded;
   indexRef.current = index;
   activeRef.current = active;
@@ -356,6 +366,9 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       entered,
       squared,
       started,
+      middayDone,
+      legStopped,
+      middayLines,
       logs,
       logId: logIdRef.current,
     };
@@ -364,17 +377,15 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     } catch {
       /* ignore quota */
     }
-  }, [params, legs, fills, realized, entered, squared, started, logs]);
+  }, [params, legs, fills, realized, entered, squared, started, middayDone, legStopped, middayLines, logs]);
 
   useEffect(() => {
     if (index !== "NIFTY") return;
     let cancelled = false;
     const load = async () => {
       const clock = istClock();
-      const rules = paramsRef.current;
-      const mins = clockMinutes(clock);
       const open = legsRef.current.some((leg) => leg.open) || nakedRef.current.length > 0;
-      const watching = activeRef.current || startedRef.current || warmupDue(mins, rules) || open || enteredRef.current;
+      const watching = activeRef.current || startedRef.current || open || enteredRef.current;
       if (!watching) return;
       const have = loadedRef.current;
       if (have && have.date === clock.date) return;
@@ -390,7 +401,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         }
         const pick = pickNiftyWeek(exp.expiries, clock);
         if (!pick) {
-          setChainNote("No Tuesday remains. No entry.");
+          setChainNote("No expiry remains. No entry.");
           return;
         }
         const resolveOne = async (row: N930ExpiryPick, wings: number) =>
@@ -439,7 +450,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     const addChain = (chain: ChainResolved, count: number) => {
       const strikes = Object.keys(chain.instrumentMap || {})
         .map(Number)
-        .filter((strike) => strike > 0 && strike % N930.strikeStep === 0)
+        .filter((strike) => strike > 0)
         .sort((a, b) => Math.abs(a - chain.atmStrike) - Math.abs(b - chain.atmStrike));
       for (const strike of strikes.slice(0, count)) {
         const row = chain.instrumentMap[String(strike)];
@@ -452,8 +463,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     const keepChains =
       active ||
       started ||
-      warmupDue(focusMinute, params) ||
-      entryWindow(focusMinute, params) ||
       legs.some((leg) => leg.open) ||
       nakedRef.current.length > 0;
     if (index === "NIFTY" && book && keepChains) {
@@ -469,7 +478,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       cancelled = true;
       setHotFocus("930", []);
     };
-  }, [index, active, started, loaded, legs, params, focusMinute]);
+  }, [index, active, started, loaded, legs]);
 
   const sendOrder = useCallback(
     async (
@@ -484,18 +493,25 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         fillPx: null,
         rate,
         counted: false,
+        rejected: false,
         foreign: false,
         error,
       });
       if (rate == null) return blank("No tick. Order not sent.");
-      if (orderSide === "SELL" && rate < paramsRef.current.minPremium) return blank("Quote under min. Order not sent.");
+      if (orderSide === "SELL" && rate < N930.liveMin) return blank("Quote under min. Order not sent.");
       let response: { ok?: boolean; error?: string; raw?: unknown } | null = null;
       try {
         response = (await apiFetch("/api/ix/place_order", {
           method: "POST",
           body: JSON.stringify({
-            ...XTS_IX_ORDER_BASE,
-            ...ixOrderPricing(orderSide, rate),
+            orderType: "MARKET",
+            productType: "NRML",
+            timeInForce: "IOC",
+            apiOrderSource: "WEBAPI",
+            disclosedQuantity: 0,
+            limitPrice: 0,
+            stopPrice: 0,
+            keepMarket: true,
             exchangeSegment: segment,
             exchangeInstrumentID: instrumentId,
             orderSide,
@@ -510,18 +526,20 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       bumpPositionsRefresh();
       const raw = response?.raw ?? response;
       const own = xtsOwnOrderFill(raw, instrumentId);
-      const rejected = ixOrderRejectedMessage(raw) || ixOrderRejectedMessage(response) || response?.error || null;
+      const rejectedText = ixOrderRejectedMessage(raw) || ixOrderRejectedMessage(response) || response?.error || null;
       if (own && fillCounts(own.px, rate)) {
-        return { filledQty: own.qty, fillPx: own.px, rate, counted: true, foreign: false, error: null };
+        return { filledQty: own.qty, fillPx: own.px, rate, counted: true, rejected: false, foreign: false, error: null };
       }
-      const foreign = (own != null && !fillCounts(own.px, rate)) || (own == null && orderLooksFilled(raw) && !rejected);
+      const foreign = (own != null && !fillCounts(own.px, rate)) || (own == null && orderLooksFilled(raw) && !rejectedText);
+      const rejected = Boolean(rejectedText) && !foreign;
       return {
         filledQty: 0,
         fillPx: own?.px ?? null,
         rate,
         counted: false,
+        rejected,
         foreign,
-        error: rejected || (foreign ? "Not booked" : "Order not filled"),
+        error: rejectedText || (foreign ? "Not booked" : "Order not filled"),
       };
     },
     [],
@@ -539,57 +557,69 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
 
   const coverLegs = useCallback(
     async (targets: BookLeg[], reason: string, kind: ClosedBy) => {
-      const results = await Promise.all(
-        targets.map(async (leg) => ({ leg, sent: await sendOrder("BUY", leg.iid, leg.qty, leg.segment) })),
-      );
-      let next = legsRef.current.slice();
-      let realizedNow = realizedRef.current;
-      const fillRows = fillsRef.current.slice();
-      let failed = false;
-      for (const { leg, sent } of results) {
-        const rate = sent.rate ?? livePremium(leg.iid);
-        if (!sent.counted || sent.fillPx == null) {
-          failed = true;
-          pushLog(
-            `Not booked. ${leg.side} ${fmtStrike(leg.strike)} rate ${rate == null ? "—" : fmtPrice(rate)}.`,
-            "error",
-          );
-          continue;
-        }
-        const qty = Math.min(sent.filledQty, leg.qty);
-        const booked = (leg.sold - sent.fillPx) * qty;
-        const left = leg.qty - qty;
-        realizedNow += booked;
-        fillRows.push({ side: "BUY", premium: sent.fillPx, qty });
-        if (left <= 0) clearLocalPosition(leg.iid, booked);
-        else {
-          setLocalShortPosition({
-            exchangeInstrumentID: leg.iid,
-            exchangeSegment: leg.segment,
-            qty: left,
-            fillPx: leg.sold,
-            tradingSymbol: `NIFTY ${Math.round(leg.strike)} ${leg.side}`,
-          });
-        }
-        next = next.map((row) =>
-          row.iid === leg.iid
-            ? {
-                ...row,
-                open: left > 0,
-                qty: left > 0 ? left : row.qty,
-                slOn: left > 0,
-                closedBy: left > 0 ? row.closedBy : kind,
-                coverPx: sent.fillPx,
-              }
-            : row,
+      const apply = async (rows: BookLeg[]) => {
+        const results = await Promise.all(
+          rows.map(async (leg) => ({ leg, sent: await sendOrder("BUY", leg.iid, leg.qty, leg.segment) })),
         );
-        pushLog(`${reason} BUY ${leg.side} ${fmtStrike(leg.strike)} rate ${fmtPrice(rate ?? sent.fillPx)}`, "exit");
+        let next = legsRef.current.slice();
+        let realizedNow = realizedRef.current;
+        const fillRows = fillsRef.current.slice();
+        let failed = false;
+        for (const { leg, sent } of results) {
+          const rate = sent.rate ?? livePremium(leg.iid);
+          if (!sent.counted || sent.fillPx == null) {
+            failed = true;
+            pushLog(
+              `Not booked. ${leg.side} ${fmtStrike(leg.strike)} rate ${rate == null ? "—" : fmtPrice(rate)}.`,
+              "error",
+            );
+            continue;
+          }
+          const qty = Math.min(sent.filledQty, leg.qty);
+          const booked = (leg.sold - sent.fillPx) * qty;
+          const left = leg.qty - qty;
+          realizedNow += booked;
+          fillRows.push({ side: "BUY", premium: sent.fillPx, qty });
+          if (left <= 0) clearLocalPosition(leg.iid, booked);
+          else {
+            setLocalShortPosition({
+              exchangeInstrumentID: leg.iid,
+              exchangeSegment: leg.segment,
+              qty: left,
+              fillPx: leg.sold,
+              tradingSymbol: `NIFTY ${Math.round(leg.strike)} ${leg.side}`,
+            });
+          }
+          next = next.map((row) =>
+            row.iid === leg.iid
+              ? {
+                  ...row,
+                  open: left > 0,
+                  qty: left > 0 ? left : row.qty,
+                  slOn: left > 0,
+                  closedBy: left > 0 ? row.closedBy : kind,
+                  coverPx: sent.fillPx,
+                }
+              : row,
+          );
+          pushLog(`${reason} BUY ${leg.side} ${fmtStrike(leg.strike)} rate ${fmtPrice(rate ?? sent.fillPx)}`, "exit");
+        }
+        realizedRef.current = realizedNow;
+        setRealized(realizedNow);
+        fillsRef.current = fillRows;
+        setFills(fillRows);
+        commitLegs(next);
+        return { next, failed };
+      };
+      let { next, failed } = await apply(targets);
+      if (failed && (reason === "Day −" || reason === "Day +")) {
+        const still = next.filter((leg) => leg.open && targets.some((row) => row.iid === leg.iid));
+        if (still.length) ({ next, failed } = await apply(still));
       }
-      realizedRef.current = realizedNow;
-      setRealized(realizedNow);
-      fillsRef.current = fillRows;
-      setFills(fillRows);
-      commitLegs(next);
+      if (kind === "sl" || kind === "leftover") {
+        legStoppedRef.current = true;
+        setLegStopped(true);
+      }
       if (!next.some((leg) => leg.open)) {
         squaredRef.current = true;
         setSquared(true);
@@ -607,8 +637,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     if (tickingRef.current || busyRef.current) return;
     if (indexRef.current !== "NIFTY") return;
     const clock: IstClock = istClock();
-    const minsNow = clockMinutes(clock);
-    if (minsNow !== focusMinute) setFocusMinute(minsNow);
     if (sessionDateRef.current !== clock.date) {
       sessionDateRef.current = clock.date;
       enteredRef.current = false;
@@ -618,9 +646,15 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       fillsRef.current = [];
       realizedRef.current = 0;
       nakedRef.current = [];
+      middayDoneRef.current = false;
+      legStoppedRef.current = false;
+      middayLinesRef.current = false;
       setEntered(false);
       setSquared(false);
       setStarted(false);
+      setMiddayDone(false);
+      setLegStopped(false);
+      setMiddayLines(false);
       commitLegs([]);
       setFills([]);
       setRealized(0);
@@ -633,8 +667,38 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     tickingRef.current = true;
     try {
       const rules = paramsRef.current;
-      const mins = clockMinutes(clock);
       const book = loadedRef.current;
+      const flatBook = !legsRef.current.some((leg) => leg.open) && nakedRef.current.length === 0;
+      if (!middaySlot(clock) && middayLinesRef.current && !middayDoneRef.current && flatBook && !enteredRef.current) {
+        middayDoneRef.current = true;
+        middayLinesRef.current = false;
+        setMiddayDone(true);
+        setMiddayLines(false);
+      }
+      if (
+        middaySlot(clock) &&
+        !middayDoneRef.current &&
+        !legStoppedRef.current &&
+        flatBook &&
+        book &&
+        !middayLinesRef.current
+      ) {
+        middayLinesRef.current = true;
+        setMiddayLines(true);
+        enteredRef.current = false;
+        squaredRef.current = false;
+        legsRef.current = [];
+        fillsRef.current = [];
+        realizedRef.current = 0;
+        setEntered(false);
+        setSquared(false);
+        commitLegs([]);
+        setFills([]);
+        setRealized(0);
+        startedRef.current = true;
+        setStarted(true);
+        pushLog("12:45. Card cleared. Selling 1 lot.", "info");
+      }
       if (!startedRef.current) {
         const open = legsRef.current.filter((leg) => leg.open);
         if (!open.length && !nakedRef.current.length) return;
@@ -683,39 +747,47 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         return;
       }
 
-      let working = withSavedSl(legsRef.current, rules);
-      if (working.some((leg, i) => leg.slPx !== legsRef.current[i]?.slPx)) commitLegs(working);
-      const snaps = working.map(snapOf);
+      const snaps = legsRef.current.map(snapOf);
+      const dayPlus = middayLinesRef.current ? N930_MIDDAY.dayPlusPerLot : dayLine(rules.dayPlusPerLot, rules.lots);
+      const dayMinus = middayLinesRef.current ? N930_MIDDAY.dayMinusPerLot : dayLine(rules.dayMinusPerLot, rules.lots);
       const actions = tickActions({
         entered: enteredRef.current,
         squared: squaredRef.current,
-        inWindow: entryWindow(mins, rules),
-        eod: eodDue(mins, rules),
         legs: snaps,
-        dayPlus: dayLine(rules.dayPlusPerLot, rules.lots),
-        dayMinus: dayLine(rules.dayMinusPerLot, rules.lots),
+        dayPlus,
+        dayMinus,
+        slPct: rules.slPct,
         partnerPct: rules.partnerPct,
         realized: realizedRef.current,
       });
-      const locals = actions.filter((row): row is Extract<N930Action, { type: "PARTNER" | "ARM_LOCK" }> => row.type === "PARTNER" || row.type === "ARM_LOCK");
+      const locals = actions.filter(
+        (row): row is Extract<N930Action, { type: "PARTNER" | "MARK_LOW" | "ARM_LOCK" }> =>
+          row.type === "PARTNER" || row.type === "MARK_LOW" || row.type === "ARM_LOCK",
+      );
       if (locals.length) {
-        working = working.map((leg) => {
-          let next = leg;
-          for (const row of locals) {
-            if (row.side !== leg.side || !leg.open) continue;
-            if (row.type === "PARTNER") next = { ...next, slPx: row.slPx };
-            else next = { ...next, lockArmed: true, lockPct: row.lockPct };
+        const next = legsRef.current.map((leg) => {
+          let row = leg;
+          for (const action of locals) {
+            if (action.side !== leg.side || !leg.open) continue;
+            if (action.type === "PARTNER") row = { ...row, slPx: action.slPx, slOn: false };
+            else if (action.type === "MARK_LOW") row = { ...row, lowPx: action.lowPx };
+            else row = { ...row, lockArmed: true, lockPct: action.lockPct };
           }
-          return next;
+          return row;
         });
-        commitLegs(working);
-        for (const row of locals) {
-          if (row.type === "PARTNER") note(`partner-${row.side}`, `Partner ${rules.partnerPct}%. ${row.side} SL is ${fmtPrice(row.slPx)}.`, "info");
-          else note(`lock-${row.side}-${row.lockPct}`, `Leftover lock ${row.lockPct}% on ${row.side}.`, "info");
+        commitLegs(next);
+        for (const action of locals) {
+          if (action.type === "PARTNER") {
+            note(`partner-${action.side}`, `Partner ${rules.partnerPct}%. ${action.side} SL is ${fmtPrice(action.slPx)}.`, "info");
+          } else if (action.type === "ARM_LOCK") {
+            note(`lock-${action.side}-${action.lockPct}`, `Leftover lock ${action.lockPct}% on ${action.side}.`, "info");
+          }
         }
       }
-      const orders = actions.filter((row) => row.type !== "PARTNER" && row.type !== "ARM_LOCK");
 
+      const orders = actions.filter(
+        (row) => row.type === "ENTER" || row.type === "SQUARE" || row.type === "SL" || row.type === "LEFTOVER",
+      );
       if (!orders.length) return;
       const first = orders[0]!;
       if (first.type === "ENTER") {
@@ -723,31 +795,66 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           note("chain", chainNote || "Weekly chain is not ready.", "info");
           return;
         }
-        const ce = pickCheapest(quotesFor(book.trade, "CE"), rules.minPremium);
-        const pe = pickCheapest(quotesFor(book.trade, "PE"), rules.minPremium);
+        const ce = pickCheapest(quotesFor(book.trade, "CE"), N930.liveMin);
+        const pe = pickCheapest(quotesFor(book.trade, "PE"), N930.liveMin);
         if (!ce || !pe) {
-          note("pick", `No ${rules.minPremium} premium on both sides of ${book.pick.trade.label}. No order.`, "info");
+          note("pick", `No ${N930.liveMin} premium on both sides of ${book.pick.trade.label}. No order.`, "info");
           return;
         }
         const ceNow = livePremium(ce.iid);
         const peNow = livePremium(pe.iid);
-        if (ceNow == null || peNow == null || ceNow < rules.minPremium || peNow < rules.minPremium) {
+        if (ceNow == null || peNow == null || ceNow < N930.liveMin || peNow < N930.liveMin) {
           note("pick", "Quote fell under min before send. Pair not sent.", "info");
           return;
         }
         if (Date.now() < backoffRef.current) return;
         busyRef.current = true;
         setBusy(true);
-        const qty = orderQty(rules.lots);
+        const qty = middayLinesRef.current ? orderQty(N930_MIDDAY.lots) : orderQty(rules.lots);
         const segment = book.trade.optionSegment;
-        const [ceSent, peSent] = await Promise.all([
+        if (middayLinesRef.current) {
+          middayDoneRef.current = true;
+          setMiddayDone(true);
+        }
+        let [ceSent, peSent] = await Promise.all([
           sendOrder("SELL", ce.iid, qty, segment),
           sendOrder("SELL", pe.iid, qty, segment),
         ]);
-        const plan = pairFillPlan(
-          { filledQty: ceSent.counted ? ceSent.filledQty : 0, fillPx: ceSent.counted ? ceSent.fillPx : null, rate: ceSent.rate ?? ceNow },
-          { filledQty: peSent.counted ? peSent.filledQty : 0, fillPx: peSent.counted ? peSent.fillPx : null, rate: peSent.rate ?? peNow },
+        let plan = entryPlan(
+          { filledQty: ceSent.counted ? ceSent.filledQty : 0, fillPx: ceSent.counted ? ceSent.fillPx : null, rate: ceSent.rate ?? ceNow, rejected: ceSent.rejected },
+          { filledQty: peSent.counted ? peSent.filledQty : 0, fillPx: peSent.counted ? peSent.fillPx : null, rate: peSent.rate ?? peNow, rejected: peSent.rejected },
         );
+        if (plan.type === "retry") {
+          const again = await sendOrder("SELL", plan.side === "CE" ? ce.iid : pe.iid, qty, segment);
+          if (plan.side === "CE") ceSent = again;
+          else peSent = again;
+          plan = entryPlan(
+            { filledQty: ceSent.counted ? ceSent.filledQty : 0, fillPx: ceSent.counted ? ceSent.fillPx : null, rate: ceSent.rate ?? ceNow, rejected: ceSent.rejected },
+            { filledQty: peSent.counted ? peSent.filledQty : 0, fillPx: peSent.counted ? peSent.fillPx : null, rate: peSent.rate ?? peNow, rejected: peSent.rejected },
+          );
+          if (plan.type === "retry" || plan.type === "keep" || plan.type === "none") {
+            const filled = ceSent.counted ? "CE" : "PE";
+            const sent = filled === "CE" ? ceSent : peSent;
+            const iid = filled === "CE" ? ce.iid : pe.iid;
+            const strike = filled === "CE" ? ce.strike : pe.strike;
+            if (sent.counted && sent.fillPx != null) {
+              pushLog(`SELL ${filled} ${fmtStrike(strike)} rate ${fmtPrice(sent.rate ?? sent.fillPx)}`, "entry");
+              const buy = await sendOrder("BUY", iid, sent.filledQty, segment);
+              if (buy.counted && buy.fillPx != null) {
+                clearLocalPosition(iid);
+                pushLog(`BUY ${filled} ${fmtStrike(strike)} rate ${fmtPrice(buy.rate ?? buy.fillPx)}`, "exit");
+              } else {
+                nakedRef.current = [...nakedRef.current, { side: filled, strike, iid, segment, qty: sent.filledQty }];
+              }
+            }
+            enteredRef.current = true;
+            squaredRef.current = true;
+            setEntered(true);
+            setSquared(true);
+            pushLog("Missing sell failed. The filled leg was bought back.", "error");
+            return;
+          }
+        }
         if (ceSent.foreign || peSent.foreign) {
           pushLog(`Not booked. CE ${fmtStrike(ce.strike)} rate ${fmtPrice(ceNow)}. PE ${fmtStrike(pe.strike)} rate ${fmtPrice(peNow)}.`, "error");
           backoffRef.current = Date.now() + ENTRY_BACKOFF_MS;
@@ -765,6 +872,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
               sold: plan.cePx,
               slPx: slPrice(plan.cePx, rules.slPct),
               slOn: true,
+              lowPx: null,
               lockArmed: false,
               lockPct: 0,
               open: true,
@@ -780,6 +888,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
               sold: plan.pePx,
               slPx: slPrice(plan.pePx, rules.slPct),
               slOn: true,
+              lowPx: null,
               lockArmed: false,
               lockPct: 0,
               open: true,
@@ -803,39 +912,41 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           toast({ title: "9:30 sold", description: `CE ${ce.strike} and PE ${pe.strike}` });
           return;
         }
-        const unwind = async (side: N930Side, iid: number, strike: number, qtyFilled: number, sold: number, rate: number) => {
-          pushLog(`SELL ${side} ${fmtStrike(strike)} rate ${fmtPrice(rate)}`, "entry");
-          const sent = await sendOrder("BUY", iid, qtyFilled, segment);
-          if (sent.counted && sent.fillPx != null) {
-            clearLocalPosition(iid);
-            pushLog(`BUY ${side} ${fmtStrike(strike)} rate ${fmtPrice(sent.rate ?? rate)}`, "exit");
-            return;
-          }
-          nakedRef.current = [...nakedRef.current, { side, strike, iid, segment, qty: qtyFilled }];
-          setLocalShortPosition({
-            exchangeInstrumentID: iid,
-            exchangeSegment: segment,
-            qty: qtyFilled,
-            fillPx: sold,
-            tradingSymbol: `NIFTY ${strike} ${side}`,
-          });
-          pushLog(`Not booked. ${side} ${fmtStrike(strike)} rate ${sent.rate == null ? fmtPrice(rate) : fmtPrice(sent.rate)}.`, "error");
-        };
-        if (plan.type === "unwind" && plan.side === "CE" && ceSent.counted && ceSent.fillPx != null) {
-          await unwind("CE", ce.iid, ce.strike, ceSent.filledQty, ceSent.fillPx, ceNow);
-          backoffRef.current = Date.now() + (nakedRef.current.length ? EXIT_BACKOFF_MS : ENTRY_BACKOFF_MS);
-        } else if (plan.type === "unwind" && plan.side === "PE" && peSent.counted && peSent.fillPx != null) {
-          await unwind("PE", pe.iid, pe.strike, peSent.filledQty, peSent.fillPx, peNow);
-          backoffRef.current = Date.now() + (nakedRef.current.length ? EXIT_BACKOFF_MS : ENTRY_BACKOFF_MS);
-        } else if (!ceSent.foreign && !peSent.foreign) {
-          backoffRef.current = Date.now() + ENTRY_BACKOFF_MS;
-          const why = ceSent.error || peSent.error || "Rejected.";
-          pushLog(`${why} Not a position.`, "error");
+        if (plan.type === "keep") {
+          const quote = plan.side === "CE" ? ce : pe;
+          const expiry = book.trade.expiryUi || book.pick.trade.label;
+          const kept: BookLeg = {
+            side: plan.side,
+            strike: quote.strike,
+            iid: quote.iid,
+            segment,
+            qty: plan.qty,
+            sold: plan.px,
+            slPx: slPrice(plan.px, rules.slPct),
+            slOn: true,
+            lowPx: null,
+            lockArmed: false,
+            lockPct: 0,
+            open: true,
+            closedBy: null,
+            coverPx: null,
+          };
+          fillsRef.current = [...fillsRef.current, { side: "SELL", premium: plan.px, qty: plan.qty }];
+          setFills(fillsRef.current);
+          enteredRef.current = true;
+          setEntered(true);
+          commitLegs([kept]);
+          remember(kept, expiry);
+          pushLog(`SELL ${plan.side} ${fmtStrike(quote.strike)} rate ${fmtPrice(plan.px)}. The other sell did not confirm.`, "entry");
+          return;
         }
+        backoffRef.current = Date.now() + ENTRY_BACKOFF_MS;
+        const why = ceSent.error || peSent.error || "Rejected.";
+        pushLog(`${why} Not a position.`, "error");
         return;
       }
 
-      const openLegs = working.filter((leg) => leg.open);
+      const openLegs = legsRef.current.filter((leg) => leg.open);
       const targets =
         first.type === "SQUARE"
           ? openLegs
@@ -843,15 +954,15 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       if (!targets.length) return;
       const reason =
         first.type === "SQUARE"
-          ? first.reason === "EOD"
-            ? `EOD ${formatHm(rules.eodMin)}`
-            : first.reason === "DAY_MINUS"
-              ? "Day −"
-              : "Day +"
+          ? first.reason === "DAY_MINUS"
+            ? "Day −"
+            : "Day +"
           : first.type === "SL"
-            ? `SL ${rules.slPct}%`
+            ? first.via === "partner"
+              ? `Partner ${rules.partnerPct}%`
+              : `SL ${rules.slPct}%`
             : "Leftover";
-      const kind: ClosedBy = first.type === "SL" ? "sl" : first.type === "LEFTOVER" ? "leftover" : "square";
+      const kind: ClosedBy = first.type === "LEFTOVER" ? "leftover" : first.type === "SL" ? "sl" : "square";
       if (Date.now() < backoffRef.current) return;
       busyRef.current = true;
       setBusy(true);
@@ -865,8 +976,8 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       const now = Date.now();
       const showing =
         activeRef.current ||
-        legsRef.current.some((leg) => leg.open) ||
-        entryWindow(clockMinutes(istClock()), paramsRef.current);
+        startedRef.current ||
+        legsRef.current.some((leg) => leg.open);
       if (showing && now - shownRef.current > 400) {
         shownRef.current = now;
         setMarkTick((n) => (n + 1) % 1_000_000);
@@ -887,10 +998,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     }
     paramsRef.current = parsed.params;
     setParams(parsed.params);
-    pushLog(
-      `Parameters saved. ${formatHm(parsed.params.startMin)}–${formatHm(parsed.params.cutoffMin)}, EOD ${formatHm(parsed.params.eodMin)}, ${parsed.params.lots} lots, min ${parsed.params.minPremium}.`,
-      "info",
-    );
+    pushLog(`Parameters saved. ${parsed.params.lots} lots, min ${parsed.params.minPremium}.`, "info");
     toast({ title: "9:30 parameters", description: "Saved. The live card uses this save." });
   };
 
@@ -914,6 +1022,10 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
 
   const startDesk = () => {
     if (busyRef.current) return;
+    if (legStoppedRef.current) {
+      pushLog("After a leg stop, START does not sell again.", "info");
+      return;
+    }
     if (!bookIsFlat()) {
       if (!startedRef.current) {
         startedRef.current = true;
@@ -928,15 +1040,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
     startedRef.current = true;
     setStarted(true);
     if (was && !cleared) return;
-    const mins = clockMinutes(istClock());
-    const rules = paramsRef.current;
-    const when =
-      mins < rules.startMin
-        ? `Waiting for ${formatHm(rules.startMin)}.`
-        : entryWindow(mins, rules)
-          ? "Selling on the next tick."
-          : `Past ${formatHm(rules.cutoffMin)}. No new sell.`;
-    pushLog(cleared ? `START. Old book cleared. ${when}` : `START. ${when}`, "info");
+    pushLog(cleared ? "START. Old book cleared. Selling on the next tick." : "START. Selling on the next tick.", "info");
   };
 
   const stop = async () => {
@@ -980,26 +1084,27 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   void markTick;
   const ceOpen = legs.find((leg) => leg.side === "CE" && leg.open) ?? null;
   const peOpen = legs.find((leg) => leg.side === "PE" && leg.open) ?? null;
-  const ceWatch = !ceOpen && loaded ? pickCheapest(quotesFor(loaded.trade, "CE"), rules.minPremium) : null;
-  const peWatch = !peOpen && loaded ? pickCheapest(quotesFor(loaded.trade, "PE"), rules.minPremium) : null;
+  const ceWatch = !ceOpen && loaded ? pickCheapest(quotesFor(loaded.trade, "CE"), N930.liveMin) : null;
+  const peWatch = !peOpen && loaded ? pickCheapest(quotesFor(loaded.trade, "PE"), N930.liveMin) : null;
   const deskMode = started ? "START" : "STOP";
-  const deskState = started ? "One sell at the saved time" : "No new sell";
+  const deskState = !started ? "No new sell" : legs.some((leg) => leg.open) ? "Short is open" : "Sells on the next tick";
   const mark = dayMtm(snaps, realized);
-  const gross = mark.mtm;
-  const money = netPnl(gross, fills);
+  const gross = mark.ready ? mark.mtm : null;
+  const money = gross == null ? null : netPnl(gross, fills);
   const charges = chargeBreakup(fills).total;
+  const plusLine = middayLines ? N930_MIDDAY.dayPlusPerLot : dayLine(rules.dayPlusPerLot, rules.lots);
+  const minusLine = middayLines ? N930_MIDDAY.dayMinusPerLot : dayLine(rules.dayMinusPerLot, rules.lots);
+  const ist = istClock();
   const draftDirty =
-    draft.start !== formatHm(rules.startMin) ||
-    draft.cutoff !== formatHm(rules.cutoffMin) ||
-    draft.eod !== formatHm(rules.eodMin) ||
     draft.lots !== String(rules.lots) ||
     draft.minPremium !== String(rules.minPremium) ||
     draft.slPct !== String(rules.slPct) ||
     draft.partnerPct !== String(rules.partnerPct) ||
     draft.dayPlusPerLot !== String(rules.dayPlusPerLot) ||
-    draft.dayMinusPerLot !== String(rules.dayMinusPerLot);
-  const clock = istClock();
-  const mins = clockMinutes(clock);
+    draft.dayMinusPerLot !== String(rules.dayMinusPerLot) ||
+    draft.start !== formatClock(rules.start) ||
+    draft.cutoff !== formatClock(rules.cutoff) ||
+    draft.squareOff !== formatClock(rules.squareOff);
   const status =
     index !== "NIFTY"
       ? "Select NIFTY. This desk does not trade another index."
@@ -1010,25 +1115,17 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           : entered || squared
             ? "This START is used. Press START to clear the old book."
             : !loaded
-              ? chainNote || "Resolving the Tuesday chain."
-              : !entryWindow(mins, rules)
-                ? mins < rules.startMin
-                  ? `Waiting for ${formatHm(rules.startMin)}. Cutoff ${formatHm(rules.cutoffMin)}.`
-                  : `Past ${formatHm(rules.cutoffMin)}. No new sell.`
-                : `${loaded.pick.trade.label} CE and PE sell together on the next tick.`;
+              ? chainNote || "Resolving the expiry chain."
+              : `${loaded.pick.trade.label} CE and PE sell together on the next tick.`;
 
   return (
     <div className="flex flex-1 min-h-0 min-w-0 flex-col overflow-hidden text-[13px] ramsetu-glass-panel">
       <div className="shrink-0 ramsetu-glass-toolbar">
         <div className="n930-tape">
           <div className="n930-cell">
-            <div className="n930-kicker">Window</div>
-            <div className="n930-px">
-              {formatHm(rules.startMin)}–{formatHm(rules.cutoffMin)}
-            </div>
-            <div className="n930-meta">
-              EOD {formatHm(rules.eodMin)} · {deskMode}
-            </div>
+            <div className="n930-kicker">Desk</div>
+            <div className="n930-px">{deskMode}</div>
+            <div className="n930-meta">{`${String(ist.hour).padStart(2, "0")}:${String(ist.minute).padStart(2, "0")} IST · ${started && !entered ? "Next tick" : deskState}`}</div>
           </div>
           <div className="n930-cell">
             <div className="n930-kicker">CE</div>
@@ -1037,7 +1134,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
             </div>
             <div className="n930-meta">
               {ceOpen
-                ? `${Math.round(ceOpen.strike).toLocaleString("en-IN")} · SL ${fmtPrice(ceOpen.slPx)}`
+                ? `${Math.round(ceOpen.strike).toLocaleString("en-IN")} · sold ${fmtPrice(ceOpen.sold)} · SL ${fmtPrice(ceOpen.slPx)}`
                 : ceWatch
                   ? `${Math.round(ceWatch.strike).toLocaleString("en-IN")} · cheapest ≥ min`
                   : chainNote || (loaded ? "waiting for LTP" : "—")}
@@ -1050,7 +1147,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
             </div>
             <div className="n930-meta">
               {peOpen
-                ? `${Math.round(peOpen.strike).toLocaleString("en-IN")} · SL ${fmtPrice(peOpen.slPx)}`
+                ? `${Math.round(peOpen.strike).toLocaleString("en-IN")} · sold ${fmtPrice(peOpen.sold)} · SL ${fmtPrice(peOpen.slPx)}`
                 : peWatch
                   ? `${Math.round(peWatch.strike).toLocaleString("en-IN")} · cheapest ≥ min`
                   : chainNote || (loaded ? "waiting for LTP" : "—")}
@@ -1058,10 +1155,11 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           </div>
           <div className="n930-cell">
             <div className="n930-kicker">Day MTM</div>
-            <div className={`n930-px ${gross > 0 ? "n930-px--up" : gross < 0 ? "n930-px--down" : ""}`}>{fmtPnl(gross)}</div>
+            <div className={`n930-px ${gross != null && gross > 0 ? "n930-px--up" : gross != null && gross < 0 ? "n930-px--down" : ""}`}>{fmtPnl(gross)}</div>
             <div className="n930-meta">
-              net {fmtPnl(money.net)} · charges {fmtPrice(charges)}
-              {!mark.dayPlusReady ? " · mark incomplete" : ""}
+              +₹{fmtPrice(plusLine)} / −₹{fmtPrice(minusLine)}
+              {money ? ` · net ${fmtPnl(money.net)} · charges ${fmtPrice(charges)}` : ""}
+              {!mark.ready ? " · mark incomplete" : ""}
             </div>
           </div>
           <div className="n930-cell">
@@ -1093,24 +1191,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
 
         <div className="cd-params">
           <div className="cd-params__grid">
-            <Field label="Start">
-              <input
-                aria-label="Start"
-                value={draft.start}
-                onChange={(e) => {
-                  const start = e.target.value;
-                  const cutoff = cutoffFromStart(start);
-                  setDraft((row) => ({ ...row, start, ...(cutoff ? { cutoff } : {}) }));
-                }}
-                className="ramsetu-glass-select cd-field__control"
-              />
-            </Field>
-            <Field label="Cutoff">
-              <input aria-label="Cutoff" value={draft.cutoff} onChange={(e) => setDraft((row) => ({ ...row, cutoff: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
-            </Field>
-            <Field label="EOD">
-              <input aria-label="EOD" value={draft.eod} onChange={(e) => setDraft((row) => ({ ...row, eod: e.target.value }))} className="ramsetu-glass-select cd-field__control" />
-            </Field>
             <Field label="Lots">
               <input aria-label="Lots" inputMode="numeric" value={draft.lots} onChange={(e) => setDraft((row) => ({ ...row, lots: e.target.value.replace(/[^\d]/g, "").slice(0, 2) }))} className="ramsetu-glass-select cd-field__control" />
             </Field>
@@ -1128,6 +1208,15 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
             </Field>
             <Field label="Day − ₹/lot">
               <input aria-label="Day − ₹/lot" inputMode="decimal" value={draft.dayMinusPerLot} onChange={(e) => setDraft((row) => ({ ...row, dayMinusPerLot: e.target.value.replace(/[^\d.]/g, "").slice(0, 8) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Start">
+              <input aria-label="Start" value={draft.start} onChange={(e) => setDraft((row) => ({ ...row, start: e.target.value.replace(/[^\d:]/g, "").slice(0, 5) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Cutoff">
+              <input aria-label="Cutoff" value={draft.cutoff} onChange={(e) => setDraft((row) => ({ ...row, cutoff: e.target.value.replace(/[^\d:]/g, "").slice(0, 5) }))} className="ramsetu-glass-select cd-field__control" />
+            </Field>
+            <Field label="Square-off">
+              <input aria-label="Square-off" value={draft.squareOff} onChange={(e) => setDraft((row) => ({ ...row, squareOff: e.target.value.replace(/[^\d:]/g, "").slice(0, 5) }))} className="ramsetu-glass-select cd-field__control" />
             </Field>
           </div>
           <div className="cd-params__bar">
@@ -1161,9 +1250,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
                   </div>
                   <div className="text-[12px] tabular-nums text-muted-foreground">
                     LTP {leg ? <FyersPx iid={leg.iid} /> : quote ? fmtPrice(quote.ltp) : "—"}
-                    {" · "}SL {leg ? fmtPrice(leg.slPx) : "—"}
-                    {leg?.lockArmed ? ` · lock ${leg.lockPct}%` : ""}
-                    {leg ? ` · sold ${fmtPrice(leg.sold)}` : ""}
+                    {leg ? ` · sold ${fmtPrice(leg.sold)} · SL ${fmtPrice(leg.slPx)}` : ""}
                   </div>
                 </div>
               );
@@ -1181,11 +1268,12 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                NIFTY weekly, lot 65, step 50. START and STOP only. Wed–Fri sell the nearest Tuesday. Mon–Tue skip that Tuesday and sell the next one.
-                Both legs use that expiry. Each side is the cheapest tick at or above the saved min. Equal rates keep the lower strike.
-                CE and PE sell together. A fill counts only when it is this strike's own price. One real leg is bought back. After a stop that
-                strike is done. Both open legs keep the saved SL. After one stop, the other stop tightens and the leftover ladder can lock.
-                Day + and Day − use the saved rupees per lot. Orders go out only while START is on.
+                NIFTY weekly, lot 65. Orders are MARKET at price 0. The live sell uses ₹100 on the current tick. Saved start, cutoff, and square-off stay stored and do not block.
+                Monday and Tuesday sell the next listed expiry. Wednesday to Friday sell the nearest. A holiday date in the broker list is the contract.
+                Both legs sell together. A confirmed reject retries the missing sell once, then buys the filled leg back. An unconfirmed sell keeps the filled short.
+                Day + and Day − are rupees per lot times lots, on the combined gross. Both legs buy together when that line is hit and every open premium is live.
+                A 25% stop closes only that leg. The survivor then uses Partner% and the leftover lock. From 12:45 to 13:00, once, a flat card sells 1 lot at ₹600 and ₹700.
+                STOP buys the open shorts. After a leg stop, START does not sell again.
               </p>
             ) : (
               <ul className="space-y-1.5">
