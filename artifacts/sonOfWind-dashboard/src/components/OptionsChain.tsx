@@ -9,6 +9,7 @@ import NiftyVwapPanel from "@/components/NiftyVwapPanel";
 import CdRangePanel from "@/components/CdRangePanel";
 import CustomVwapPanel from "@/components/CustomVwapPanel";
 import NineThirtyPanel from "@/components/NineThirtyPanel";
+import FlipPanel from "@/components/FlipPanel";
 import { bumpPositionsRefresh } from "@/lib/ixPortfolio";
 
 export default function OptionsChain({
@@ -29,7 +30,7 @@ export default function OptionsChain({
 }) {
   const lotSize = lotSizeForIndex(index);
   const qty = Math.max(1, lotSize);
-  const [desk, setDesk] = useState<"snake" | "vwap" | "cd" | "custom" | "930">("snake");
+  const [desk, setDesk] = useState<"snake" | "vwap" | "cd" | "custom" | "930" | "flip">("snake");
   const [exitBusy, setExitBusy] = useState(false);
   const [exitSelected, setExitSelected] = useState<25 | 50 | 75 | 100 | null>(null);
 
@@ -108,9 +109,16 @@ export default function OptionsChain({
         >
           9:30
         </button>
+        <button
+          type="button"
+          className={`sow-glass-tab${desk === "flip" ? " sow-glass-tab--active" : ""}`}
+          onClick={() => setDesk("flip")}
+        >
+          Flip
+        </button>
       </div>
 
-      {!resolved && desk !== "custom" && desk !== "930" && (
+      {!resolved && desk !== "custom" && desk !== "930" && desk !== "flip" && (
         <div className="flex-1 flex flex-col items-center justify-center gap-5 p-6 relative overflow-hidden">
           <div className="absolute -top-24 left-1/2 -translate-x-1/2 h-64 w-[620px] rounded-full blur-3xl opacity-30 bg-gradient-to-r from-blue-500/15 via-cyan-500/10 to-violet-500/15" />
           <div className="relative z-10">
@@ -165,6 +173,9 @@ export default function OptionsChain({
       </div>
       <div className={desk === "930" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "930"}>
         <NineThirtyPanel index={index} active={desk === "930"} />
+      </div>
+      <div className={desk === "flip" ? "flex flex-1 min-h-0 flex-col overflow-hidden" : "hidden"} aria-hidden={desk !== "flip"}>
+        <FlipPanel index={index} active={desk === "flip"} />
       </div>
 
       <div className="sow-footer-scroll sow-glass-footer-bar w-full min-w-0 shrink-0 text-[11px]">

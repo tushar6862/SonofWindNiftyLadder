@@ -3798,6 +3798,7 @@ body.sow-has-dashboard-bg {
 .cd-trade__actions {
   display: flex;
   flex-shrink: 0;
+  align-items: flex-end;
   gap: 8px;
 }
 

@@ -22,7 +22,6 @@ import {
   entryPlan,
   expiryDayKey,
   fillCounts,
-  formatClock,
   goodPremium,
   istClock,
   middaySlot,
@@ -34,10 +33,8 @@ import {
   pickCheapest,
   pickNiftyWeek,
   readN930Params,
-  slPrice,
   tickActions,
   type IstClock,
-  type N930Action,
   type N930Draft,
   type N930ExpiryPick,
   type N930Fill,
@@ -58,7 +55,7 @@ const WINGS = 16;
 
 type LogKind = "entry" | "exit" | "error" | "info";
 type N930Log = { id: number; ts: number; text: string; kind: LogKind };
-type ClosedBy = "sl" | "leftover" | "square";
+type ClosedBy = "square";
 
 type BookLeg = {
   side: N930Side;
@@ -67,11 +64,6 @@ type BookLeg = {
   segment: number;
   qty: number;
   sold: number;
-  slPx: number;
-  slOn: boolean;
-  lowPx: number | null;
-  lockArmed: boolean;
-  lockPct: number;
   open: boolean;
   closedBy: ClosedBy | null;
   coverPx: number | null;
@@ -141,8 +133,7 @@ function readLegs(raw: unknown): BookLeg[] {
     const segment = Number(leg.segment);
     const qty = Number(leg.qty);
     const sold = Number(leg.sold);
-    const slPx = Number(leg.slPx);
-    if (!(strike > 0) || !(iid > 0) || !(segment > 0) || !(qty > 0) || !(sold > 0) || !(slPx > 0)) continue;
+    if (!(strike > 0) || !(iid > 0) || !(segment > 0) || !(qty > 0) || !(sold > 0)) continue;
     out.push({
       side: leg.side,
       strike,
@@ -150,13 +141,8 @@ function readLegs(raw: unknown): BookLeg[] {
       segment,
       qty,
       sold,
-      slPx,
-      slOn: leg.slOn !== false && leg.open !== false,
-      lowPx: Number(leg.lowPx) > 0 ? Number(leg.lowPx) : null,
-      lockArmed: leg.lockArmed === true,
-      lockPct: Number(leg.lockPct) > 0 ? Number(leg.lockPct) : 0,
       open: leg.open !== false,
-      closedBy: leg.closedBy === "sl" || leg.closedBy === "leftover" || leg.closedBy === "square" ? leg.closedBy : null,
+      closedBy: leg.closedBy === "square" ? "square" : null,
       coverPx: Number(leg.coverPx) > 0 ? Number(leg.coverPx) : null,
     });
   }
@@ -271,12 +257,6 @@ function snapOf(leg: BookLeg): N930LegSnap {
     sold: leg.sold,
     qty: leg.qty,
     ltp: leg.open ? livePremium(leg.iid) : null,
-    slPx: leg.slPx,
-    slOn: leg.open && leg.slOn,
-    lowPx: leg.lowPx,
-    lockArmed: leg.lockArmed,
-    lockPct: leg.lockPct,
-    closedBy: leg.closedBy,
   };
 }
 
@@ -596,7 +576,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
                   ...row,
                   open: left > 0,
                   qty: left > 0 ? left : row.qty,
-                  slOn: left > 0,
                   closedBy: left > 0 ? row.closedBy : kind,
                   coverPx: sent.fillPx,
                 }
@@ -615,10 +594,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       if (failed && (reason === "Day −" || reason === "Day +")) {
         const still = next.filter((leg) => leg.open && targets.some((row) => row.iid === leg.iid));
         if (still.length) ({ next, failed } = await apply(still));
-      }
-      if (kind === "sl" || kind === "leftover") {
-        legStoppedRef.current = true;
-        setLegStopped(true);
       }
       if (!next.some((leg) => leg.open)) {
         squaredRef.current = true;
@@ -678,7 +653,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
       if (
         middaySlot(clock) &&
         !middayDoneRef.current &&
-        !legStoppedRef.current &&
         flatBook &&
         book &&
         !middayLinesRef.current
@@ -756,38 +730,9 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         legs: snaps,
         dayPlus,
         dayMinus,
-        slPct: rules.slPct,
-        partnerPct: rules.partnerPct,
         realized: realizedRef.current,
       });
-      const locals = actions.filter(
-        (row): row is Extract<N930Action, { type: "PARTNER" | "MARK_LOW" | "ARM_LOCK" }> =>
-          row.type === "PARTNER" || row.type === "MARK_LOW" || row.type === "ARM_LOCK",
-      );
-      if (locals.length) {
-        const next = legsRef.current.map((leg) => {
-          let row = leg;
-          for (const action of locals) {
-            if (action.side !== leg.side || !leg.open) continue;
-            if (action.type === "PARTNER") row = { ...row, slPx: action.slPx, slOn: false };
-            else if (action.type === "MARK_LOW") row = { ...row, lowPx: action.lowPx };
-            else row = { ...row, lockArmed: true, lockPct: action.lockPct };
-          }
-          return row;
-        });
-        commitLegs(next);
-        for (const action of locals) {
-          if (action.type === "PARTNER") {
-            note(`partner-${action.side}`, `Partner ${rules.partnerPct}%. ${action.side} SL is ${fmtPrice(action.slPx)}.`, "info");
-          } else if (action.type === "ARM_LOCK") {
-            note(`lock-${action.side}-${action.lockPct}`, `Leftover lock ${action.lockPct}% on ${action.side}.`, "info");
-          }
-        }
-      }
-
-      const orders = actions.filter(
-        (row) => row.type === "ENTER" || row.type === "SQUARE" || row.type === "SL" || row.type === "LEFTOVER",
-      );
+      const orders = actions.filter((row) => row.type === "ENTER" || row.type === "SQUARE");
       if (!orders.length) return;
       const first = orders[0]!;
       if (first.type === "ENTER") {
@@ -870,11 +815,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
               segment,
               qty: plan.ceQty,
               sold: plan.cePx,
-              slPx: slPrice(plan.cePx, rules.slPct),
-              slOn: true,
-              lowPx: null,
-              lockArmed: false,
-              lockPct: 0,
               open: true,
               closedBy: null,
               coverPx: null,
@@ -886,11 +826,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
               segment,
               qty: plan.peQty,
               sold: plan.pePx,
-              slPx: slPrice(plan.pePx, rules.slPct),
-              slOn: true,
-              lowPx: null,
-              lockArmed: false,
-              lockPct: 0,
               open: true,
               closedBy: null,
               coverPx: null,
@@ -922,11 +857,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
             segment,
             qty: plan.qty,
             sold: plan.px,
-            slPx: slPrice(plan.px, rules.slPct),
-            slOn: true,
-            lowPx: null,
-            lockArmed: false,
-            lockPct: 0,
             open: true,
             closedBy: null,
             coverPx: null,
@@ -946,23 +876,11 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
         return;
       }
 
-      const openLegs = legsRef.current.filter((leg) => leg.open);
-      const targets =
-        first.type === "SQUARE"
-          ? openLegs
-          : openLegs.filter((leg) => orders.some((row) => (row.type === "SL" || row.type === "LEFTOVER") && row.side === leg.side));
+      if (first.type !== "SQUARE") return;
+      const targets = legsRef.current.filter((leg) => leg.open);
       if (!targets.length) return;
-      const reason =
-        first.type === "SQUARE"
-          ? first.reason === "DAY_MINUS"
-            ? "Day −"
-            : "Day +"
-          : first.type === "SL"
-            ? first.via === "partner"
-              ? `Partner ${rules.partnerPct}%`
-              : `SL ${rules.slPct}%`
-            : "Leftover";
-      const kind: ClosedBy = first.type === "LEFTOVER" ? "leftover" : first.type === "SL" ? "sl" : "square";
+      const reason = first.reason === "DAY_MINUS" ? "Day −" : "Day +";
+      const kind: ClosedBy = "square";
       if (Date.now() < backoffRef.current) return;
       busyRef.current = true;
       setBusy(true);
@@ -1022,10 +940,6 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
 
   const startDesk = () => {
     if (busyRef.current) return;
-    if (legStoppedRef.current) {
-      pushLog("After a leg stop, START does not sell again.", "info");
-      return;
-    }
     if (!bookIsFlat()) {
       if (!startedRef.current) {
         startedRef.current = true;
@@ -1098,13 +1012,8 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
   const draftDirty =
     draft.lots !== String(rules.lots) ||
     draft.minPremium !== String(rules.minPremium) ||
-    draft.slPct !== String(rules.slPct) ||
-    draft.partnerPct !== String(rules.partnerPct) ||
     draft.dayPlusPerLot !== String(rules.dayPlusPerLot) ||
-    draft.dayMinusPerLot !== String(rules.dayMinusPerLot) ||
-    draft.start !== formatClock(rules.start) ||
-    draft.cutoff !== formatClock(rules.cutoff) ||
-    draft.squareOff !== formatClock(rules.squareOff);
+    draft.dayMinusPerLot !== String(rules.dayMinusPerLot);
   const status =
     index !== "NIFTY"
       ? "Select NIFTY. This desk does not trade another index."
@@ -1134,7 +1043,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
             </div>
             <div className="n930-meta">
               {ceOpen
-                ? `${Math.round(ceOpen.strike).toLocaleString("en-IN")} · sold ${fmtPrice(ceOpen.sold)} · SL ${fmtPrice(ceOpen.slPx)}`
+                ? `${Math.round(ceOpen.strike).toLocaleString("en-IN")} · sold ${fmtPrice(ceOpen.sold)}`
                 : ceWatch
                   ? `${Math.round(ceWatch.strike).toLocaleString("en-IN")} · cheapest ≥ min`
                   : chainNote || (loaded ? "waiting for LTP" : "—")}
@@ -1147,7 +1056,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
             </div>
             <div className="n930-meta">
               {peOpen
-                ? `${Math.round(peOpen.strike).toLocaleString("en-IN")} · sold ${fmtPrice(peOpen.sold)} · SL ${fmtPrice(peOpen.slPx)}`
+                ? `${Math.round(peOpen.strike).toLocaleString("en-IN")} · sold ${fmtPrice(peOpen.sold)}`
                 : peWatch
                   ? `${Math.round(peWatch.strike).toLocaleString("en-IN")} · cheapest ≥ min`
                   : chainNote || (loaded ? "waiting for LTP" : "—")}
@@ -1197,26 +1106,11 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
             <Field label="Min premium">
               <input aria-label="Min premium" inputMode="decimal" value={draft.minPremium} onChange={(e) => setDraft((row) => ({ ...row, minPremium: e.target.value.replace(/[^\d.]/g, "").slice(0, 6) }))} className="ramsetu-glass-select cd-field__control" />
             </Field>
-            <Field label="SL %">
-              <input aria-label="SL %" inputMode="decimal" value={draft.slPct} onChange={(e) => setDraft((row) => ({ ...row, slPct: e.target.value.replace(/[^\d.]/g, "").slice(0, 6) }))} className="ramsetu-glass-select cd-field__control" />
-            </Field>
-            <Field label="Partner %">
-              <input aria-label="Partner %" inputMode="decimal" value={draft.partnerPct} onChange={(e) => setDraft((row) => ({ ...row, partnerPct: e.target.value.replace(/[^\d.]/g, "").slice(0, 6) }))} className="ramsetu-glass-select cd-field__control" />
-            </Field>
             <Field label="Day + ₹/lot">
               <input aria-label="Day + ₹/lot" inputMode="decimal" value={draft.dayPlusPerLot} onChange={(e) => setDraft((row) => ({ ...row, dayPlusPerLot: e.target.value.replace(/[^\d.]/g, "").slice(0, 8) }))} className="ramsetu-glass-select cd-field__control" />
             </Field>
             <Field label="Day − ₹/lot">
               <input aria-label="Day − ₹/lot" inputMode="decimal" value={draft.dayMinusPerLot} onChange={(e) => setDraft((row) => ({ ...row, dayMinusPerLot: e.target.value.replace(/[^\d.]/g, "").slice(0, 8) }))} className="ramsetu-glass-select cd-field__control" />
-            </Field>
-            <Field label="Start">
-              <input aria-label="Start" value={draft.start} onChange={(e) => setDraft((row) => ({ ...row, start: e.target.value.replace(/[^\d:]/g, "").slice(0, 5) }))} className="ramsetu-glass-select cd-field__control" />
-            </Field>
-            <Field label="Cutoff">
-              <input aria-label="Cutoff" value={draft.cutoff} onChange={(e) => setDraft((row) => ({ ...row, cutoff: e.target.value.replace(/[^\d:]/g, "").slice(0, 5) }))} className="ramsetu-glass-select cd-field__control" />
-            </Field>
-            <Field label="Square-off">
-              <input aria-label="Square-off" value={draft.squareOff} onChange={(e) => setDraft((row) => ({ ...row, squareOff: e.target.value.replace(/[^\d:]/g, "").slice(0, 5) }))} className="ramsetu-glass-select cd-field__control" />
             </Field>
           </div>
           <div className="cd-params__bar">
@@ -1250,7 +1144,7 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
                   </div>
                   <div className="text-[12px] tabular-nums text-muted-foreground">
                     LTP {leg ? <FyersPx iid={leg.iid} /> : quote ? fmtPrice(quote.ltp) : "—"}
-                    {leg ? ` · sold ${fmtPrice(leg.sold)} · SL ${fmtPrice(leg.slPx)}` : ""}
+                    {leg ? ` · sold ${fmtPrice(leg.sold)}` : ""}
                   </div>
                 </div>
               );
@@ -1268,12 +1162,12 @@ export default function NineThirtyPanel({ index, active }: { index: IndexName; a
           <div className="min-h-0 flex-1 overflow-auto">
             {!logs.length ? (
               <p className="text-[14px] font-semibold leading-snug text-foreground/80">
-                NIFTY weekly, lot 65. Orders are MARKET at price 0. The live sell uses ₹100 on the current tick. Saved start, cutoff, and square-off stay stored and do not block.
+                NIFTY weekly, lot 65. Orders are MARKET at price 0. The live sell uses ₹100 on the current tick. There is no start, cutoff, or square-off clock.
                 Monday and Tuesday sell the next listed expiry. Wednesday to Friday sell the nearest. A holiday date in the broker list is the contract.
                 Both legs sell together. A confirmed reject retries the missing sell once, then buys the filled leg back. An unconfirmed sell keeps the filled short.
-                Day + and Day − are rupees per lot times lots, on the combined gross. Both legs buy together when that line is hit and every open premium is live.
-                A 25% stop closes only that leg. The survivor then uses Partner% and the leftover lock. From 12:45 to 13:00, once, a flat card sells 1 lot at ₹600 and ₹700.
-                STOP buys the open shorts. After a leg stop, START does not sell again.
+                Day + and Day − are rupees per lot times lots, on the combined CE + PE. Both legs buy together when that line is hit and every open premium is live.
+                1 lot at 600 and 700 books +₹600 or −₹700. 2 lots books +₹1,200 or −₹1,400. From 12:45 to 13:00, once, a flat card sells 1 lot at ₹600 and ₹700.
+                STOP buys the open shorts.
               </p>
             ) : (
               <ul className="space-y-1.5">

@@ -227,15 +227,31 @@ function applyLocalPositionOverlay(data: unknown): unknown {
   for (const row of broker) {
     const iid = overlayIid(row);
     const net = overlayNet(row);
-    if (iid != null && squaredBook.has(iid)) {
-      // Keep the freeze until a new short is taken. A later stale snapshot
+    if (iid != null && squaredBook.has(iid) && !localShorts.has(iid)) {
+      // Keep the freeze until a new position is taken. A later stale snapshot
       // often brings the old qty back after one flat read.
       if (net === 0) keepBroker.push(row);
       else keepBroker.push(forceBookFlat(row, squaredBook.get(iid) ?? null));
       seen.add(iid);
       continue;
     }
-    if (iid != null && net < 0) {
+    const local = iid != null ? localShorts.get(iid) : undefined;
+    if (local && iid != null) {
+      const localNet = overlayNet(local);
+      const sameSide = (localNet < 0 && net < 0) || (localNet > 0 && net > 0);
+      if (sameSide) {
+        localShorts.delete(iid);
+        seen.add(iid);
+        keepBroker.push(row);
+        continue;
+      }
+      if (localNet !== 0 && net !== 0 && Math.sign(localNet) !== Math.sign(net)) {
+        seen.add(iid);
+        keepBroker.push(local);
+        continue;
+      }
+    }
+    if (iid != null && net < 0 && !localShorts.has(iid)) {
       localShorts.delete(iid);
       seen.add(iid);
     }
@@ -287,6 +303,42 @@ export function setLocalShortPosition(opts: {
     OpenSellQuantity: qty,
     OpenBuyQuantity: 0,
     SellAveragePrice: opts.fillPx,
+    AveragePrice: opts.fillPx,
+    _sowLocal: true,
+  };
+  const same = prev && JSON.stringify(prev) === JSON.stringify(row);
+  squaredBook.delete(iid);
+  saveSquaredBook();
+  localShorts.set(iid, row);
+  if (!same) emitPosRefresh();
+}
+
+/** Optimistic long after a flip buy, until the broker snapshot shows the long. */
+export function setLocalLongPosition(opts: {
+  exchangeInstrumentID: number;
+  exchangeSegment: number | string;
+  qty: number;
+  fillPx: number;
+  tradingSymbol?: string;
+  productType?: string;
+}): void {
+  const iid = Math.floor(opts.exchangeInstrumentID);
+  const qty = Math.floor(Math.abs(opts.qty));
+  if (!(iid > 0) || qty <= 0 || !(opts.fillPx > 0)) return;
+  const prev = localShorts.get(iid);
+  const row: Record<string, unknown> = {
+    ExchangeInstrumentID: iid,
+    ExchangeInstrumentId: iid,
+    ExchangeSegment: segLabel(opts.exchangeSegment),
+    TradingSymbol: opts.tradingSymbol || prev?.TradingSymbol || `IID ${iid}`,
+    ProductType: opts.productType || "NRML",
+    NetPosition: qty,
+    Quantity: qty,
+    ShortPosition: 0,
+    LongPosition: qty,
+    OpenSellQuantity: 0,
+    OpenBuyQuantity: qty,
+    BuyAveragePrice: opts.fillPx,
     AveragePrice: opts.fillPx,
     _sowLocal: true,
   };

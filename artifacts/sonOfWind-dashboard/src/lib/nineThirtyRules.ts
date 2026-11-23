@@ -1,9 +1,9 @@
 /**
  * 9:30 NIFTY weekly short strangle.
- * Lots, Min, SL%, Partner%, Day +, and Day − come from Save.
- * Day + and Day − are rupees per lot, then × lots. The live minimum is ₹100.
- * Start, cutoff, and square-off are stored. The live card is immediate, so those clocks do not block.
- * Orders are MARKET, price 0. One sell per START. A leg stop does not sell again.
+ * Lots, Min, Day +, and Day − come from Save.
+ * Day + and Day − are rupees per lot, then × lots. CE and PE book together on that combined line.
+ * There is no SL% and no Partner%. There is no start, cutoff, or square-off clock.
+ * START sells on the next tick. Orders are MARKET, price 0. One sell per START.
  */
 
 export const N930 = {
@@ -33,18 +33,11 @@ export const N930_MIDDAY = {
 
 export type N930Side = "CE" | "PE";
 
-export type N930Clock = { hour: number; minute: number };
-
 export type N930Params = {
   lots: number;
   minPremium: number;
-  slPct: number;
-  partnerPct: number;
   dayPlusPerLot: number;
   dayMinusPerLot: number;
-  start: N930Clock;
-  cutoff: N930Clock;
-  squareOff: N930Clock;
 };
 
 /** Built-in save before the user saves. The live card still sells at ₹100 on the live tick. */
@@ -52,38 +45,23 @@ export function defaultN930Params(): N930Params {
   return {
     lots: 10,
     minPremium: 100,
-    slPct: 25,
-    partnerPct: 15,
     dayPlusPerLot: 600,
     dayMinusPerLot: 700,
-    start: { hour: 9, minute: 36 },
-    cutoff: { hour: 10, minute: 30 },
-    squareOff: { hour: 15, minute: 14 },
   };
 }
 
 export const N930_FYERS_PARAMS: N930Params = {
   lots: 1,
   minPremium: 100,
-  slPct: 25,
-  partnerPct: 15,
   dayPlusPerLot: 700,
   dayMinusPerLot: 700,
-  start: { hour: 9, minute: 36 },
-  cutoff: { hour: 10, minute: 30 },
-  squareOff: { hour: 15, minute: 14 },
 };
 
 export type N930Draft = {
   lots: string;
   minPremium: string;
-  slPct: string;
-  partnerPct: string;
   dayPlusPerLot: string;
   dayMinusPerLot: string;
-  start: string;
-  cutoff: string;
-  squareOff: string;
 };
 
 export type IstClock = {
@@ -105,22 +83,9 @@ export type N930LegSnap = {
   sold: number;
   qty: number;
   ltp: number | null;
-  slPx: number;
-  slOn: boolean;
-  lowPx: number | null;
-  lockArmed: boolean;
-  lockPct: number;
-  closedBy: "sl" | "leftover" | "square" | null;
 };
 
-export type N930Action =
-  | { type: "ENTER" }
-  | { type: "SQUARE"; reason: "DAY_MINUS" | "DAY_PLUS" }
-  | { type: "SL"; side: N930Side; via?: "partner" }
-  | { type: "PARTNER"; side: N930Side; slPx: number }
-  | { type: "MARK_LOW"; side: N930Side; lowPx: number }
-  | { type: "ARM_LOCK"; side: N930Side; lockPct: number }
-  | { type: "LEFTOVER"; side: N930Side };
+export type N930Action = { type: "ENTER" } | { type: "SQUARE"; reason: "DAY_MINUS" | "DAY_PLUS" };
 
 export type N930Fill = { side: "BUY" | "SELL"; premium: number; qty: number };
 
@@ -164,40 +129,13 @@ export function istClock(now = new Date()): IstClock {
   };
 }
 
-export function formatClock(clock: N930Clock): string {
-  return `${String(clock.hour).padStart(2, "0")}:${String(clock.minute).padStart(2, "0")}`;
-}
-
 export function draftFromParams(params: N930Params): N930Draft {
   return {
     lots: String(params.lots),
     minPremium: String(params.minPremium),
-    slPct: String(params.slPct),
-    partnerPct: String(params.partnerPct),
     dayPlusPerLot: String(params.dayPlusPerLot),
     dayMinusPerLot: String(params.dayMinusPerLot),
-    start: formatClock(params.start),
-    cutoff: formatClock(params.cutoff),
-    squareOff: formatClock(params.squareOff),
   };
-}
-
-function parseClock(text: string): N930Clock | null {
-  const match = /^(\d{1,2}):(\d{2})$/.exec(text.trim());
-  if (!match) return null;
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour > 23 || minute > 59) return null;
-  return { hour, minute };
-}
-
-function clockMinute(clock: N930Clock): number {
-  return clock.hour * 60 + clock.minute;
-}
-
-/** Stored clocks do not block. The live card is immediate. */
-export function clocksBlockEntry(): boolean {
-  return false;
 }
 
 function parsePositive(text: string, max: number): number | null {
@@ -216,22 +154,12 @@ export function parseN930Params(draft: N930Draft): { ok: true; params: N930Param
   }
   const minPremium = parsePositive(draft.minPremium, 999);
   if (minPremium == null) return { ok: false, error: "Min premium must be above 0 and below 1000." };
-  const slPct = parsePositive(draft.slPct, 100);
-  const partnerPct = parsePositive(draft.partnerPct, 100);
-  if (slPct == null || partnerPct == null) return { ok: false, error: "SL% and partner% must be above 0 and at most 100." };
-  if (partnerPct > slPct) return { ok: false, error: "Partner% cannot be above SL%." };
   const dayPlusPerLot = parsePositive(draft.dayPlusPerLot, 1_000_000);
   const dayMinusPerLot = parsePositive(draft.dayMinusPerLot, 1_000_000);
   if (dayPlusPerLot == null || dayMinusPerLot == null) return { ok: false, error: "Day + and Day − must be rupees per lot." };
-  const start = parseClock(draft.start);
-  const cutoff = parseClock(draft.cutoff);
-  const squareOff = parseClock(draft.squareOff);
-  if (!start || !cutoff || !squareOff) return { ok: false, error: "Start, cutoff, and square-off must be HH:MM." };
-  if (clockMinute(start) >= clockMinute(cutoff)) return { ok: false, error: "Start must be before cutoff." };
-  if (clockMinute(squareOff) < clockMinute(cutoff)) return { ok: false, error: "Square-off must be at or after cutoff." };
   return {
     ok: true,
-    params: { lots, minPremium, slPct, partnerPct, dayPlusPerLot, dayMinusPerLot, start, cutoff, squareOff },
+    params: { lots, minPremium, dayPlusPerLot, dayMinusPerLot },
   };
 }
 
@@ -239,19 +167,11 @@ export function readN930Params(raw: unknown): N930Params {
   const base = defaultN930Params();
   if (!raw || typeof raw !== "object") return base;
   const row = raw as Partial<N930Params>;
-  const rawStart = row.start ?? base.start;
-  const rawCutoff = row.cutoff ?? base.cutoff;
-  const rawSquare = row.squareOff ?? base.squareOff;
   const draft: N930Draft = {
     lots: String(row.lots ?? base.lots),
     minPremium: String(row.minPremium ?? base.minPremium),
-    slPct: String(row.slPct ?? base.slPct),
-    partnerPct: String(row.partnerPct ?? base.partnerPct),
     dayPlusPerLot: String(row.dayPlusPerLot ?? base.dayPlusPerLot),
     dayMinusPerLot: String(row.dayMinusPerLot ?? base.dayMinusPerLot),
-    start: typeof rawStart === "string" ? rawStart : formatClock(rawStart),
-    cutoff: typeof rawCutoff === "string" ? rawCutoff : formatClock(rawCutoff),
-    squareOff: typeof rawSquare === "string" ? rawSquare : formatClock(rawSquare),
   };
   const parsed = parseN930Params(draft);
   return parsed.ok ? parsed.params : base;
@@ -261,37 +181,9 @@ export function orderQty(lots: number): number {
   return lots * N930.lotSize;
 }
 
-/** Saved rupees per lot × lots. One open leg keeps the same per-lot line. */
+/** Saved rupees per lot × lots. 1 lot at 600 and 700 is ₹600 and ₹700. 2 lots is ₹1,200 and ₹1,400. */
 export function dayLine(perLot: number, lots: number): number {
   return perLot * lots;
-}
-
-export function slPrice(sold: number, pct: number): number {
-  return sold * (1 + pct / 100);
-}
-
-/** Partner stop never loosens. */
-export function partnerSl(currentSl: number, sold: number, partnerPct: number): number {
-  return Math.min(currentSl, slPrice(sold, partnerPct));
-}
-
-export function favPct(sold: number, lowPx: number): number {
-  if (!(sold > 0)) return 0;
-  return ((sold - lowPx) / sold) * 100;
-}
-
-/** Best favorable fall. Under 25 there is no lock. The lock only tightens. */
-export function leftoverLockPct(fav: number): number | null {
-  if (!(fav >= 25)) return null;
-  if (fav >= 45) return 30 + Math.floor(fav - 45 + 1e-9);
-  if (fav >= 40) return 25;
-  if (fav >= 35) return 10;
-  if (fav >= 30) return 5;
-  return 0;
-}
-
-export function lockCoverPx(sold: number, lockPct: number): number {
-  return sold * (1 - lockPct / 100);
 }
 
 /** 12:45 inclusive through 12:59. 13:00 is outside. */
@@ -400,10 +292,8 @@ export function dayMtm(legs: readonly N930LegSnap[], realized: number): DayMark 
 }
 
 /**
- * Day −, then Day +, and only when every open leg has a live premium.
- * A 25% stop does not run on the tick that squares the day.
- * After one leg stop, the survivor uses the partner stop. Leftover cover does not
- * fire on the same tick as that 25% stop or the partner stop.
+ * Day −, then Day +. Both open legs book together.
+ * The line is the saved rupees per lot × lots. A blank open premium blocks the book.
  */
 export function tickActions(args: {
   entered: boolean;
@@ -411,8 +301,6 @@ export function tickActions(args: {
   legs: readonly N930LegSnap[];
   dayPlus: number;
   dayMinus: number;
-  slPct: number;
-  partnerPct: number;
   realized: number;
 }): N930Action[] {
   if (!args.entered && !args.squared) return [{ type: "ENTER" }];
@@ -420,48 +308,10 @@ export function tickActions(args: {
   const open = args.legs.filter((leg) => leg.open);
   if (!open.length) return [];
   const mark = dayMtm(args.legs, args.realized);
-  if (mark.ready && mark.mtm != null && mark.mtm <= -args.dayMinus) return [{ type: "SQUARE", reason: "DAY_MINUS" }];
-  if (mark.ready && mark.mtm != null && mark.mtm >= args.dayPlus) return [{ type: "SQUARE", reason: "DAY_PLUS" }];
-
-  const siblingStopped = args.legs.some((leg) => !leg.open && leg.closedBy === "sl");
-  if (!siblingStopped) {
-    const stops: N930Action[] = [];
-    for (const leg of open) {
-      if (!leg.slOn || leg.ltp == null) continue;
-      if (leg.ltp + 1e-6 >= slPrice(leg.sold, args.slPct)) stops.push({ type: "SL", side: leg.side });
-    }
-    return stops;
-  }
-  if (open.length !== 1) return [];
-  const leg = open[0]!;
-  const actions: N930Action[] = [];
-  const current = leg.slOn ? slPrice(leg.sold, args.slPct) : leg.slPx;
-  const tightened = partnerSl(current, leg.sold, args.partnerPct);
-  let slPx = current;
-  if (tightened < slPx - 1e-9) {
-    slPx = tightened;
-    actions.push({ type: "PARTNER", side: leg.side, slPx });
-  }
-  if (leg.ltp == null) return actions;
-  if (leg.ltp + 1e-6 >= slPx) {
-    actions.push({ type: "SL", side: leg.side, via: "partner" });
-    return actions;
-  }
-  const low = leg.lowPx == null ? leg.ltp : Math.min(leg.lowPx, leg.ltp);
-  if (leg.lowPx == null || low < leg.lowPx - 1e-9) actions.push({ type: "MARK_LOW", side: leg.side, lowPx: low });
-  const rung = leftoverLockPct(favPct(leg.sold, low));
-  if (rung != null && (!leg.lockArmed || rung > leg.lockPct + 1e-9)) {
-    actions.push({ type: "ARM_LOCK", side: leg.side, lockPct: rung });
-  }
-  if (
-    leg.lockArmed &&
-    leg.lowPx != null &&
-    leg.ltp > leg.lowPx + 1e-9 &&
-    leg.ltp + 1e-6 >= lockCoverPx(leg.sold, leg.lockPct)
-  ) {
-    actions.push({ type: "LEFTOVER", side: leg.side });
-  }
-  return actions;
+  if (!mark.ready || mark.mtm == null) return [];
+  if (mark.mtm <= -args.dayMinus) return [{ type: "SQUARE", reason: "DAY_MINUS" }];
+  if (mark.mtm >= args.dayPlus) return [{ type: "SQUARE", reason: "DAY_PLUS" }];
+  return [];
 }
 
 export type LegAck = { filledQty: number; fillPx: number | null; rate: number | null };
@@ -566,15 +416,11 @@ export function assertNineThirtyRules(): void {
   if (dayLine(xts.dayPlusPerLot, 10) !== 6000 || dayLine(xts.dayMinusPerLot, 10) !== 7000 || dayLine(700, 1) !== 700) {
     throw new Error("Day + and Day − are rupees per lot");
   }
-  if (clocksBlockEntry()) throw new Error("stored clocks do not block the live card");
   if (!middaySlot({ hour: 12, minute: 45 }) || middaySlot({ hour: 12, minute: 44 }) || middaySlot({ hour: 13, minute: 0 })) {
     throw new Error("midday slot is 12:45 until 13:00");
   }
-  const badPartner = parseN930Params({ ...draftFromParams(xts), partnerPct: "30", slPct: "25" });
-  if (badPartner.ok) throw new Error("partner cannot be above SL");
-  const badClock = parseN930Params({ ...draftFromParams(xts), start: "11:00", cutoff: "10:30" });
-  if (badClock.ok) throw new Error("start must be before cutoff");
-  if (xts.start.hour !== 9 || xts.start.minute !== 36 || xts.squareOff.hour !== 15) throw new Error("built-in clocks");
+  if ("slPct" in xts || "partnerPct" in xts) throw new Error("no SL% and no Partner%");
+  if ("start" in xts || "cutoff" in xts || "squareOff" in xts) throw new Error("no start, cutoff, or square-off");
   if (orderQty(10) !== 650 || orderQty(1) !== 65) throw new Error("lot 65");
   if (goodPremium(null) !== null || goodPremium(0) !== null || goodPremium(1000) !== null || goodPremium(24500) !== null) {
     throw new Error("junk is not a price");
@@ -598,94 +444,44 @@ export function assertNineThirtyRules(): void {
   );
   if (tied?.strike !== 25650) throw new Error("equal rates keep the lower strike");
 
-  const both = (ce: number | null, pe: number | null, qty = 650, patch?: Partial<N930LegSnap>): N930LegSnap[] => [
-    {
-      side: "CE",
-      open: true,
-      sold: 100,
-      qty,
-      ltp: ce,
-      slPx: 125,
-      slOn: true,
-      lowPx: null,
-      lockArmed: false,
-      lockPct: 0,
-      closedBy: null,
-      ...patch,
-    },
-    {
-      side: "PE",
-      open: true,
-      sold: 100,
-      qty,
-      ltp: pe,
-      slPx: 125,
-      slOn: true,
-      lowPx: null,
-      lockArmed: false,
-      lockPct: 0,
-      closedBy: null,
-    },
+  const both = (ce: number | null, pe: number | null, qty = 65): N930LegSnap[] => [
+    { side: "CE", open: true, sold: 100, qty, ltp: ce },
+    { side: "PE", open: true, sold: 100, qty, ltp: pe },
   ];
   const act = (legs: N930LegSnap[], patch?: Partial<Parameters<typeof tickActions>[0]>) =>
     tickActions({
       entered: true,
       squared: false,
       legs,
-      dayPlus: 6000,
-      dayMinus: 7000,
-      slPct: 25,
-      partnerPct: 15,
+      dayPlus: 600,
+      dayMinus: 700,
       realized: 0,
       ...patch,
     });
 
   if (act(both(100, 100), { entered: false })[0]?.type !== "ENTER") throw new Error("entry is first");
-  if (act(both(100, 100)).some((row) => row.type === "SQUARE")) throw new Error("no clock square");
-  const down = act(both(120, 120));
-  if (down.length !== 1 || down[0]?.type !== "SQUARE" || (down[0].type === "SQUARE" && down[0].reason !== "DAY_MINUS")) {
-    throw new Error("Day − books both legs");
+  if (act(both(100, 100)).some((row) => row.type === "SQUARE")) throw new Error("flat pair does not book");
+  const underLoss = act(both(110, 100));
+  if (underLoss.some((row) => row.type === "SQUARE")) throw new Error("−650 does not book a 700 combined loss");
+  const oneLotLoss = act(both(111, 100));
+  if (
+    oneLotLoss.length !== 1 ||
+    oneLotLoss[0]?.type !== "SQUARE" ||
+    (oneLotLoss[0].type === "SQUARE" && oneLotLoss[0].reason !== "DAY_MINUS")
+  ) {
+    throw new Error("−715 books both legs at the 700 combined loss");
   }
-  const up = act(both(90, 90));
-  if (up[0]?.type !== "SQUARE" || (up[0].type === "SQUARE" && up[0].reason !== "DAY_PLUS")) throw new Error("Day + squares the pair");
+  const underProfit = act(both(91, 100));
+  if (underProfit.some((row) => row.type === "SQUARE")) throw new Error("585 does not book a 600 combined profit");
+  const oneLotProfit = act(both(90, 100));
+  if (
+    oneLotProfit[0]?.type !== "SQUARE" ||
+    (oneLotProfit[0].type === "SQUARE" && oneLotProfit[0].reason !== "DAY_PLUS")
+  ) {
+    throw new Error("650 books both legs at the 600 combined profit");
+  }
   if (act(both(90, null)).some((row) => row.type === "SQUARE")) throw new Error("Day + needs a good LTP on every open leg");
-  if (act(both(124, null)).length !== 0) throw new Error("a missing premium blocks the day square");
-  const sl = act(both(125, 100, 65));
-  if (sl.length !== 1 || sl[0]?.type !== "SL" || (sl[0].type === "SL" && sl[0].via === "partner")) {
-    throw new Error("25% stop closes only that leg");
-  }
-  if (act(both(80, 100, 65)).length !== 0) throw new Error("both open: no leftover and no partner");
-  if (act(both(100, 100), { squared: true }).length !== 0) throw new Error("no resell after the day is done");
-
-  const afterSl = both(null, 100, 65);
-  afterSl[0] = { ...afterSl[0]!, open: false, ltp: null, slOn: false, closedBy: "sl" };
-  const partner = act(afterSl);
-  const tightened = partner.find((row) => row.type === "PARTNER" && row.side === "PE");
-  if (!tightened || tightened.type !== "PARTNER" || Math.abs(tightened.slPx - 115) > 1e-6) {
-    throw new Error("one SL tightens the other stop to 15%");
-  }
-  if (partner.some((row) => row.type === "LEFTOVER" || row.type === "SL")) throw new Error("the partner tick does not cover at cost");
-
-  const partnerHit = both(null, 115, 65);
-  partnerHit[0] = { ...partnerHit[0]!, open: false, ltp: null, slOn: false, closedBy: "sl" };
-  const hit = act(partnerHit);
-  if (!hit.some((row) => row.type === "SL" && row.via === "partner")) throw new Error("partner stop covers at sold × 1.15");
-  if (hit.some((row) => row.type === "LEFTOVER")) throw new Error("partner stop does not also fire leftover");
-
-  const deep = both(null, 70, 65);
-  deep[0] = { ...deep[0]!, open: false, ltp: null, slOn: false, closedBy: "sl" };
-  const locked = act(deep);
-  const arm = locked.find((row) => row.type === "ARM_LOCK");
-  if (!arm || arm.type !== "ARM_LOCK" || arm.lockPct !== 5) throw new Error("30% favorable locks 5");
-  if (locked.some((row) => row.type === "LEFTOVER")) throw new Error("the new low does not cover");
-
-  const giveback = both(null, 95, 65);
-  giveback[0] = { ...giveback[0]!, open: false, ltp: null, slOn: false, closedBy: "sl" };
-  giveback[1] = { ...giveback[1]!, slOn: false, slPx: 115, lowPx: 70, lockArmed: true, lockPct: 5 };
-  if (!act(giveback).some((row) => row.type === "LEFTOVER" && row.side === "PE")) throw new Error("price back to the lock covers");
-  if (leftoverLockPct(24) !== null || leftoverLockPct(25) !== 0 || leftoverLockPct(45) !== 30 || leftoverLockPct(46) !== 31) {
-    throw new Error("leftover rungs");
-  }
+  if (act(both(100, 100), { squared: true }).length !== 0) throw new Error("no resell after the book is done");
 
   const kept = entryPlan(
     { filledQty: 65, fillPx: 110, rate: 110, rejected: false },
@@ -708,8 +504,8 @@ export function assertNineThirtyRules(): void {
   ) {
     throw new Error("−1430 books both legs at the 1400 combined loss");
   }
-  const underProfit = act(both(91, 100, 130), { dayPlus: 1200, dayMinus: 1400 });
-  if (underProfit.some((row) => row.type === "SQUARE")) throw new Error("1170 does not book a 1200 combined profit");
+  const twoLotUnderProfit = act(both(91, 100, 130), { dayPlus: 1200, dayMinus: 1400 });
+  if (twoLotUnderProfit.some((row) => row.type === "SQUARE")) throw new Error("1170 does not book a 1200 combined profit");
   const combinedProfit = act(both(90, 100, 130), { dayPlus: 1200, dayMinus: 1400 });
   if (
     combinedProfit[0]?.type !== "SQUARE" ||
