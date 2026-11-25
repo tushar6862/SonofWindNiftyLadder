@@ -19,6 +19,8 @@ import {
   dayHaltTick,
   defaultFlipLock,
   draftFromLock,
+  entryClockDraft,
+  entryDue,
   entryStrike,
   FLIP,
   flipBuyQuantity,
@@ -33,6 +35,7 @@ import {
   nextTrail,
   openLots,
   parseFlipLock,
+  parseEntryClock,
   parseFlipLots,
   parseFlipTrigger,
   pickFlipExpiry,
@@ -52,6 +55,7 @@ import {
   tradableQuote,
   triggerPx,
   type DayHalt,
+  type FlipEntryMode,
   type FlipLockDraft,
   type FlipLockParams,
   type ExpiryPick,
@@ -119,6 +123,8 @@ type Loaded = {
   chain: ChainResolved;
 };
 
+type FlipVenue = "live" | "demo";
+
 type OrderSent = {
   filledQty: number;
   fillPx: number | null;
@@ -144,6 +150,9 @@ type SessionStore = {
   dayClosed: boolean;
   halt: DayHalt | null;
   rebalance: Rebalance | null;
+  venue: FlipVenue;
+  entryMode: FlipEntryMode;
+  entryClock: string;
   logs: FlipLog[];
   logId: number;
 };
@@ -153,6 +162,9 @@ function emptyStore(
   triggerPct: number = FLIP.triggerDefault,
   lock: FlipLockParams = defaultFlipLock(),
   lots: number = FLIP.lots,
+  venue: FlipVenue = "demo",
+  entryMode: FlipEntryMode = "timer",
+  entryClock = "09:15",
 ): SessionStore {
   return {
     sessionDate: today,
@@ -171,6 +183,9 @@ function emptyStore(
     dayClosed: false,
     halt: null,
     rebalance: null,
+    venue,
+    entryMode,
+    entryClock,
     logs: [],
     logId: 1,
   };
@@ -343,6 +358,11 @@ function readLock(raw: unknown): PairLock | null {
   };
 }
 
+function readVenue(raw: unknown, openBook: boolean): FlipVenue {
+  if (raw === "live" || raw === "demo") return raw;
+  return openBook ? "live" : "demo";
+}
+
 function loadStore(): SessionStore {
   const clock = istNow();
   const phase = clockPhase(clock);
@@ -355,7 +375,11 @@ function loadStore(): SessionStore {
     const lock = readFlipLock(parsed.lock);
     const lotsParsed = parseFlipLots(String(parsed.lots ?? FLIP.lots));
     const lots = lotsParsed.ok ? lotsParsed.lots : FLIP.lots;
-    if (parsed.sessionDate !== clock.date) return emptyStore(clock.date, triggerPct, lock, lots);
+    const entryMode: FlipEntryMode = parsed.entryMode === "normal" ? "normal" : "timer";
+    const entryClock = parseEntryClock(String(parsed.entryClock ?? "09:15")) != null ? String(parsed.entryClock) : "09:15";
+    if (parsed.sessionDate !== clock.date) {
+      return emptyStore(clock.date, triggerPct, lock, lots, readVenue(parsed.venue, false), entryMode, entryClock);
+    }
     const legs = (Array.isArray(parsed.legs) ? parsed.legs : [])
       .map((row) => {
         const leg = readLeg(row);
@@ -373,7 +397,7 @@ function loadStore(): SessionStore {
     const shut = phase === "shut";
     const realized = Number(parsed.realized) || 0;
     const peak = typeof parsed.lockPeak === "number" && Number.isFinite(parsed.lockPeak) ? parsed.lockPeak : null;
-    const halt = parsed.halt === "loss" || parsed.halt === "target" ? parsed.halt : null;
+    const halt = parsed.halt === "target" ? parsed.halt : null;
     return {
       sessionDate: clock.date,
       triggerPct,
@@ -391,6 +415,9 @@ function loadStore(): SessionStore {
       dayClosed: shut || parsed.dayClosed === true,
       halt,
       rebalance: shut || halt != null ? null : readRebalance(parsed.rebalance),
+      venue: readVenue(parsed.venue, legs.length > 0 || parsed.pairLock != null),
+      entryMode,
+      entryClock,
       logs: logs.slice(0, 80),
       logId: logs.reduce((max, row) => Math.max(max, row.id), 0) + 1,
     };
@@ -465,6 +492,15 @@ function legQuoteMark(leg: OpenLeg): number | null {
   return longMark(leg.buyAvg, ltp, leg.qty);
 }
 
+/** Screen mark follows the last print. Orders still require a live print. */
+function screenMark(leg: OpenLeg): number | null {
+  const ltp = displayPx(leg.iid);
+  if (ltp == null) return null;
+  if (leg.mode === "short") return shortMark(leg.sellFill, ltp, leg.qty);
+  if (leg.buyAvg == null) return null;
+  return longMark(leg.buyAvg, ltp, leg.qty);
+}
+
 export default function FlipPanel({ index, active }: { index: IndexName; active: boolean }) {
   const boot = useRef<SessionStore | null>(null);
   if (!boot.current) boot.current = loadStore();
@@ -488,6 +524,9 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
   const [dayClosed, setDayClosed] = useState(initial.dayClosed);
   const [halt, setHalt] = useState<DayHalt | null>(initial.halt);
   const [rebalance, setRebalance] = useState<Rebalance | null>(initial.rebalance);
+  const [venue, setVenue] = useState<FlipVenue>(initial.venue);
+  const [entryMode, setEntryMode] = useState<FlipEntryMode>(initial.entryMode);
+  const [entryClock, setEntryClock] = useState(initial.entryClock);
   const [logs, setLogs] = useState<FlipLog[]>(initial.logs);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
@@ -510,6 +549,9 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
   const haltRef = useRef(halt);
   const rebalanceRef = useRef(rebalance);
   const haltPendingRef = useRef<DayHalt | null>(null);
+  const venueRef = useRef(venue);
+  const entryModeRef = useRef(entryMode);
+  const entryClockRef = useRef(entryClock);
   /** A short that crossed together with the leg we just flipped. It must cool off before it can flip. */
   const flipHoldRef = useRef<FlipSide | null>(null);
   const loadedRef = useRef(loaded);
@@ -537,6 +579,9 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
   dayClosedRef.current = dayClosed;
   haltRef.current = halt;
   rebalanceRef.current = rebalance;
+  venueRef.current = venue;
+  entryModeRef.current = entryMode;
+  entryClockRef.current = entryClock;
   loadedRef.current = loaded;
   indexRef.current = index;
   activeRef.current = active;
@@ -588,6 +633,16 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     setRealized(next);
   }, []);
 
+  const bookLeg = useCallback((leg: OpenLeg) => {
+    if (venueRef.current === "demo") return;
+    remember(leg);
+  }, []);
+
+  const dropLeg = useCallback((iid: number, pnl?: number) => {
+    if (venueRef.current === "demo") return;
+    clearLocalPosition(iid, pnl);
+  }, []);
+
   const commitProfit = useCallback((floor: number, peak: number | null) => {
     floorRef.current = floor;
     peakRef.current = peak;
@@ -613,6 +668,9 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       dayClosed,
       halt,
       rebalance,
+      venue,
+      entryMode,
+      entryClock,
       logs,
       logId: logIdRef.current,
     };
@@ -621,7 +679,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     } catch {
       /* ignore quota */
     }
-  }, [triggerPct, lots, lockParams, lockFloor, lockPeak, cycleBase, legs, pairLock, stagedAtm, stagedSpot, realized, started, dayClosed, halt, rebalance, logs]);
+  }, [triggerPct, lots, lockParams, lockFloor, lockPeak, cycleBase, legs, pairLock, stagedAtm, stagedSpot, realized, started, dayClosed, halt, rebalance, venue, entryMode, entryClock, logs]);
 
   useEffect(() => {
     const name = flipIndex(index);
@@ -677,6 +735,18 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     };
   }, [index, active]);
 
+  const quoteKey = [
+    index,
+    active ? 1 : 0,
+    started ? 1 : 0,
+    loaded?.chain.spotToken ?? 0,
+    loaded?.chain.optionSegment ?? 0,
+    stagedAtm ?? 0,
+    pairLock ? `${pairLock.ceIid}:${pairLock.peIid}:${pairLock.strike}` : "",
+    rebalance ? `${rebalance.side}:${rebalance.anchor}` : "",
+    legs.map((leg) => `${leg.segment}:${leg.iid}`).join(","),
+  ].join("|");
+
   useEffect(() => {
     const instruments: { exchangeSegment: number; exchangeInstrumentID: number }[] = [];
     const seen = new Set<number>();
@@ -720,7 +790,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       cancelled = true;
       setHotFocus("flip", []);
     };
-  }, [index, active, started, loaded, legs, pairLock, stagedAtm, rebalance]);
+  }, [quoteKey]);
 
   const sendOrder = useCallback(
     async (
@@ -738,6 +808,10 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         counted: false,
         error,
       });
+      if (venueRef.current === "demo") {
+        if (rate == null) return blank("No live quote. Demo order not booked.");
+        return { filledQty: orderQuantity, fillPx: rate, rate, counted: true, error: null };
+      }
       if (rate == null && !exit) return blank("No live quote. Order not sent.");
       let response: { ok?: boolean; error?: string; raw?: unknown } | null = null;
       try {
@@ -813,12 +887,12 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         addRealized(booked);
         const left = leg.qty - used;
         if (left <= 0) {
-          clearLocalPosition(leg.iid, booked);
+          dropLeg(leg.iid, booked);
           commitLegs(legsRef.current.filter((row) => row.iid !== leg.iid));
         } else {
           const nextLeg = { ...leg, qty: left };
           commitLegs(legsRef.current.map((row) => (row.iid === leg.iid ? nextLeg : row)));
-          remember(nextLeg);
+          bookLeg(nextLeg);
         }
         pushLog(
           `${reason} ${orderSide} ${leg.side} ${fmtStrike(leg.strike)} fill ${fmtPrice(sent.fillPx)} booked ${fmtPnl(booked)}`,
@@ -839,7 +913,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
 
   const sellLocked = useCallback(async () => {
     const lock = lockRef.current;
-    if (!lock || clockPhase(istNow()) !== "open") return;
+    if (!lock || !entryDue(istNow(), entryModeRef.current, entryClockRef.current)) return;
     const missing = (["CE", "PE"] as const).filter((side) => !legsRef.current.some((row) => row.side === side));
     if (!missing.length) {
       commitLock(null);
@@ -849,7 +923,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       missing.map(async (side) => {
         const iid = side === "CE" ? lock.ceIid : lock.peIid;
         const rate = livePrint(iid);
-        if (clockPhase(istNow()) !== "open") return { side, iid, rate, sent: null as OrderSent | null };
+        if (!entryDue(istNow(), entryModeRef.current, entryClockRef.current)) return { side, iid, rate, sent: null as OrderSent | null };
         if (!(rate != null && rate > 0)) {
           note(`quote-${side}`, `${side} has no live quote. Sell waits.`, "info");
           return { side, iid, rate, sent: null as OrderSent | null };
@@ -886,7 +960,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       );
       next = [...next.filter((item) => item.side !== row.side), leg];
       changed = true;
-      remember(leg);
+      bookLeg(leg);
       pushLog(`SELL ${row.side} ${fmtStrike(lock.strike)} fill ${fmtPrice(row.sent.fillPx)} qty ${fmtQty(qty)}`, "entry");
     }
     if (changed) commitLegs(next);
@@ -930,14 +1004,14 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       if (left > 0) {
         const nextLeg = { ...live, qty: left };
         commitLegs(legsRef.current.map((row) => (row.iid === live.iid ? nextLeg : row)));
-        remember(nextLeg);
+        bookLeg(nextLeg);
         pushLog(
           `${reason} SELL ${live.side} ${fmtStrike(live.strike)} fill ${fmtPrice(sent.fillPx)} booked ${fmtPnl(booked)}. Long left ${fmtQty(left)}.`,
           "exit",
         );
         return false;
       }
-      clearLocalPosition(live.iid, booked);
+      dropLeg(live.iid, booked);
       commitLegs(legsRef.current.filter((row) => row.iid !== live.iid));
       pushLog(`${reason} SELL ${live.side} ${fmtStrike(live.strike)} fill ${fmtPrice(sent.fillPx)} booked ${fmtPnl(booked)}.`, "exit");
       logState();
@@ -965,14 +1039,14 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       if (split.longLeft > 0) {
         const nextLeg = { ...live, qty: split.longLeft };
         commitLegs(legsRef.current.map((row) => (row.iid === live.iid ? nextLeg : row)));
-        remember(nextLeg);
+        bookLeg(nextLeg);
         pushLog(
           `REVERSAL SELL ${live.side} ${fmtStrike(live.strike)} fill ${fmtPrice(sent.fillPx)} covered ${fmtQty(split.cover)}. Long left ${fmtQty(split.longLeft)}.`,
           "exit",
         );
         return;
       }
-      clearLocalPosition(live.iid, bookedLong(sent.fillPx, live.buyAvg, split.cover));
+      dropLeg(live.iid, bookedLong(sent.fillPx, live.buyAvg, split.cover));
       let shortQty = split.shortQty;
       let fill = sent.fillPx;
       if (shortQty <= 0) {
@@ -988,7 +1062,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       }
       const nextLeg = shortFromFill(live, fill, shortQty, triggerRef.current);
       commitLegs(legsRef.current.map((row) => (row.iid === live.iid ? nextLeg : row)));
-      remember(nextLeg);
+      bookLeg(nextLeg);
       pushLog(
         `REVERSAL ${live.side} ${fmtStrike(live.strike)} sell ${fmtPrice(fill)} qty ${fmtQty(flipBuyQuantity(live.qty))}. New short ${fmtQty(shortQty)}. Trail ${fmtPrice(fill)}.`,
         "entry",
@@ -1018,7 +1092,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       if (split.shortLeft > 0) {
         const nextLeg = { ...live, qty: split.shortLeft };
         commitLegs(legsRef.current.map((row) => (row.iid === live.iid ? nextLeg : row)));
-        remember(nextLeg);
+        bookLeg(nextLeg);
         pushLog(
           `FLIP BUY ${live.side} ${fmtStrike(live.strike)} fill ${fmtPrice(sent.fillPx)} covered ${fmtQty(split.cover)}. Short left ${fmtQty(split.shortLeft)}.`,
           "exit",
@@ -1036,7 +1110,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
           reversal: reversalTrigger(sent.fillPx),
         };
         commitLegs(legsRef.current.map((row) => (row.iid === live.iid ? nextLeg : row)));
-        remember(nextLeg);
+        bookLeg(nextLeg);
         const booked = bookedShort(live.sellFill, sent.fillPx, split.cover);
         pushLog(
           `FLIP ${live.side} ${fmtStrike(live.strike)} buy ${fmtPrice(sent.fillPx)} qty ${fmtQty(sent.filledQty)}. Short booked ${fmtPnl(booked)}. Long avg ${fmtPrice(sent.fillPx)}. Stop ${fmtPrice(nextLeg.reversal)}.`,
@@ -1046,7 +1120,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         logState();
         return;
       }
-      clearLocalPosition(live.iid, bookedShort(live.sellFill, sent.fillPx, split.cover));
+      dropLeg(live.iid, bookedShort(live.sellFill, sent.fillPx, split.cover));
       commitLegs(legsRef.current.filter((row) => row.iid !== live.iid));
       pushLog(`FLIP BUY ${live.side} ${fmtStrike(live.strike)} closed the short. No long opened.`, "exit");
       logState();
@@ -1100,7 +1174,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     );
     commitRebalance(null);
     commitLegs([...legsRef.current.filter((item) => item.side !== job.side), leg]);
-    remember(leg);
+    bookLeg(leg);
     notedRef.current.delete("otm");
     pushLog(`OTM SELL ${job.side} ${fmtStrike(strike)} fill ${fmtPrice(sent.fillPx)} qty ${fmtQty(qty)}. Near ${FLIP.otmPremium}.`, "entry");
     logState();
@@ -1248,7 +1322,8 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         }
       }
 
-      if (ordersOk && clockPhase(istNow()) === "open") {
+      if (haltRef.current === "loss") commitHalt(null);
+      if (ordersOk && phase !== "shut") {
         const rows = legsRef.current;
         const longs = rows.filter((row) => row.mode === "long" && row.buyAvg != null);
         const run = async (work: () => Promise<unknown>) => {
@@ -1334,7 +1409,8 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       const flat = legsRef.current.length === 0 && lockRef.current == null && rebalanceRef.current == null;
       if (!name && flat) note("index", "Flip trades NIFTY or SENSEX only. No order.", "info");
 
-      if (lockRef.current && ordersOk && clockPhase(istNow()) === "open") {
+      const due = entryDue(clock, entryModeRef.current, entryClockRef.current);
+      if (lockRef.current && ordersOk && due) {
         busyRef.current = true;
         setBusy(true);
         await sellLocked();
@@ -1343,11 +1419,10 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
 
       if (!flat) return;
       if (!name) return;
-      if (phase === "pre") {
-        note("plan", "Before 09:15. START waits. ATM stages at 09:10.", "info");
+      if (!due && !ordersOk) {
+        note("plan", `Timer ${entryClockRef.current}. Sell at ${entryClockRef.current}.`, "info");
         return;
       }
-      if (!ordersOk) return;
       const book = loadedRef.current;
       if (!book || book.index !== name || book.date !== clock.date) {
         note("chain", chainNote || "Expiry chain is not ready.", "info");
@@ -1367,13 +1442,14 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
           `Staged ATM ${fmtStrike(atm)} from spot ${fmtPrice(spot)}. Quotes ${stagedBracket.map((n) => fmtStrike(n)).join(", ")}.`,
           "info",
         );
-        if (phase !== "open") note("plan", `ATM ${fmtStrike(atm)} staged. Sell at 09:15.`, "info");
+        if (!due) note("plan", `ATM ${fmtStrike(atm)} staged. Sell at ${entryClockRef.current}.`, "info");
         return;
       }
-      if (phase !== "open") {
-        note("plan", `ATM ${fmtStrike(stagedAtmRef.current ?? 0)} staged. Sell at 09:15.`, "info");
+      if (!due) {
+        note("plan", `ATM ${fmtStrike(stagedAtmRef.current ?? 0)} staged. Sell at ${entryClockRef.current}.`, "info");
         return;
       }
+      if (!ordersOk) return;
       const spot = spotNow(book.chain);
       const staged = stagedAtmRef.current;
       if (spot == null || staged == null) {
@@ -1429,6 +1505,14 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     return () => window.clearInterval(id);
   }, []);
 
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (!activeRef.current && !startedRef.current && legsRef.current.length === 0) return;
+      setMarkTick((n) => (n + 1) % 1_000_000);
+    }, 400);
+    return () => window.clearInterval(id);
+  }, []);
+
   const saveParameters = () => {
     const parsedLots = parseFlipLots(draftLots);
     if (!parsedLots.ok) {
@@ -1463,6 +1547,31 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     toast({ title: "Flip settings", description: "Saved. Rupee boxes are per lot." });
   };
 
+  const chooseEntry = (next: FlipEntryMode) => {
+    if (next === entryModeRef.current) return;
+    entryModeRef.current = next;
+    setEntryMode(next);
+    pushLog(
+      next === "normal" ? "Normal. START sells on the next tick." : `Timer. START waits until ${entryClockRef.current}.`,
+      "info",
+    );
+  };
+
+  const chooseVenue = (next: FlipVenue) => {
+    if (next === venueRef.current) return;
+    if (startedRef.current || legsRef.current.length > 0 || lockRef.current != null || rebalanceRef.current != null) {
+      toast({
+        title: "Flip",
+        description: "Switch Live or Demo only when the card is flat and stopped.",
+        variant: "destructive",
+      });
+      return;
+    }
+    venueRef.current = next;
+    setVenue(next);
+    pushLog(next === "demo" ? "Demo. Fills use the live quote. Nothing is sent to XTS." : "Live. Orders go to XTS.", "info");
+  };
+
   const startDesk = () => {
     if (busyRef.current || tickingRef.current) return;
     const phase = clockPhase(istNow());
@@ -1475,10 +1584,11 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       pushLog("After 15:15. START sends no new sell.", "info");
       return;
     }
-    const dayBlock = haltRef.current ?? dayHaltTick(realizedRef.current);
-    if (dayBlock) {
-      if (!haltRef.current) commitHalt(dayBlock);
-      const text = dayBlock === "loss" ? "Daily loss ₹5,000. START sends no new sell." : "Daily target ₹15,000. START sends no new sell.";
+    if (haltRef.current === "loss") commitHalt(null);
+    const dayBlock = haltRef.current === "target" ? "target" : dayHaltTick(realizedRef.current);
+    if (dayBlock === "target") {
+      if (!haltRef.current) commitHalt("target");
+      const text = "Daily target ₹15,000. START sends no new sell.";
       pushLog(text, "info");
       toast({ title: "Flip", description: text, variant: "destructive" });
       return;
@@ -1497,7 +1607,9 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     startedRef.current = true;
     setStarted(true);
     pushLog(
-      phase === "open" ? "START. Staging ATM and selling on the next tick." : "START. Waiting. ATM stages at 09:10. Sell at 09:15.",
+      entryModeRef.current === "normal"
+        ? "START. Normal. Selling on the next tick."
+        : `START. Timer ${entryClockRef.current}. Sell at ${entryClockRef.current}.`,
       "info",
     );
   };
@@ -1550,9 +1662,14 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
   const previewRow = chainNow && previewStrike != null ? rowAt(chainNow, previewStrike) : null;
   const ceWatch = ceLeg ? displayPx(ceLeg.iid) : previewRow ? displayPx(previewRow.ce) : null;
   const peWatch = peLeg ? displayPx(peLeg.iid) : previewRow ? displayPx(previewRow.pe) : null;
-  const synth = previewStrike != null && ceWatch != null && peWatch != null ? syntheticFuture(previewStrike, ceWatch, peWatch) : null;
-  const bracket = previewStrike != null ? atmBracket(previewStrike) : null;
-  const marks = legs.map((leg) => legQuoteMark(leg));
+  const liveAtm = spotShown != null ? stageAtm(spotShown) : null;
+  const atmShow = liveAtm ?? previewStrike;
+  const atmRow = chainNow && atmShow != null ? rowAt(chainNow, atmShow) : null;
+  const atmCe = atmRow ? displayPx(atmRow.ce) : null;
+  const atmPe = atmRow ? displayPx(atmRow.pe) : null;
+  const synth = atmShow != null && atmCe != null && atmPe != null ? syntheticFuture(atmShow, atmCe, atmPe) : null;
+  const bracket = atmShow != null ? atmBracket(atmShow) : null;
+  const marks = legs.map((leg) => screenMark(leg));
   const markReady = marks.every((n) => n != null);
   const live = markReady ? marks.reduce<number>((sum, n) => sum + (n ?? 0), 0) : null;
   const gross = live == null ? null : realized + live;
@@ -1587,11 +1704,9 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         : halt === "target"
           ? "Daily target closed"
           : "No new sell"
-      : phase === "pre"
-        ? "Stages at 09:10"
-        : phase === "stage"
-          ? "Sells at 09:15"
-          : phase === "shut"
+      : entryMode === "timer" && !entryDue(clock, entryMode, entryClock)
+        ? `Sells at ${entryClock}`
+        : phase === "shut"
             ? "Session closed"
             : "Next tick";
   const qtyLabel = name ? `${lots} × ${FLIP.lotSize[name]} = ${fmtQty(sellQuantity(name, lots))}` : `${lots} lots`;
@@ -1608,9 +1723,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
   const cycleMtm = live == null ? null : realized - cycleBase + live;
   const status = !name
     ? "Select NIFTY or SENSEX. This desk sends no order for another index."
-    : halt === "loss"
-      ? "Daily loss ₹5,000. The card is closed for today."
-      : halt === "target"
+    : halt === "target"
         ? "Daily target ₹15,000. The card is closed for today."
         : phase === "shut" || dayClosed
           ? "After 15:15. No new sell. An open leg is bought if short and sold if long."
@@ -1628,13 +1741,13 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
                     ? rebalance
                       ? `Selling the far ${rebalance.side} near ₹${FLIP.otmPremium} to rebuild the short.`
                       : "One leg is open. The other sell is still working. A new straddle waits until the card is flat."
-                    : phase === "pre"
-                      ? "Before 09:15. START waits. ATM stages at 09:10."
-                      : phase === "stage"
-                        ? stagedAtm
-                          ? `ATM ${fmtStrike(stagedAtm)} staged. Sell at 09:15.`
-                          : "Waiting for a live spot to stage the ATM."
-                        : "Flat card. Staging the ATM from this spot and selling on the next tick.";
+                    : entryMode === "normal"
+                      ? "Normal. Flat card. Selling on the next tick."
+                      : entryDue(clock, entryMode, entryClock)
+                        ? "Timer time has passed. Selling on the next tick."
+                        : stagedAtm
+                          ? `Timer ${entryClock}. ATM ${fmtStrike(stagedAtm)} is staged. Sell at ${entryClock}.`
+                          : `Timer ${entryClock}. START is on. Sell at ${entryClock}.`;
 
   const clockLabel = `${String(clock.hour).padStart(2, "0")}:${String(clock.minute).padStart(2, "0")}:${String(clock.second).padStart(2, "0")}`;
 
@@ -1687,11 +1800,12 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
           </div>
           <div className="n930-cell">
             <div className="n930-kicker">ATM</div>
-            <div className="n930-px">{previewStrike != null ? fmtStrike(previewStrike) : "—"}</div>
+            <div className="n930-px">{atmShow != null ? fmtStrike(atmShow) : "—"}</div>
             <div className="n930-meta">
               {spotShown != null ? `spot ${fmtPrice(spotShown)}` : chainNow ? "spot —" : "—"}
-              {ceWatch != null ? ` · CE ${fmtPrice(ceWatch)}` : ""}
-              {peWatch != null ? ` · PE ${fmtPrice(peWatch)}` : ""}
+              {ceLeg && atmShow != null && ceLeg.strike !== atmShow ? ` · pos ${fmtStrike(ceLeg.strike)}` : ""}
+              {atmCe != null ? ` · CE ${fmtPrice(atmCe)}` : ""}
+              {atmPe != null ? ` · PE ${fmtPrice(atmPe)}` : ""}
               {synth != null ? ` · synth ${fmtPrice(synth)}` : ""}
               {bracket ? ` · ${bracket.map((n) => fmtStrike(n)).join(" · ")}` : ""}
             </div>
@@ -1702,6 +1816,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
             <div className="n930-meta">
               {qtyLabel}
               {` · trigger ${triggerPct}%`}
+              {venue === "demo" ? " · Demo" : " · XTS"}
               {chainNote ? ` · ${chainNote}` : ""}
             </div>
           </div>
@@ -1710,6 +1825,64 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         <div className="cd-trade">
           <p className="cd-trade__status">{status}</p>
           <div className="cd-trade__actions">
+            <div className="nl-toggle" role="group" aria-label="Timer or Normal">
+              <button
+                type="button"
+                className={`nl-toggle__btn${entryMode === "timer" ? " nl-toggle__btn--on" : ""}`}
+                aria-pressed={entryMode === "timer"}
+                onClick={() => chooseEntry("timer")}
+              >
+                Timer
+              </button>
+              <button
+                type="button"
+                className={`nl-toggle__btn${entryMode === "normal" ? " nl-toggle__btn--on" : ""}`}
+                aria-pressed={entryMode === "normal"}
+                onClick={() => chooseEntry("normal")}
+              >
+                Normal
+              </button>
+            </div>
+            {entryMode === "timer" ? (
+              <label className="cd-field" style={{ width: 92 }}>
+                <span className="cd-field__label">Time</span>
+                <input
+                  aria-label="Sell time"
+                  inputMode="numeric"
+                  placeholder="09:15"
+                  maxLength={5}
+                  value={entryClock}
+                  onChange={(e) => {
+                    const next = entryClockDraft(e.target.value);
+                    setEntryClock(next);
+                    if (parseEntryClock(next) != null) entryClockRef.current = next;
+                  }}
+                  onBlur={() => {
+                    if (parseEntryClock(entryClock) != null) return;
+                    setEntryClock(entryClockRef.current);
+                  }}
+                  className="ramsetu-glass-select cd-field__control"
+                />
+              </label>
+            ) : null}
+            <div className="nl-toggle" role="group" aria-label="Live or Demo">
+              <button
+                type="button"
+                className={`nl-toggle__btn nl-toggle__btn--demo${venue === "demo" ? " nl-toggle__btn--on" : ""}`}
+                aria-pressed={venue === "demo"}
+                onClick={() => chooseVenue("demo")}
+              >
+                Demo
+              </button>
+              <button
+                type="button"
+                className={`nl-toggle__btn nl-toggle__btn--pe${venue === "live" ? " nl-toggle__btn--on" : ""}`}
+                aria-pressed={venue === "live"}
+                onClick={() => chooseVenue("live")}
+              >
+                Live
+              </button>
+            </div>
             <label className="cd-field" style={{ width: 88 }}>
               <span className="cd-field__label">Lots</span>
               <input
@@ -1800,7 +1973,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
             {(["CE", "PE"] as const).map((side) => {
               const leg = side === "CE" ? ceLeg : peLeg;
               const watch = side === "CE" ? ceWatch : peWatch;
-              const mark = leg ? legQuoteMark(leg) : null;
+              const mark = leg ? screenMark(leg) : null;
               return (
                 <div key={side}>
                   <div className="ramsetu-glass-toolbar__label">{side}</div>
@@ -1843,7 +2016,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
                 The entry keeps the staged ATM while the spot is within 60 points. Both legs need a live quote. A blank, zero, or previous close is not a quote.
                 Each short trails down. The trigger is the trailing low times one plus the saved percent, default 15, save 7 to 15. When that leg prints at the trigger, the buy is twice the short.
                 Half closes the short and half opens a long. That long stops 10% under the buy: a sell of twice the long closes it and opens a new short. After the long is 15% in profit, a 5% pullback from the high books it and sells the far OTM near ₹70.
-                CE and PE are never long together. If the other short flips while one leg is long, that long is sold first and the short flips only after the fill. A loss of ₹5,000 or a profit of ₹15,000 on the day flattens the card and blocks the next START. STOP and 15:15 still flatten. The card price is the broker fill. Slippage of 0.20 to 0.40 is not added again.
+                CE and PE are never long together. If the other short flips while one leg is long, that long is sold first and the short flips only after the fill. A loss does not block the next START. A profit of ₹15,000 on the day still closes the card. Timer waits until the set clock. Normal sells on the next tick after START. STOP and 15:15 still flatten. The card price is the broker fill. Slippage of 0.20 to 0.40 is not added again.
                 Profit lock boxes are per lot. At 2 lots the defaults are step ₹3,000, lock ₹2,000, trail ₹3,400, and 80%. The floor only rises. A missing price does not square. A loss before the first lock stays open. The next START begins a new cycle.
               </p>
             ) : (

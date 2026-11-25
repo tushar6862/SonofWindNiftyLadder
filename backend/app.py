@@ -546,6 +546,33 @@ def fyers_callback():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.post("/api/fyers/place_order")
+def fyers_place_order():
+    """Flip demo route. A market order on Fyers. Live Flip orders use /api/ix/place_order."""
+    username = (_current_user() or "").strip().upper()
+    if not username:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    try:
+        iid = int(body.get("exchangeInstrumentID") or body.get("exchangeInstrumentId") or 0)
+    except (TypeError, ValueError):
+        iid = 0
+    side = str(body.get("orderSide") or "").strip().upper()
+    try:
+        qty = int(body.get("orderQuantity") or 0)
+    except (TypeError, ValueError):
+        qty = 0
+    if iid <= 0 or side not in ("BUY", "SELL") or qty <= 0:
+        return jsonify({"ok": False, "error": "Need exchangeInstrumentID, BUY or SELL, and quantity"}), 400
+    try:
+        from market.fyers_orders import place_market_order
+
+        placed = place_market_order(instrument_id=iid, side=side, qty=qty)
+        return jsonify({"ok": True, **placed})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @app.post("/api/fyers/quotes")
 def fyers_quotes():
     """LTP for a list of XTS tokens from Fyers. Not an XTS touchline call."""
@@ -598,20 +625,6 @@ def fyers_topbar_focus():
         return jsonify({"ok": True, **out})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/api/vwap/data", methods=["GET"])
-def vwap_data():
-    """Session VWAP for the top-bar index. Spot candles come from Fyers."""
-    index = str(request.args.get("index") or "NIFTY").strip().upper()
-    if index not in ("NIFTY", "BANKNIFTY", "SENSEX"):
-        return jsonify({"ok": False, "error": "index must be NIFTY, BANKNIFTY, or SENSEX"}), 400
-    try:
-        from market.nifty_vwap import get_index_vwap
-
-        return jsonify(get_index_vwap(index))
-    except Exception as e:
-        return jsonify({"ok": False, "index": index, "error": str(e)}), 500
 
 
 @app.route("/api/cd/range", methods=["GET"])

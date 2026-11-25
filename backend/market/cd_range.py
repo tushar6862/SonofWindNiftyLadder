@@ -11,20 +11,13 @@ then the next month.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
-
-from market.nifty_vwap import (
-    _as_float,
-    _in_cash_window,
-    _minute_dt,
-    _px2,
-    select_session_date,
-)
 
 _log = logging.getLogger(__name__)
 
@@ -33,12 +26,59 @@ LOOKBACK = 4
 TF_MINUTES = 15
 MIN_GAP = 50.0
 SESSION_OPEN = (9, 15)
+SESSION_LAST = (15, 29)
 FUTURE_SEGMENT = 12
 _CACHE_TTL_SEC = 10.0
 _CACHE: dict[str, Any] = {}
 _lock = threading.Lock()
 _FUT_RE = re.compile(r"^SENSEX\d{2}[A-Z]{3}FUT$")
 _MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+
+def _px2(value: float) -> float:
+    return round(float(value) + 1e-9, 2)
+
+
+def _minute_dt(epoch: int) -> datetime | None:
+    try:
+        raw = int(epoch)
+    except (TypeError, ValueError):
+        return None
+    if raw <= 0 or raw > 10_000_000_000:
+        return None
+    return datetime.fromtimestamp(raw, IST).replace(second=0, microsecond=0)
+
+
+def _in_cash_window(dt: datetime) -> bool:
+    hm = (dt.hour, dt.minute)
+    return SESSION_OPEN <= hm <= SESSION_LAST
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+
+def select_session_date(now: datetime, dates: set[date]) -> date | None:
+    """Cash session resets at 09:15 IST. A live weekday uses that day only."""
+    today = now.date()
+    hm = (now.hour, now.minute)
+    weekday = today.weekday() < 5
+    if weekday and SESSION_OPEN <= hm <= (15, 30):
+        return today if today in dates else None
+    if weekday and hm > (15, 30) and today in dates:
+        return today
+    prior = sorted(d for d in dates if d < today)
+    if prior:
+        return prior[-1]
+    if today in dates:
+        return today
+    return None
 
 
 def _session_minutes(bars: list[dict[str, Any]]) -> dict[date, dict[datetime, dict[str, float]]]:

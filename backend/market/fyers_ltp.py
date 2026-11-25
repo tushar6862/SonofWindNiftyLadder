@@ -189,6 +189,17 @@ def _master_paths() -> list[Path]:
     return sorted(cache.glob(_MASTER_GLOB), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def _symbol_master_paths() -> list[Path]:
+    """Newest NSE file plus the newest BSE file. One file is not both venues."""
+    paths = _master_paths()
+    picked: list[Path] = []
+    for needle in ("NSEFO", "BSEFO"):
+        found = next((path for path in paths if needle in path.name.upper()), None)
+        if found is not None and found not in picked:
+            picked.append(found)
+    return picked or paths[:1]
+
+
 _SYM_INDEX: dict[int, str] = {}
 _SYM_INDEX_KEY = ""
 
@@ -197,8 +208,11 @@ def _symbol_from_master_parts(parts: list[str]) -> str | None:
     """Trading symbol from one instruments-master row. parts[1] is the XTS token."""
     for c in (parts[4].strip() if len(parts) > 4 else "", parts[-1].strip() if parts else ""):
         c = c.strip().upper().replace(" ", "")
-        if c.startswith("NIFTY") and (c.endswith("CE") or c.endswith("PE")) and any(ch.isdigit() for ch in c):
-            return f"NSE:{c}"
+        if (c.endswith("CE") or c.endswith("PE")) and any(ch.isdigit() for ch in c):
+            if c.startswith("SENSEX"):
+                return f"BSE:{c}"
+            if c.startswith("NIFTY"):
+                return f"NSE:{c}"
     try:
         name = parts[3].strip().upper()
         exp = parts[16].strip() if len(parts) > 16 else ""
@@ -227,34 +241,34 @@ def _symbol_from_master_parts(parts: list[str]) -> str | None:
 def _option_symbol_index() -> dict[int, str]:
     """token → Fyers option symbol. Match column 1 only — strike 26000 is not token 26000."""
     global _SYM_INDEX, _SYM_INDEX_KEY
-    paths = _master_paths()
-    path = paths[0] if paths else None
-    if path is None:
+    paths = _symbol_master_paths()
+    if not paths:
         return {}
     try:
-        key = f"{path}|{path.stat().st_mtime_ns}"
+        key = "|".join(f"{path}|{path.stat().st_mtime_ns}" for path in paths)
     except Exception:
-        key = str(path)
+        key = "|".join(str(path) for path in paths)
     if key == _SYM_INDEX_KEY and _SYM_INDEX:
         return _SYM_INDEX
     index: dict[int, str] = {}
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return _SYM_INDEX
-    for line in text.splitlines():
-        parts = line.split("|")
-        if len(parts) < 5:
-            continue
+    for path in paths:
         try:
-            tid = int(parts[1].strip())
+            text = path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
-        if tid <= 0 or tid in index:
-            continue
-        sym = _symbol_from_master_parts(parts)
-        if sym:
-            index[tid] = sym
+        for line in text.splitlines():
+            parts = line.split("|")
+            if len(parts) < 5:
+                continue
+            try:
+                tid = int(parts[1].strip())
+            except Exception:
+                continue
+            if tid <= 0 or tid in index:
+                continue
+            sym = _symbol_from_master_parts(parts)
+            if sym:
+                index[tid] = sym
     _SYM_INDEX = index
     _SYM_INDEX_KEY = key
     return index

@@ -3013,6 +3013,10 @@ body.sow-has-dashboard-bg {
   background: linear-gradient(145deg, hsl(0 72% 48% / 0.95) 0%, hsl(0 68% 38% / 0.98) 100%);
 }
 
+.nl-toggle__btn--demo.nl-toggle__btn--on {
+  background: linear-gradient(145deg, hsl(152 62% 38% / 0.96) 0%, hsl(152 64% 28% / 0.98) 100%);
+}
+
 .nl-strike-dd__btn {
   display: inline-flex;
   align-items: center;

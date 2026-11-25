@@ -219,13 +219,46 @@ export function shouldBookLong(ltp: number | null, exitPx: number | null): boole
 }
 
 export type DayHalt = "loss" | "target";
+export type FlipEntryMode = "timer" | "normal";
 
-/** Day MTM is booked plus open marks. A missing price leaves the day alone. */
+/** Day target still closes the card. A loss does not. The next START is allowed after a loss. */
 export function dayHaltTick(dayMtm: number | null): DayHalt | null {
   if (dayMtm == null || !Number.isFinite(dayMtm)) return null;
-  if (dayMtm <= -FLIP.maxDailyLoss) return "loss";
   if (dayMtm >= FLIP.dailyTarget) return "target";
   return null;
+}
+
+/** Timer clock is HH:MM, 24 hour. Seconds on the end are ignored. 09:15 is 33300 seconds. */
+export function parseEntryClock(text: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(text.trim());
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return null;
+  return hour * 3600 + minute * 60;
+}
+
+/** Keeps each key. 0915 and 09:15 both become 09:15. */
+export function entryClockDraft(text: string): string {
+  const digits = text.replace(/[^\d]/g, "").slice(0, 4);
+  if (digits.length <= 2) return digits;
+  return `${digits.slice(0, 2)}:${digits.slice(2)}`;
+}
+
+/**
+ * Normal sells as soon as START is on, until 15:15.
+ * Timer waits until the set clock, then sells. After 15:15 neither sells.
+ */
+export function entryDue(
+  clock: { hour: number; minute: number; second: number },
+  mode: FlipEntryMode,
+  timer: string,
+): boolean {
+  if (clockPhase(clock) === "shut") return false;
+  if (mode === "normal") return true;
+  const fire = parseEntryClock(timer);
+  if (fire == null) return false;
+  return clock.hour * 3600 + clock.minute * 60 + clock.second >= fire;
 }
 
 /**
@@ -570,9 +603,19 @@ export function assertFlipRules(): void {
   if (!shouldBookLong(123.5, 123.5) || shouldBookLong(123.51, 123.5) || shouldBookLong(100, null)) {
     throw new Error("long books on the pullback");
   }
-  if (dayHaltTick(-4999) !== null || dayHaltTick(-5000) !== "loss" || dayHaltTick(14999) !== null || dayHaltTick(15000) !== "target") {
-    throw new Error("day loss and day target");
+  if (dayHaltTick(-5000) !== null || dayHaltTick(-20000) !== null) throw new Error("a loss does not close the day");
+  if (dayHaltTick(14999) !== null || dayHaltTick(15000) !== "target") throw new Error("day target");
+  if (parseEntryClock("09:15") !== 9 * 3600 + 15 * 60 || parseEntryClock("9:05") !== 9 * 3600 + 5 * 60) {
+    throw new Error("entry clock");
   }
+  if (parseEntryClock("09:15:00") !== 9 * 3600 + 15 * 60) throw new Error("entry clock ignores seconds");
+  if (entryClockDraft("0915") !== "09:15" || entryClockDraft("09:1") !== "09:1") throw new Error("keyboard clock draft");
+  if (parseEntryClock("24:00") !== null || parseEntryClock("09:60") !== null) throw new Error("entry clock rejects a bad time");
+  const morning = { hour: 9, minute: 13, second: 0 };
+  const open = { hour: 9, minute: 15, second: 0 };
+  if (entryDue(morning, "timer", "09:15") || !entryDue(open, "timer", "09:15")) throw new Error("timer waits until the set time");
+  if (!entryDue(morning, "normal", "09:15")) throw new Error("normal sells before the timer");
+  if (entryDue({ hour: 15, minute: 15, second: 0 }, "normal", "09:15")) throw new Error("15:15 blocks a new sell");
   if (dayHaltTick(null) !== null) throw new Error("a missing day price does not exit");
   const otm = pickOtmStrike(
     [
