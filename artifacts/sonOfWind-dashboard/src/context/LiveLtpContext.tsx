@@ -104,6 +104,20 @@ export function peekLiveLtp(id: number): number | null {
   return row && row.ltp > 0 ? row.ltp : null;
 }
 
+/** Ms since the last Fyers websocket print. null when this token has not printed on the socket. */
+export function fyersPrintAgeMs(id: number): number | null {
+  if (!Number.isFinite(id) || id <= 0) return null;
+  const t = fyersPrintAt.get(id);
+  if (t == null) return null;
+  return performance.now() - t;
+}
+
+/** True while a recent Fyers socket print should keep XTS off this token. */
+export function fyersPrintFresh(id: number): boolean {
+  const age = fyersPrintAgeMs(id);
+  return age != null && age < FYERS_OWNS_MS;
+}
+
 /** Fyers websocket last trade for this token. Blank when only REST or cache has a number. */
 export function peekFyersWsLtp(id: number): number | null {
   if (!Number.isFinite(id) || id <= 0) return null;
@@ -514,7 +528,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
           if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) continue;
           if (fromFyers) fyersOwnedIds.add(id);
           // Fyers owns LIVE for this token. An XTS quote seed must not replace it.
-          if (!fromFyers && (fyersOwnsLtp(id) || socketBeatsRest(id))) continue;
+          if (!fromFyers && (fyersPrintFresh(id) || socketBeatsRest(id))) continue;
           rememberLiveTick(id, v, null, null, true);
           if (next[id] !== v) {
             next[id] = v;
@@ -702,7 +716,7 @@ export function LiveLtpProvider({ children }: { children: ReactNode }) {
         const gapFill = t._gapFill === true || t._fromRestQuote === true || t._hotLtp === true;
         const fyersLtp = t._fyersLtp === true;
         const fyersRest = t._fyersRest === true;
-        const xtsLtpBlocked = !fyersLtp && fyersOwnsLtp(id);
+        const xtsLtpBlocked = !fyersLtp && fyersPrintFresh(id);
         // Fyers socket LTP paints first. A REST snapshot must not rewind that print,
         // and it must not lock XTS out — that lock was the sahi/galat/sahi flicker.
         if (fyersLtp && ltpFastRaw != null) {

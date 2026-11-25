@@ -758,10 +758,14 @@ class FyersLtpFeed:
         def onclose(_msg: Any) -> None:
             # Keep the socket object. Fyers reconnects it, and onopen must still subscribe.
             # Dropping _ws here left the tape on the last print.
+            # A reconnect that sits on "1 of 5" must not freeze the last print, so quotes poll now.
             feed._mode = "reconnect"
             feed._last_err = "Fyers socket reconnecting"
+            feed._last_ws_rx = 0.0
+            feed._last_rest_poll = 0.0
             try:
                 feed._start_poll_loop()
+                feed._poll_quotes_once()
             except Exception:
                 pass
 
@@ -865,6 +869,20 @@ class FyersLtpFeed:
                 changed = self._last_px_change.get(sym, 0.0)
                 if changed <= 0 or now - changed >= stale_px:
                     need[sym] = pair
+            # Index ticks keep the socket "alive" while option symbols stop.
+            # Refresh the quiet ones or Flip's CE/PE stay on the last print.
+            quiet = []
+            for sym, pair in live.items():
+                if sym in need:
+                    continue
+                changed = self._last_px_change.get(sym, 0.0)
+                if changed <= 0 or now - changed >= stale_px:
+                    quiet.append((changed, sym, pair))
+            quiet.sort()
+            for _changed, sym, pair in quiet:
+                need[sym] = pair
+                if len(need) >= 40:
+                    break
             if not need or now - self._last_rest_poll < stale_px:
                 return
         else:

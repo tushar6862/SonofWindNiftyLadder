@@ -3987,13 +3987,13 @@ def _ix_cool_until(cache_key: str) -> float:
     )
 
 
-def _ix_portfolio_cached(cache_key: str, fetcher):
+def _ix_portfolio_cached(cache_key: str, fetcher, *, max_age: float | None = None):
     """Serialize broker GETs; positions Net/Day share one cooldown on e-api-0004."""
     now = time.time()
     with _IX_PORTFOLIO_LOCK:
         hit = _IX_PORTFOLIO_CACHE.get(cache_key)
         cool_until = _ix_cool_until(cache_key)
-        ttl = _ix_portfolio_ttl(cache_key)
+        ttl = _ix_portfolio_ttl(cache_key) if max_age is None else max_age
         if hit and now - hit[0] < ttl:
             return hit[1], False
         if cool_until > now:
@@ -4015,7 +4015,9 @@ def _ix_portfolio_cached(cache_key: str, fetcher):
                 return empty, False
             if _ix_rate_limited(e):
                 bucket = _ix_cool_bucket(cache_key)
-                wait = _ix_next_cool_sec(bucket)
+                # GET /orders has its own small quota. A 5-minute ladder keeps START
+                # from ever seeing the fill, so the straddle sits half open.
+                wait = 45.0 if ":orderbook" in cache_key else _ix_next_cool_sec(bucket)
                 until = time.time() + wait
                 _IX_PORTFOLIO_COOLDOWN[cache_key] = until
                 _IX_PORTFOLIO_COOLDOWN[bucket] = until
@@ -4243,22 +4245,134 @@ def _xts_order_rows(book: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _xts_find_order(ix: XtsInteractiveClient, client_id: str | None, app_id: str, uniq: str) -> dict[str, Any] | None:
-    book = ix.get_order_book(client_id=client_id)
+def _ix_read_order_book(username: str, ix: XtsInteractiveClient, client_id: str | None) -> tuple[Any, bool]:
+    """One shared GET /orders. Parallel CE and PE legs wait on the same read.
+    The second value is true when the broker quota blocked a fresh book."""
+    key = f"{(username or '').strip().upper()}:orderbook"
+    return _ix_portfolio_cached(
+        key,
+        lambda: _ix_call_query(ix, client_id, lambda oc: ix.get_order_book(client_id=oc)),
+        max_age=0.8,
+    )
+
+
+def _xts_find_order(
+    ix: XtsInteractiveClient,
+    client_id: str | None,
+    app_id: str,
+    uniq: str,
+    *,
+    username: str = "",
+    book: Any = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    stale = False
+    if book is None:
+        if username:
+            book, stale = _ix_read_order_book(username, ix, client_id)
+        else:
+            book = ix.get_order_book(client_id=client_id)
     want_id = str(app_id or "").strip()
     want_uniq = str(uniq or "").strip()
     for row in _xts_order_rows(book):
         if want_id and _xts_app_order_id(row) == want_id:
-            return row
+            return row, stale
         if want_uniq and _xts_order_unique(row) == want_uniq:
-            return row
-    return None
+            return row, stale
+    return None, stale
 
 
 def _ix_drop_orderbook_cache(username: str) -> None:
     key = f"{(username or '').strip().upper()}:orderbook"
     with _IX_PORTFOLIO_LOCK:
         _IX_PORTFOLIO_CACHE.pop(key, None)
+
+
+def _ix_drop_positions_cache(username: str) -> None:
+    key = f"{(username or '').strip().upper()}:pos:NetWise"
+    with _IX_PORTFOLIO_LOCK:
+        _IX_PORTFOLIO_CACHE.pop(key, None)
+
+
+def _position_rows(book: Any) -> list[dict[str, Any]]:
+    if not isinstance(book, dict):
+        return []
+    inner = book.get("result")
+    if inner is None:
+        inner = book.get("Result")
+    if isinstance(inner, list):
+        return [row for row in inner if isinstance(row, dict)]
+    if isinstance(inner, dict):
+        listed = inner.get("positionList") or inner.get("PositionList") or inner.get("positions")
+        if isinstance(listed, list):
+            return [row for row in listed if isinstance(row, dict)]
+    return []
+
+
+def _position_avg(row: dict[str, Any], side: str) -> float | None:
+    keys = (
+        ("SellAveragePrice", "sellAveragePrice", "sellAvgPrice", "SellAvgPrice")
+        if side == "SELL"
+        else ("BuyAveragePrice", "buyAveragePrice", "buyAvgPrice", "BuyAvgPrice")
+    )
+    for key in keys:
+        raw = row.get(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            px = float(str(raw).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if px > 0:
+            return round(px + 1e-9, 2)
+    return None
+
+
+def _fill_from_positions(
+    username: str,
+    ix: XtsInteractiveClient,
+    client_id: str | None,
+    iid: int,
+    side: str,
+    sent_qty: int,
+) -> dict[str, Any] | None:
+    """When GET /orders is capped, a matching open position is enough to book the fill."""
+    if iid <= 0 or sent_qty <= 0 or side not in ("BUY", "SELL"):
+        return None
+    try:
+        book, _stale = _ix_portfolio_cached(
+            f"{(username or '').strip().upper()}:pos:NetWise",
+            lambda: _ix_call_query(
+                ix, client_id, lambda oc: ix.get_positions(day_or_net="NetWise", client_id=oc)
+            ),
+            max_age=2.0,
+        )
+    except Exception as exc:
+        app.logger.warning("position fill check failed: %s", exc)
+        return None
+    for row in _position_rows(book):
+        pid = _num_int(
+            row.get("ExchangeInstrumentID") or row.get("exchangeInstrumentID") or row.get("ExchangeInstrumentId") or 0
+        )
+        if pid != iid:
+            continue
+        net = _position_net_qty(row)
+        if side == "SELL" and net >= 0:
+            continue
+        if side == "BUY" and net <= 0:
+            continue
+        if abs(net) < sent_qty:
+            continue
+        px = _position_avg(row, side)
+        if px is None:
+            continue
+        return {
+            "OrderStatus": "Filled",
+            "CumulativeQuantity": sent_qty,
+            "OrderQuantity": sent_qty,
+            "OrderAverageTradedPrice": px,
+            "ExchangeInstrumentID": iid,
+        }
+    return None
 
 
 def _watch_working_order(
@@ -4268,18 +4382,28 @@ def _watch_working_order(
     uniq: str,
     sent_qty: int,
     *,
-    polls: int = 4,
-    gap: float = 0.3,
+    username: str = "",
+    polls: int = 2,
+    gap: float = 0.9,
 ) -> tuple[str, dict[str, Any] | None]:
-    """filled, dead, pending, or unknown. A working order is watched briefly so a fast fill is not cancelled."""
+    """filled, dead, pending, limited, or unknown.
+
+    A rate-limited book stops the watch. More GET /orders calls only keep the quota shut
+    and leave the straddle half open.
+    """
     last: dict[str, Any] | None = None
     for i in range(polls):
         time.sleep(gap)
         try:
-            row = _xts_find_order(ix, client_id, app_id, uniq)
+            row, stale = _xts_find_order(ix, client_id, app_id, uniq, username=username)
         except Exception as exc:
+            if _ix_rate_limited(exc):
+                app.logger.warning("order book lookup rate-limited: %s", exc)
+                return "limited", last
             app.logger.warning("order book lookup failed: %s", exc)
             continue
+        if stale and row is None:
+            return "limited", last
         if row is None:
             continue
         last = row
@@ -4349,9 +4473,16 @@ def _chase_pending_xts_order(
     if sent <= 0 or (not app_id and not uniq):
         return res, payload, fill_hint, None
 
-    state, row = _watch_working_order(ix, client_id, app_id, uniq, sent)
+    state, row = _watch_working_order(ix, client_id, app_id, uniq, sent, username=username)
     if state == "filled":
         return res, payload, fill_hint, None
+    if state == "limited":
+        booked = _fill_from_positions(username, ix, client_id, iid, side, sent)
+        if booked is not None:
+            app.logger.info("order book rate-limited — %s %s booked from positions", side, iid)
+            return _order_proof(booked, res), payload, fill_hint, None
+        app.logger.warning("order %s book is rate-limited; not cancelling and not replacing", app_id or uniq)
+        return res, payload, fill_hint, "Order book is rate-limited. This order was left working and was not sent again."
     if state == "dead":
         return res, payload, fill_hint, _xts_row_reason(row) or f"Order {_xts_order_status(row) or 'rejected'}"
     if state != "pending" or row is None:
@@ -4370,7 +4501,9 @@ def _chase_pending_xts_order(
     time.sleep(0.25)
     _ix_drop_orderbook_cache(username)
     try:
-        again = _xts_find_order(ix, client_id, app_id, uniq)
+        again, again_stale = _xts_find_order(ix, client_id, app_id, uniq, username=username)
+        if again_stale:
+            again = None
     except Exception:
         again = None
     if again is not None:
@@ -4415,7 +4548,12 @@ def _chase_pending_xts_order(
 
     app2, uniq2_res = _xts_place_app_ids(res2)
     uniq2 = str(retry.get("orderUniqueIdentifier") or uniq2_res or "").strip()
-    state2, row2 = _watch_working_order(ix, client_id, app2, uniq2, remain)
+    state2, row2 = _watch_working_order(ix, client_id, app2, uniq2, remain, username=username)
+    if state2 == "limited":
+        booked = _fill_from_positions(username, ix, client_id, iid, side, remain)
+        if booked is not None:
+            return _order_proof(booked, res2), retry, hint2, None
+        return res2, retry, hint2, "Order book is rate-limited. This order was left working and was not sent again."
     _ix_drop_orderbook_cache(username)
     if state2 == "filled":
         return res2, retry, hint2, None
@@ -4476,9 +4614,26 @@ def _respond_book_only_if_filled(
 
     app_id, res_uniq = _xts_place_app_ids(res)
     uniq = str(payload.get("orderUniqueIdentifier") or res_uniq or "").strip()
+    side = str(payload.get("orderSide") or "").strip().upper()
+    iid = int(payload.get("exchangeInstrumentID") or 0)
     row: dict[str, Any] | None = None
+    state = "unknown"
     if sent > 0 and (app_id or uniq):
-        _state, row = _watch_working_order(ix, client_id, app_id, uniq, sent)
+        state, row = _watch_working_order(ix, client_id, app_id, uniq, sent, username=username)
+    if state == "limited":
+        booked = _fill_from_positions(username, ix, client_id, iid, side, sent)
+        pos_key = f"{(username or '').strip().upper()}:pos:NetWise"
+        if booked is None and _ix_cool_until(pos_key) <= time.time():
+            time.sleep(1.0)
+            _ix_drop_positions_cache(username)
+            booked = _fill_from_positions(username, ix, client_id, iid, side, sent)
+        if booked is not None:
+            app.logger.info("order book rate-limited — %s %s booked from positions", side, iid)
+            return ok_fill(_order_proof(booked, res))
+        return not_filled(
+            res,
+            "Order book is rate-limited. This order was left working and was not sent again.",
+        )
     proof = _order_proof(row, res)
     if response_is_full_fill(proof, sent):
         return ok_fill(proof)
@@ -4501,7 +4656,9 @@ def _respond_book_only_if_filled(
         time.sleep(0.25)
         _ix_drop_orderbook_cache(username)
         try:
-            again = _xts_find_order(ix, client_id, cancel_id, uniq)
+            again, again_stale = _xts_find_order(ix, client_id, cancel_id, uniq, username=username)
+            if again_stale:
+                again = None
         except Exception:
             again = None
         if isinstance(again, dict):

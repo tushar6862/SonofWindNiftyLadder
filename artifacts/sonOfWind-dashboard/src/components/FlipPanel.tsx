@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { ChainExpiriesResponse, ChainResolved, ChainResolveResponse } from "@/types/market";
-import { peekFyersWsLtp, peekLiveLtp, socketPrintAgeMs, subscribeLiveLtp } from "@/context/LiveLtpContext";
+import { fyersPrintFresh, peekFyersWsLtp, peekLiveLtp, subscribeLiveLtp } from "@/context/LiveLtpContext";
 import { setHotFocus } from "@/lib/hotFocus";
 import { fmtPnl, fmtPrice, fmtQty } from "@/lib/formatNumber";
 import { apiFetch } from "@/lib/backend";
@@ -131,6 +131,8 @@ type OrderSent = {
   rate: number | null;
   counted: boolean;
   error: string | null;
+  /** The broker accepted the order, but GET /orders was rate-limited. Do not send it again. */
+  leftWorking?: boolean;
 };
 
 type SessionStore = {
@@ -229,9 +231,11 @@ function legTape(leg: OpenLeg): string {
 
 function livePrint(iid: number): number | null {
   if (!(iid > 0)) return null;
-  const ws = peekFyersWsLtp(iid);
-  if (ws != null && ws > 0) return tradableQuote(ws, true);
-  if (socketPrintAgeMs(iid) == null) return null;
+  // A Fyers print that stopped ticking must not sit on top of a newer quote.
+  if (fyersPrintFresh(iid)) {
+    const ws = peekFyersWsLtp(iid);
+    if (ws != null && ws > 0) return tradableQuote(ws, true);
+  }
   return tradableQuote(peekLiveLtp(iid), true);
 }
 
@@ -538,6 +542,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
   const lockParamsRef = useRef(lockParams);
   const floorRef = useRef(lockFloor);
   const peakRef = useRef(lockPeak);
+  const openBookKeyRef = useRef("");
   const cycleBaseRef = useRef(cycleBase);
   const legsRef = useRef(legs);
   const lockRef = useRef(pairLock);
@@ -554,6 +559,8 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
   const entryClockRef = useRef(entryClock);
   /** A short that crossed together with the leg we just flipped. It must cool off before it can flip. */
   const flipHoldRef = useRef<FlipSide | null>(null);
+  /** Sides already sent while the order book was rate-limited. A second sell would double the leg. */
+  const heldSidesRef = useRef<Set<FlipSide>>(new Set());
   const loadedRef = useRef(loaded);
   const indexRef = useRef(index);
   const activeRef = useRef(active);
@@ -757,10 +764,9 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     };
     const chain = loaded?.chain;
     const keep = active || started || legs.length > 0 || pairLock != null || rebalance != null;
-    const warmAll = started || legs.length > 0 || rebalance != null;
     if (chain && keep && flipIndex(index)) {
       add(chain.spotSegment, chain.spotToken);
-      if (warmAll) {
+      if (rebalance) {
         for (const row of Object.values(chain.instrumentMap ?? {})) {
           if (!row) continue;
           add(chain.optionSegment, row.ce);
@@ -814,6 +820,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       }
       if (rate == null && !exit) return blank("No live quote. Order not sent.");
       let response: { ok?: boolean; error?: string; raw?: unknown } | null = null;
+      const leftWorking = (message: string) => /rate-limited|left working/i.test(message);
       try {
         response = (await apiFetch("/api/ix/place_order", {
           method: "POST",
@@ -835,7 +842,11 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         })) as { ok?: boolean; error?: string; raw?: unknown };
       } catch (err: unknown) {
         bumpPositionsRefresh();
-        return blank(err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        if (leftWorking(message)) {
+          return { filledQty: 0, fillPx: null, rate, counted: false, error: message, leftWorking: true };
+        }
+        return blank(message);
       }
       bumpPositionsRefresh();
       const raw = response?.raw ?? response;
@@ -861,6 +872,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     commitStage(null, null);
     commitRebalance(null);
     flipHoldRef.current = null;
+    heldSidesRef.current.clear();
   }, [commitLegs, commitLock, commitRebalance, commitStage]);
 
   const flatten = useCallback(
@@ -916,11 +928,14 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     if (!lock || !entryDue(istNow(), entryModeRef.current, entryClockRef.current)) return;
     const missing = (["CE", "PE"] as const).filter((side) => !legsRef.current.some((row) => row.side === side));
     if (!missing.length) {
+      heldSidesRef.current.clear();
       commitLock(null);
       return;
     }
+    const pending = missing.filter((side) => !heldSidesRef.current.has(side));
+    if (!pending.length) return;
     const sentRows = await Promise.all(
-      missing.map(async (side) => {
+      pending.map(async (side) => {
         const iid = side === "CE" ? lock.ceIid : lock.peIid;
         const rate = livePrint(iid);
         if (!entryDue(istNow(), entryModeRef.current, entryClockRef.current)) return { side, iid, rate, sent: null as OrderSent | null };
@@ -936,6 +951,14 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     let changed = false;
     for (const row of sentRows) {
       if (!row.sent) continue;
+      if (row.sent.leftWorking) {
+        heldSidesRef.current.add(row.side);
+        pushLog(
+          `SELL ${row.side} ${fmtStrike(lock.strike)} was sent. Order book is rate-limited, so this side is not sold again.`,
+          "error",
+        );
+        continue;
+      }
       if (!row.sent.counted || row.sent.fillPx == null || row.sent.filledQty <= 0) {
         pushLog(
           `Not booked. SELL ${row.side} ${fmtStrike(lock.strike)} rate ${row.rate == null ? "—" : fmtPrice(row.rate)}. ${row.sent.error || ""}`.trim(),
@@ -944,6 +967,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         backoffRef.current = Date.now() + ORDER_BACKOFF_MS;
         continue;
       }
+      heldSidesRef.current.delete(row.side);
       const qty = Math.min(row.sent.filledQty, sellQuantity(lock.index, lock.lots));
       const leg = shortFromFill(
         {
@@ -1253,26 +1277,30 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       }
       if (trailChanged) commitLegs(trailed);
 
-      let day: number | null = realizedRef.current;
-      let cycle: number | null = realizedRef.current - cycleBaseRef.current;
+      let openMtm: number | null = legsRef.current.length ? 0 : null;
       if (legsRef.current.length) {
         for (const leg of legsRef.current) {
           const mark = legQuoteMark(leg);
           if (mark == null) {
-            day = null;
-            cycle = null;
+            openMtm = null;
             break;
           }
-          day += mark;
-          cycle += mark;
+          openMtm += mark;
         }
       }
-      const dayExit = dayHaltTick(day);
+      const bookedThis = realizedRef.current - cycleBaseRef.current;
+      const tradeMtm = openMtm == null ? null : bookedThis + openMtm;
+      const bookKey = legsRef.current.map((leg) => `${leg.iid}:${leg.mode}:${leg.qty}`).join("|");
+      if (bookKey !== openBookKeyRef.current) {
+        openBookKeyRef.current = bookKey;
+        if (floorRef.current !== 0 || peakRef.current != null) commitProfit(0, null);
+      }
+      const dayExit = dayHaltTick(legsRef.current.length ? tradeMtm : realizedRef.current);
       if (dayExit) haltPendingRef.current = dayExit;
       if (haltPendingRef.current) {
         const why = haltPendingRef.current;
         const label = why === "loss" ? "Daily loss" : "Daily target";
-        pushLog(`${label}${day == null ? "" : ` ${fmtPnl(day)}`}. Flattening.`, "info");
+        pushLog(`${label}${tradeMtm == null ? "" : ` ${fmtPnl(tradeMtm)}`}. Flattening.`, "info");
         busyRef.current = true;
         setBusy(true);
         const closed = await flatten(label);
@@ -1286,14 +1314,14 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
         return;
       }
 
-      if (legsRef.current.length && cycle != null) {
+      if (legsRef.current.length && tradeMtm != null) {
         const bookIndex = legsRef.current[0]!.index;
         const lots = openLots(
           legsRef.current.map((leg) => leg.qty),
           bookIndex,
         );
         const step = profitLockTick({
-          mtm: cycle,
+          mtm: tradeMtm,
           lots,
           floor: floorRef.current,
           peak: peakRef.current,
@@ -1310,7 +1338,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
           }
         }
         if (step.square) {
-          pushLog(`Profit lock. Cycle ${fmtPnl(cycle)} at floor ${fmtPrice(step.floor)}. Flattening.`, "info");
+          pushLog(`Profit lock. Trade ${fmtPnl(tradeMtm)} at floor ${fmtPrice(step.floor)}. Flattening.`, "info");
           busyRef.current = true;
           setBusy(true);
           const closed = await flatten("Lock");
@@ -1585,7 +1613,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
       return;
     }
     if (haltRef.current === "loss") commitHalt(null);
-    const dayBlock = haltRef.current === "target" ? "target" : dayHaltTick(realizedRef.current);
+    const dayBlock = haltRef.current === "target" ? "target" : null;
     if (dayBlock === "target") {
       if (!haltRef.current) commitHalt("target");
       const text = "Daily target ₹15,000. START sends no new sell.";
@@ -1672,7 +1700,8 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
   const marks = legs.map((leg) => screenMark(leg));
   const markReady = marks.every((n) => n != null);
   const live = markReady ? marks.reduce<number>((sum, n) => sum + (n ?? 0), 0) : null;
-  const gross = live == null ? null : realized + live;
+  const bookedThis = realized - cycleBase;
+  const gross = legs.length && live == null ? null : bookedThis + (live ?? 0);
   const stateName = flipStateName(ceLeg?.mode ?? null, peLeg?.mode ?? null);
   const bothShort = stateName === "STATE_A_SIDEWAYS";
   const deskWord = halt === "loss"
@@ -1720,11 +1749,10 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
     lockDraft.trailPercent !== savedLock.trailPercent;
   const levelLots = legs.length && legs[0] ? openLots(legs.map((leg) => leg.qty), legs[0].index) : lots;
   const levels = liveLockLevels(lockParams, levelLots);
-  const cycleMtm = live == null ? null : realized - cycleBase + live;
   const status = !name
     ? "Select NIFTY or SENSEX. This desk sends no order for another index."
     : halt === "target"
-        ? "Daily target ₹15,000. The card is closed for today."
+        ? "This flip trade hit ₹15,000. The card is closed for today."
         : phase === "shut" || dayClosed
           ? "After 15:15. No new sell. An open leg is bought if short and sold if long."
           : !started
@@ -1792,10 +1820,10 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
               {fmtPnl(gross)}
             </div>
             <div className="n930-meta">
-              {`booked ${fmtPnl(realized)}`}
-              {live == null && legs.length ? " · mark incomplete" : live != null ? ` · live ${fmtPnl(live)}` : ""}
-              {cycleMtm == null ? " · cycle waits" : ` · cycle ${fmtPnl(cycleMtm)}`}
-              {lockFloor > 0 ? ` · floor ${fmtPrice(lockFloor)}` : " · no floor"}
+              {legs.length && live == null
+                ? "mark incomplete"
+                : `booked ${fmtPnl(bookedThis)} · open ${fmtPnl(live ?? 0)}`}
+              {lockFloor > 0 ? ` · floor ${fmtPrice(lockFloor)}` : ""}
             </div>
           </div>
           <div className="n930-cell">
@@ -1997,7 +2025,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
             Slippage model {fmtPrice(FLIP.slipLow)} to {fmtPrice(FLIP.slipHigh)} points per leg. The price on this card is the broker fill.
             {lockFloor > 0 ? ` Profit floor ${fmtPrice(lockFloor)}.` : " Profit floor is not set."}
             {lockPeak != null ? ` Peak ${fmtPrice(lockPeak)}.` : ""}
-            {cycleMtm == null ? " Cycle MTM waits for a live price." : ` Cycle MTM ${fmtPnl(cycleMtm)}.`}
+            {gross == null ? " Trade MTM waits for a live price." : ` Trade MTM ${fmtPnl(gross)}.`}
           </p>
         </div>
 
@@ -2017,7 +2045,7 @@ export default function FlipPanel({ index, active }: { index: IndexName; active:
                 Each short trails down. The trigger is the trailing low times one plus the saved percent, default 15, save 7 to 15. When that leg prints at the trigger, the buy is twice the short.
                 Half closes the short and half opens a long. That long stops 10% under the buy: a sell of twice the long closes it and opens a new short. After the long is 15% in profit, a 5% pullback from the high books it and sells the far OTM near ₹70.
                 CE and PE are never long together. If the other short flips while one leg is long, that long is sold first and the short flips only after the fill. A loss does not block the next START. A profit of ₹15,000 on the day still closes the card. Timer waits until the set clock. Normal sells on the next tick after START. STOP and 15:15 still flatten. The card price is the broker fill. Slippage of 0.20 to 0.40 is not added again.
-                Profit lock boxes are per lot. At 2 lots the defaults are step ₹3,000, lock ₹2,000, trail ₹3,400, and 80%. The floor only rises. A missing price does not square. A loss before the first lock stays open. The next START begins a new cycle.
+                Profit lock boxes are per lot and follow this START's booked profit plus the open legs. A flip's booked loss stays in the mark, so the remaining long cannot show a profit the trade does not have. At 2 lots the defaults are step ₹3,000, lock ₹2,000, trail ₹3,400, and 80%. The floor only rises, and it starts again when the open trades change. A missing price does not square. A loss before the first lock stays open. The next START begins a new cycle.
               </p>
             ) : (
               <ul className="space-y-1.5">
